@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The `if` guards below skip the job until the first crate exists.
+      # Remove them once Cargo.toml is committed.
+      - uses: jdx/mise-action@v2
+        if: hashFiles('Cargo.toml') != ''
+        with:
+          cache: true
+
+      - uses: Swatinem/rust-cache@v2
+        if: hashFiles('Cargo.toml') != ''
+
+      - run: mise run ci
+        if: hashFiles('Cargo.toml') != ''
