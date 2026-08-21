@@ -1,0 +1,58 @@
+[tools]
+# `components` is required: mise installs rust with the minimal profile, so rustfmt
+# and clippy are absent unless named here.
+rust = { version = "stable", components = "rustfmt,clippy" }
+"cargo-insta" = "latest"
+# M6 will add `java` here, for `mwl toolchain build-from-jar`. Not needed before that.
+
+[env]
+RUST_BACKTRACE = "1"
+
+# ---- everyday ----
+
+[tasks.fmt]
+description = "Format all crates"
+run = "cargo fmt --all"
+
+[tasks.lint]
+description = "Clippy, warnings denied"
+run = "cargo clippy --all-targets --all-features -- -D warnings"
+
+[tasks.check]
+description = "Type check only (fast)"
+run = "cargo check --all-targets"
+
+[tasks.test]
+description = "Run all tests"
+run = "cargo test --all-features"
+
+[tasks.build]
+description = "Release build"
+run = "cargo build --release"
+
+# ---- focused test runs ----
+
+[tasks."test:tinymcf"]
+description = "Interpreter only (the loop to run while working on M0)"
+run = "cargo test -p tinymcf"
+
+[tasks."test:mwlc"]
+description = "Compiler only"
+run = "cargo test -p mwlc"
+
+[tasks.snap]
+description = "Review insta snapshots"
+run = "cargo insta review"
+
+[tasks."snap:accept"]
+description = "Accept all pending insta snapshots"
+run = "cargo insta accept"
+
+# ---- gate ----
+
+[tasks.ci]
+description = "Same checks as CI. Run before pushing"
+depends = ["fmt:check", "lint", "test"]
+
+[tasks."fmt:check"]
+run = "cargo fmt --all -- --check"
