@@ -5,6 +5,7 @@
 //! nothing else in this repository.
 
 pub mod nbt;
+pub mod snbt;
 pub mod world;
 
 /// A hard failure: vanilla would reject the command outright and print red text.
