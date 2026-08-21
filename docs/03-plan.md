@@ -8,7 +8,7 @@
 
 | # | マイルストーン | 状態 | 進捗 |
 |---|---|---|---|
-| M0 | `tinymcf`（インタプリタ） | 進行中 | 1 / 12 |
+| M0 | `tinymcf`（インタプリタ） | 進行中 | 2 / 12 |
 | M1 | Hello World 縦断 | 未着手 | 0 / 9 |
 | M2 | 値と式 | 未着手 | 0 / 7 |
 | M3 | 制御フロー | 未着手 | 0 / 7 |
@@ -19,7 +19,7 @@
 | M8 | 数値拡張 | 未着手 | 0 / 7 |
 | M9 | 仕上げ | 未着手 | 0 / 9 |
 | — | 横断（CI・文書） | 進行中 | 1 / 5 |
-| | **合計** | | **2 / 86** |
+| | **合計** | | **3 / 86** |
 
 状態は `未着手` / `進行中` / `完了` / `保留`。
 タスクを閉じたらチェックボックスと上表の両方を更新する。
@@ -91,9 +91,8 @@ JDK は M6（`toolchain build-from-jar`）で必要になった時点で `[tools
 - [x] **M0-1** crate 雛形と NBT 値表現
   - `crates/tinymcf/src/nbt.rs`。`Compound` は `BTreeMap`（出力とスナップショットの決定性のため）
   - ルートの workspace `Cargo.toml` を作り、CI の `hashFiles` ガードを外した（X-1）
-- [ ] **M0-2** 実行状態（World）
-  - scoreboard（objective × プレイヤー名 → i32）、storage（namespace → NbtValue）
-  - 先に書くテスト: score の set / get / 未設定時の不在
+- [x] **M0-2** 実行状態（World）
+  - `world.rs`。未宣言 objective はエラー（0 として黙認しない）、未設定 holder は `None`
 - [ ] **M0-3** NBT パス解析
   - `foo.bar[0].baz`、`list[{tag:"x"}]`、`list[]` の解決と作成
   - 先に書くテスト: ネストしたパスへの書き込みで中間 compound が自動生成される
