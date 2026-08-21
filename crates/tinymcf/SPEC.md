@@ -100,24 +100,44 @@ compiler uses them.
 `namespace -> NbtValue`, where the root of every namespace is a compound. An absent
 namespace reads as an empty compound, as in vanilla.
 
-### 3.5 NBT paths — *pending (M0-3)*
+### 3.5 NBT paths — **done**
 
 ```
-path    := (seg | filter) { '.' seg | index }
-seg     := name [ filter ]
-filter  := compound            -- partial match
-index   := '[' ']'             -- every element
-         | '[' int ']'         -- by position, negative counts from the end
-         | '[' compound ']'    -- elements matching
+path     := head { '.' seg }
+head     := filter | seg
+seg      := name [ filter ] { index }
+name     := quoted | bare-name
+bare-name:= any run of characters other than . [ ] { } " ' and whitespace
+filter   := compound            -- partial match, applied to the current values
+index    := '[' ']'             -- every element
+          | '[' int ']'         -- by position, negative counts from the end
+          | '[' compound ']'    -- elements matching
 ```
 
-A path resolves to **zero or more** values; commands that require exactly one fail
-with success count 0 when the path matches none.
+A path resolves to **zero or more** values. Commands that require exactly one target
+report a success count of 0 when the path matches none; they are not errors.
 
-Filter matching is partial and recursive: the target must contain at least the given
-keys, with values that match by the same rule.
+Filter matching is **partial and recursive**: the target must be a compound containing
+at least the given keys, each of whose values matches by this same rule. Non-compound
+values match only by equality, tag included.
 
-Writes create missing intermediate compounds. Indices and filters never create.
+Indexing applies to lists and to the typed arrays. `[-1]` is the last element. An index
+outside the bounds matches nothing.
+
+Writes create missing values along `name` steps only; **indices and filters never
+create**. The created value takes the shape the *following* step needs — a list when
+that step is an index, a compound otherwise. This is vanilla's "preferred parent" rule,
+and it means a failed write can leave a partially built structure behind: `a[0].b` on
+an empty root creates `a:[]`, then matches nothing and writes nothing. `a.b.c` creates
+two compounds and writes.
+
+Typed-array elements are readable through a path but not writable; `data modify` into
+an `[I;…]` is out of scope.
+
+A trailing filter step (`a{k:1}`) cannot be removed, since removal needs the parent of
+the addressed value and a filter does not descend.
+
+Removal detaches every matched value from its parent, and reports how many.
 
 ## 4. Commands
 

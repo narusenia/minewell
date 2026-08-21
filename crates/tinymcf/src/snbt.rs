@@ -32,6 +32,14 @@ pub fn parse(src: &str) -> Result<NbtValue, SnbtError> {
     }
 }
 
+/// Parses a `{...}` starting at `at`, returning it and the offset just past it.
+/// The path parser needs this to read the filters embedded in a path.
+pub fn parse_compound_at(src: &str, at: usize) -> Result<(Compound, usize), SnbtError> {
+    let mut p = Parser { src, at };
+    let compound = p.compound()?;
+    Ok((compound, p.at))
+}
+
 struct Parser<'a> {
     src: &'a str,
     at: usize,
@@ -98,7 +106,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub fn compound(&mut self) -> Result<Compound, SnbtError> {
+    fn compound(&mut self) -> Result<Compound, SnbtError> {
         self.expect('{')?;
         let mut fields = Compound::new();
         self.skip_ws();

@@ -5,6 +5,7 @@
 //! nothing else in this repository.
 
 pub mod nbt;
+pub mod path;
 pub mod snbt;
 pub mod world;
 
