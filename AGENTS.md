@@ -17,6 +17,7 @@ Edition datapacks (`.mcfunction`). The compiler is written in Rust.
 | [`docs/01-requirements.md`](docs/01-requirements.md) | Requirements. Every design decision and the reasoning behind it. **Authoritative.** |
 | `docs/02-spec.md` | Detailed spec: grammar EBNF, typing rules, lowering rules. Written ahead of each milestone. |
 | [`docs/03-plan.md`](docs/03-plan.md) | Implementation plan, task list, progress tracking. |
+| [`crates/tinymcf/SPEC.md`](crates/tinymcf/SPEC.md) | Which subset of mcfunction the interpreter models, and where it departs from vanilla. Ships with the crate. |
 
 `01-requirements.md` is the source of truth for *what* and *why*. If an implementation
 detail contradicts it, the implementation is wrong — or the requirements need an
@@ -62,7 +63,9 @@ crates/
 ## Workflow: spec-driven + TDD
 
 The spec leads the implementation, not the other way around. Before implementing a
-milestone, write the corresponding section of `docs/02-spec.md`.
+task, settle the corresponding section of its spec — `crates/tinymcf/SPEC.md` for
+interpreter work, `docs/02-spec.md` for language work. Sections are marked **done** or
+*pending*; moving one to done is part of the task, not a follow-up.
 
 Every task in `docs/03-plan.md` names the test to write first.
 

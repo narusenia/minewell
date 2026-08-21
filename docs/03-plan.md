@@ -8,7 +8,7 @@
 
 | # | マイルストーン | 状態 | 進捗 |
 |---|---|---|---|
-| M0 | `tinymcf`（インタプリタ） | 進行中 | 2 / 12 |
+| M0 | `tinymcf`（インタプリタ） | 進行中 | 3 / 13 |
 | M1 | Hello World 縦断 | 未着手 | 0 / 9 |
 | M2 | 値と式 | 未着手 | 0 / 7 |
 | M3 | 制御フロー | 未着手 | 0 / 7 |
@@ -18,8 +18,8 @@
 | M7 | 複合型 | 未着手 | 0 / 9 |
 | M8 | 数値拡張 | 未着手 | 0 / 7 |
 | M9 | 仕上げ | 未着手 | 0 / 9 |
-| — | 横断（CI・文書） | 進行中 | 1 / 5 |
-| | **合計** | | **3 / 86** |
+| — | 横断（CI・文書） | 進行中 | 2 / 6 |
+| | **合計** | | **5 / 88** |
 
 状態は `未着手` / `進行中` / `完了` / `保留`。
 タスクを閉じたらチェックボックスと上表の両方を更新する。
@@ -88,11 +88,16 @@ JDK は M6（`toolchain build-from-jar`）で必要になった時点で `[tools
 
 **完了の判定:** 手書きの `.mcfunction` で書いた階乗・フィボナッチが正しい値を返す。
 
+**仕様:** [`crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md)。
+各タスクは**まず該当節を pending から確定させ、それから実装する。**
+
 - [x] **M0-1** crate 雛形と NBT 値表現
   - `crates/tinymcf/src/nbt.rs`。`Compound` は `BTreeMap`（出力とスナップショットの決定性のため）
   - ルートの workspace `Cargo.toml` を作り、CI の `hashFiles` ガードを外した（X-1）
 - [x] **M0-2** 実行状態（World）
   - `world.rs`。未宣言 objective はエラー（0 として黙認しない）、未設定 holder は `None`
+- [x] **M0-2b** SNBT のパーサとフォーマッタ
+  - `snbt.rs`。`parse(v.to_string()) == v` の往復一致で検証。`:` は bare-word に含めない
 - [ ] **M0-3** NBT パス解析
   - `foo.bar[0].baz`、`list[{tag:"x"}]`、`list[]` の解決と作成
   - 先に書くテスト: ネストしたパスへの書き込みで中間 compound が自動生成される
@@ -407,7 +412,11 @@ JDK は M6（`toolchain build-from-jar`）で必要になった時点で `[tools
   - ガードは M0-1 で除去済み
 - [ ] **X-2** toolchain 生成 CI
   - `server.jar` の data generator を実行して Releases へ公開。M6 と同時
-- [ ] **X-3** 詳細仕様書 `02-spec.md`
+- [x] **X-3a** `tinymcf` の対象サブセット仕様 `crates/tinymcf/SPEC.md`
+  - モデル化する mcfunction の範囲、バニラとの意図的な差異、失敗モデル、決定性の保証
+  - **`docs/` ではなく crate 同梱。** `tinymcf` は独立公開するので契約もコードと一緒に動く
+  - 各項目に done / pending と対応タスク番号を持たせ、M0 の残りはここを先に更新してから実装する
+- [ ] **X-3b** minewell 言語の詳細仕様書 `docs/02-spec.md`
   - 文法 EBNF、型規則、lowering 規則の完全な記述。M3 完了までに初版
   - **実装が仕様に追いつくのではなく、仕様が実装を先導する。** マイルストーンごとに該当節を先に書く
 - [ ] **X-4** ベンチマーク
