@@ -8,7 +8,7 @@
 
 | # | マイルストーン | 状態 | 進捗 |
 |---|---|---|---|
-| M0 | `tinymcf`（インタプリタ） | 未着手 | 0 / 12 |
+| M0 | `tinymcf`（インタプリタ） | 進行中 | 1 / 12 |
 | M1 | Hello World 縦断 | 未着手 | 0 / 9 |
 | M2 | 値と式 | 未着手 | 0 / 7 |
 | M3 | 制御フロー | 未着手 | 0 / 7 |
@@ -19,7 +19,7 @@
 | M8 | 数値拡張 | 未着手 | 0 / 7 |
 | M9 | 仕上げ | 未着手 | 0 / 9 |
 | — | 横断（CI・文書） | 進行中 | 1 / 5 |
-| | **合計** | | **1 / 86** |
+| | **合計** | | **2 / 86** |
 
 状態は `未着手` / `進行中` / `完了` / `保留`。
 タスクを閉じたらチェックボックスと上表の両方を更新する。
@@ -88,10 +88,9 @@ JDK は M6（`toolchain build-from-jar`）で必要になった時点で `[tools
 
 **完了の判定:** 手書きの `.mcfunction` で書いた階乗・フィボナッチが正しい値を返す。
 
-- [ ] **M0-1** crate 雛形と NBT 値表現
-  - `crates/tinymcf/`。`enum NbtValue { Byte, Short, Int, Long, Float, Double, String, List, Compound, ByteArray, IntArray, LongArray }`
-  - ルートの workspace `Cargo.toml` もここで作り、**CI の `hashFiles` ガードを外す**（X-1）
-  - 先に書くテスト: `NbtValue` の等価性判定。`Byte(1) != Int(1)` であること
+- [x] **M0-1** crate 雛形と NBT 値表現
+  - `crates/tinymcf/src/nbt.rs`。`Compound` は `BTreeMap`（出力とスナップショットの決定性のため）
+  - ルートの workspace `Cargo.toml` を作り、CI の `hashFiles` ガードを外した（X-1）
 - [ ] **M0-2** 実行状態（World）
   - scoreboard（objective × プレイヤー名 → i32）、storage（namespace → NbtValue）
   - 先に書くテスト: score の set / get / 未設定時の不在
@@ -406,7 +405,7 @@ JDK は M6（`toolchain build-from-jar`）で必要になった時点で `[tools
 
 - [x] **X-1** CI（`cargo test` / `clippy` / `fmt`）
   - `.github/workflows/ci.yml`。mise-action + `Swatinem/rust-cache`
-  - `Cargo.toml` が存在するまでは `hashFiles` ガードで空振りする。**M0-1 でガードを外す**
+  - ガードは M0-1 で除去済み
 - [ ] **X-2** toolchain 生成 CI
   - `server.jar` の data generator を実行して Releases へ公開。M6 と同時
 - [ ] **X-3** 詳細仕様書 `02-spec.md`

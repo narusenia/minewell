@@ -1,0 +1,10 @@
+[package]
+name = "tinymcf"
+version = "0.0.0"
+description = "A tiny interpreter for a subset of Minecraft's mcfunction"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
