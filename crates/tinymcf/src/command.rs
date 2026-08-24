@@ -6,15 +6,107 @@
 //! runnable.
 
 use crate::args::{Args, ParseError};
+use crate::nbt::NbtValue;
+use crate::path::NbtPath;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Scoreboard(Scoreboard),
+    Data(Data),
     /// A command outside the modelled subset. Kept verbatim rather than rejected: a
     /// compiler emitting something unmodelled should still produce a usable trace.
     Unknown {
         name: String,
         args: String,
+    },
+}
+
+/// Where NBT lives. Only [`Target::Storage`] executes; see `SPEC.md` §4.2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Storage(String),
+    Entity(String),
+    Block(String),
+}
+
+impl Target {
+    fn parse(args: &mut Args) -> Result<Target, ParseError> {
+        let kind = args.word()?;
+        Ok(match kind {
+            "storage" => Target::Storage(args.word()?.to_owned()),
+            "entity" => Target::Entity(args.word()?.to_owned()),
+            "block" => {
+                let (x, y, z) = (args.word()?, args.word()?, args.word()?);
+                Target::Block(format!("{x} {y} {z}"))
+            }
+            other => return Err(unexpected(other)),
+        })
+    }
+
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Target::Storage(_) => "storage",
+            Target::Entity(_) => "entity",
+            Target::Block(_) => "block",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Data {
+    Get {
+        target: Target,
+        path: Option<NbtPath>,
+        scale: f64,
+    },
+    Merge {
+        target: Target,
+        value: NbtValue,
+    },
+    Remove {
+        target: Target,
+        path: NbtPath,
+    },
+    Modify {
+        target: Target,
+        path: NbtPath,
+        kind: ModifyKind,
+        source: Source,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModifyKind {
+    Set,
+    Append,
+    Prepend,
+    Insert(i32),
+    Merge,
+}
+
+impl ModifyKind {
+    /// Whether the value the path addresses should be created as a list when missing.
+    pub fn wants_list(&self) -> bool {
+        matches!(
+            self,
+            ModifyKind::Append | ModifyKind::Prepend | ModifyKind::Insert(_)
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Source {
+    Value(NbtValue),
+    From {
+        target: Target,
+        path: Option<NbtPath>,
+    },
+    /// The source rendered as text, sliced by `[start, end)`.
+    Str {
+        target: Target,
+        path: Option<NbtPath>,
+        start: Option<i32>,
+        end: Option<i32>,
     },
 }
 
@@ -89,6 +181,7 @@ impl Command {
         // their executors.
         match name.as_str() {
             "scoreboard" => Ok(Command::Scoreboard(scoreboard(&mut args)?)),
+            "data" => Ok(Command::Data(data(&mut args)?)),
             _ => Ok(Command::Unknown {
                 name,
                 args: args.rest().to_owned(),
@@ -99,8 +192,110 @@ impl Command {
     pub fn name(&self) -> &str {
         match self {
             Command::Scoreboard(_) => "scoreboard",
+            Command::Data(_) => "data",
             Command::Unknown { name, .. } => name,
         }
+    }
+}
+
+fn data(args: &mut Args) -> Result<Data, ParseError> {
+    let action = args.word()?;
+    let target = Target::parse(args)?;
+    match action {
+        "get" => {
+            let path = if args.is_empty() {
+                None
+            } else {
+                Some(args.path()?)
+            };
+            // Vanilla only allows a scale once a path is given, so the ambiguity
+            // between "next word is a path" and "next word is a scale" never arises.
+            let scale = if args.is_empty() {
+                1.0
+            } else {
+                let word = args.word()?;
+                word.parse()
+                    .map_err(|_| ParseError::new(0, format!("expected a scale, found '{word}'")))?
+            };
+            args.end()?;
+            Ok(Data::Get {
+                target,
+                path,
+                scale,
+            })
+        }
+        "merge" => {
+            let value = args.value()?;
+            args.end()?;
+            Ok(Data::Merge { target, value })
+        }
+        "remove" => {
+            let path = args.path()?;
+            args.end()?;
+            Ok(Data::Remove { target, path })
+        }
+        "modify" => {
+            let path = args.path()?;
+            let word = args.word()?;
+            let kind = match word {
+                "set" => ModifyKind::Set,
+                "append" => ModifyKind::Append,
+                "prepend" => ModifyKind::Prepend,
+                "merge" => ModifyKind::Merge,
+                "insert" => ModifyKind::Insert(args.int()?),
+                other => return Err(unexpected(other)),
+            };
+            let source = source(args)?;
+            args.end()?;
+            Ok(Data::Modify {
+                target,
+                path,
+                kind,
+                source,
+            })
+        }
+        other => Err(unexpected(other)),
+    }
+}
+
+fn source(args: &mut Args) -> Result<Source, ParseError> {
+    let word = args.word()?;
+    match word {
+        "value" => Ok(Source::Value(args.value()?)),
+        "from" => {
+            let target = Target::parse(args)?;
+            let path = optional_path(args)?;
+            Ok(Source::From { target, path })
+        }
+        "string" => {
+            let target = Target::parse(args)?;
+            let path = optional_path(args)?;
+            let start = optional_int(args)?;
+            let end = optional_int(args)?;
+            Ok(Source::Str {
+                target,
+                path,
+                start,
+                end,
+            })
+        }
+        other => Err(unexpected(other)),
+    }
+}
+
+fn optional_path(args: &mut Args) -> Result<Option<NbtPath>, ParseError> {
+    if args.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(args.path()?))
+    }
+}
+
+fn optional_int(args: &mut Args) -> Result<Option<i32>, ParseError> {
+    if args.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(args.int()?))
     }
 }
 

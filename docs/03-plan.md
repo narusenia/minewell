@@ -8,7 +8,7 @@
 
 | # | マイルストーン | 状態 | 進捗 |
 |---|---|---|---|
-| M0 | `tinymcf`（インタプリタ） | 進行中 | 6 / 13 |
+| M0 | `tinymcf`（インタプリタ） | 進行中 | 7 / 13 |
 | M1 | Hello World 縦断 | 未着手 | 0 / 9 |
 | M2 | 値と式 | 未着手 | 0 / 7 |
 | M3 | 制御フロー | 未着手 | 0 / 7 |
@@ -19,7 +19,7 @@
 | M8 | 数値拡張 | 未着手 | 0 / 7 |
 | M9 | 仕上げ | 未着手 | 0 / 9 |
 | — | 横断（CI・文書） | 進行中 | 2 / 6 |
-| | **合計** | | **8 / 88** |
+| | **合計** | | **9 / 88** |
 
 状態は `未着手` / `進行中` / `完了` / `保留`。
 タスクを閉じたらチェックボックスと上表の両方を更新する。
@@ -115,11 +115,12 @@ JDK は M6（`toolchain build-from-jar`）で必要になった時点で `[tools
   - `interp.rs` に `Outcome`（success / result）と `Interpreter`。**失敗は中断しない**
   - `/=` `%=` は floor 除算（`-7/2 = -4`、`-7%2 = 1`）。Rust の `/` `%` とは違う
   - 書き込み系は欠損スコアを 0 で作る。`get` は作らず失敗する
-- [ ] **M0-6** `data` コマンドの実行
+- [x] **M0-6** `data` コマンドの実行
   - `get`（数値はスケール倍、文字列は長さ、list/compound は要素数）
   - `modify ... set value / set from / set string <src> <start> <end> / append / prepend / insert / merge`
   - `remove`、`merge`
-  - 先に書くテスト: `data get` が文字列に対して長さを返すこと（§4.4 の前提）
+  - **storage 対象のみ実行。** entity / block は構文解析はするが「モデル化していない」と診断して失敗
+  - `data get` は文字列に長さを返す（要件定義 §4.4 の「`String::len()` は無料」の前提を実証）
 - [ ] **M0-7** `function` 呼び出しと `return`
   - 呼び出しスタック、`return <value>` / `return run <cmd>` / `return fail`
   - 先に書くテスト: `return` 以降のコマンドが実行されないこと

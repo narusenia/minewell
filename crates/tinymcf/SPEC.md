@@ -185,22 +185,52 @@ Operators: `=` `+=` `-=` `*=` `/=` `%=` `<` (min) `>` (max) `><` (swap).
 `result` is the score after the command for `get`, `set`, `add`, `remove` and
 `operation`, and 1 for the objective commands.
 
-### 4.2 `data` — *pending (M0-6)*
+### 4.2 `data` — **done**
 
-`get`, `merge`, `remove`, and `modify ... set value|set from|set string|append|prepend|insert|merge`.
+```
+data get <target> [<path>] [<scale>]
+data merge <target> <nbt>
+data remove <target> <path>
+data modify <target> <path> <operation>
 
-`data get` returns, as the command's result value:
+operation := set value <nbt>
+           | set|append|prepend|merge from <target> [<path>]
+           | insert <index> from <target> [<path>]
+           | set|append|prepend|merge string <target> [<path>] [<start>] [<end>]
+           | insert <index> string ...
+           | append|prepend|merge value <nbt>
+           | insert <index> value <nbt>
+target    := storage <id> | entity <selector> | block <pos>
+```
 
-| Target | Result |
+**Only `storage` targets execute.** `entity` and `block` parse, so that a compiler's
+output is still recognised, but running one fails with a diagnostic saying so. There is
+no world here (§1); registering stub entity NBT is deferred to the task that first
+needs it.
+
+`data get` with a path returns, scaled by `scale` (default 1.0) and floored:
+
+| Target | Value |
 |---|---|
-| Numeric tag | value × scale, truncated |
+| Numeric tag | its numeric value |
 | String | its length |
 | List, array, compound | its number of elements |
 
 The string case is what makes `String::len()` free in the source language, so it is
-tested rather than assumed.
+tested rather than assumed. `data get` with no path returns 1.
 
-`set string <source> <start> <end>` extracts a substring.
+A path matching **nothing** fails. For `get` and for the *source* of a `from` or
+`string` operation, a path matching **more than one** value also fails, as in vanilla.
+Everywhere else all matches are acted on.
+
+`string` converts the source to text — the characters themselves for a string tag, its
+SNBT otherwise — and takes `[start, end)`. Negative bounds count from the end; an
+omitted `end` runs to the end.
+
+A missing target path is created by `set` and by the list operations, the latter as an
+empty list. This follows the same preferred-parent rule as §3.5.
+
+`data remove` reports how many values it detached as its success count.
 
 ### 4.3 `function` and `return` — *pending (M0-7)*
 

@@ -4,8 +4,97 @@
 //! to the next line and the failure is recorded, because that is what vanilla does and
 //! because the whole point of this interpreter is that nothing fails silently.
 
-use crate::command::{Command, Op, Scoreboard};
+use crate::command::{Command, Data, ModifyKind, Op, Scoreboard, Source, Target};
+use crate::nbt::{Compound, NbtValue};
+use crate::path::NbtPath;
 use crate::world::World;
+
+fn unmodelled(target: &Target) -> String {
+    format!(
+        "{} targets are not modelled by tinymcf; see SPEC.md section 1",
+        target.describe()
+    )
+}
+
+/// Vanilla refuses a source or a `data get` that is ambiguous.
+fn exactly_one(matches: &[NbtValue]) -> Result<NbtValue, String> {
+    match matches {
+        [one] => Ok(one.clone()),
+        [] => Err("found no elements matching the path".to_owned()),
+        many => Err(format!("found {} elements matching the path", many.len())),
+    }
+}
+
+/// What `data get` reports for a value, before scaling.
+fn measure(value: &NbtValue) -> Option<f64> {
+    Some(match value {
+        NbtValue::Byte(v) => *v as f64,
+        NbtValue::Short(v) => *v as f64,
+        NbtValue::Int(v) => *v as f64,
+        NbtValue::Long(v) => *v as f64,
+        NbtValue::Float(v) => *v as f64,
+        NbtValue::Double(v) => *v,
+        NbtValue::String(s) => s.chars().count() as f64,
+        NbtValue::List(items) => items.len() as f64,
+        NbtValue::Compound(fields) => fields.len() as f64,
+        NbtValue::ByteArray(items) => items.len() as f64,
+        NbtValue::IntArray(items) => items.len() as f64,
+        NbtValue::LongArray(items) => items.len() as f64,
+    })
+}
+
+/// `[start, end)`, with negative bounds counting from the end.
+fn slice(text: &str, start: Option<i32>, end: Option<i32>) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len() as i32;
+    let resolve = |i: i32| (if i < 0 { len + i } else { i }).clamp(0, len) as usize;
+    let from = resolve(start.unwrap_or(0));
+    let to = resolve(end.unwrap_or(len));
+    if from >= to {
+        return String::new();
+    }
+    chars[from..to].iter().collect()
+}
+
+fn apply(slot: &mut NbtValue, kind: ModifyKind, value: &NbtValue) {
+    match kind {
+        ModifyKind::Set => *slot = value.clone(),
+        ModifyKind::Merge => merge_into(slot, value),
+        ModifyKind::Append | ModifyKind::Prepend | ModifyKind::Insert(_) => {
+            let NbtValue::List(items) = slot else {
+                return;
+            };
+            let at = match kind {
+                ModifyKind::Append => items.len(),
+                ModifyKind::Prepend => 0,
+                ModifyKind::Insert(i) => {
+                    let len = items.len() as i32;
+                    (if i < 0 { len + i + 1 } else { i }).clamp(0, len) as usize
+                }
+                _ => unreachable!(),
+            };
+            items.insert(at, value.clone());
+        }
+    }
+}
+
+/// Recursive compound merge, as `data merge` does it: nested compounds combine rather
+/// than replacing one another.
+fn merge_into(target: &mut NbtValue, source: &NbtValue) {
+    let (NbtValue::Compound(into), NbtValue::Compound(from)) = (target, source) else {
+        return;
+    };
+    for (key, value) in from {
+        match into.get_mut(key) {
+            Some(existing @ NbtValue::Compound(_)) if matches!(value, NbtValue::Compound(_)) => {
+                merge_into(existing, value)
+            }
+            _ => {
+                into.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
 
 /// Java's `Math.floorDiv`, which vanilla uses instead of truncating division.
 /// `-7 / 2` is `-4` here and `-3` in Rust.
@@ -66,6 +155,7 @@ impl Interpreter {
     pub fn run(&mut self, command: &Command) -> Outcome {
         match command {
             Command::Scoreboard(cmd) => self.scoreboard(cmd),
+            Command::Data(cmd) => self.data(cmd),
             // Unmodelled commands are assumed to have worked; M0-10 records them.
             Command::Unknown { .. } => Outcome::ok(1),
         }
@@ -74,6 +164,119 @@ impl Interpreter {
     fn fail(&mut self, message: impl Into<String>) -> Outcome {
         self.diagnostics.push(message.into());
         Outcome::FAILED
+    }
+
+    fn data(&mut self, cmd: &Data) -> Outcome {
+        match cmd {
+            Data::Get {
+                target,
+                path,
+                scale,
+            } => {
+                let root = match self.read_target(target) {
+                    Ok(root) => root,
+                    Err(message) => return self.fail(message),
+                };
+                let Some(path) = path else {
+                    return Outcome::ok(1);
+                };
+                match exactly_one(&path.resolve(&root)) {
+                    Err(message) => self.fail(message),
+                    Ok(value) => match measure(&value) {
+                        None => self.fail(format!("{value} is not a value data can read")),
+                        Some(n) => Outcome::ok((n * scale).floor() as i32),
+                    },
+                }
+            }
+            Data::Merge { target, value } => self.with_target(target, |root| {
+                merge_into(root, value);
+                Outcome::ok(1)
+            }),
+            Data::Remove { target, path } => {
+                self.with_target(target, |root| match path.remove(root) {
+                    0 => Outcome::FAILED,
+                    n => Outcome {
+                        success: n as u32,
+                        result: n as i32,
+                    },
+                })
+            }
+            Data::Modify {
+                target,
+                path,
+                kind,
+                source,
+            } => {
+                let value = match self.resolve_source(source) {
+                    Ok(value) => value,
+                    Err(message) => return self.fail(message),
+                };
+                self.with_target(target, |root| {
+                    let leaf = if kind.wants_list() {
+                        NbtValue::List(Vec::new())
+                    } else {
+                        NbtValue::Compound(Compound::new())
+                    };
+                    let n = path.modify_creating(root, leaf, &mut |slot| {
+                        apply(slot, *kind, &value);
+                    });
+                    match n {
+                        0 => Outcome::FAILED,
+                        _ => Outcome::ok(1),
+                    }
+                })
+            }
+        }
+    }
+
+    /// A snapshot of a target's root, or why it cannot be read.
+    fn read_target(&self, target: &Target) -> Result<NbtValue, String> {
+        match target {
+            Target::Storage(id) => Ok(self.world.storage(id).clone()),
+            other => Err(unmodelled(other)),
+        }
+    }
+
+    fn with_target(
+        &mut self,
+        target: &Target,
+        f: impl FnOnce(&mut NbtValue) -> Outcome,
+    ) -> Outcome {
+        match target {
+            Target::Storage(id) => f(self.world.storage_mut(id)),
+            other => {
+                let message = unmodelled(other);
+                self.fail(message)
+            }
+        }
+    }
+
+    fn resolve_source(&self, source: &Source) -> Result<NbtValue, String> {
+        match source {
+            Source::Value(value) => Ok(value.clone()),
+            Source::From { target, path } => self.read_source(target, path.as_ref()),
+            Source::Str {
+                target,
+                path,
+                start,
+                end,
+            } => {
+                let value = self.read_source(target, path.as_ref())?;
+                let text = match &value {
+                    NbtValue::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                Ok(NbtValue::String(slice(&text, *start, *end)))
+            }
+        }
+    }
+
+    fn read_source(&self, target: &Target, path: Option<&NbtPath>) -> Result<NbtValue, String> {
+        let root = self.read_target(target)?;
+        match path {
+            None => Ok(root),
+            Some(path) => exactly_one(&path.resolve(&root)),
+        }
     }
 
     fn scoreboard(&mut self, cmd: &Scoreboard) -> Outcome {
@@ -355,5 +558,189 @@ mod tests {
         let (it, out) = run(&["say hi"]);
         assert_eq!(out, Outcome::ok(1));
         assert!(it.diagnostics.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod data_tests {
+    use super::*;
+    use crate::nbt::NbtValue;
+    use crate::path::NbtPath;
+
+    fn run(lines: &[&str]) -> (Interpreter, Outcome) {
+        let mut it = Interpreter::default();
+        let mut last = Outcome::FAILED;
+        for line in lines {
+            last = it.run_line(line);
+        }
+        (it, last)
+    }
+
+    fn at(it: &Interpreter, path: &str) -> Vec<NbtValue> {
+        NbtPath::parse(path)
+            .unwrap()
+            .resolve(it.world.storage("ns:mw"))
+    }
+
+    #[test]
+    fn get_scales_and_floors() {
+        let (_, out) = run(&[
+            "data modify storage ns:mw v set value 7",
+            "data get storage ns:mw v 0.5",
+        ]);
+        assert_eq!(out, Outcome::ok(3));
+
+        // Flooring, not truncation: -3.5 floors to -4.
+        let (_, out) = run(&[
+            "data modify storage ns:mw v set value -7",
+            "data get storage ns:mw v 0.5",
+        ]);
+        assert_eq!(out, Outcome::ok(-4));
+    }
+
+    #[test]
+    fn get_on_a_string_returns_its_length() {
+        // The premise behind `String::len()` being free in the source language.
+        let (_, out) = run(&[
+            r#"data modify storage ns:mw s set value "hello""#,
+            "data get storage ns:mw s",
+        ]);
+        assert_eq!(out, Outcome::ok(5));
+    }
+
+    #[test]
+    fn get_on_a_collection_returns_its_size() {
+        let (_, out) = run(&[
+            "data modify storage ns:mw l set value [1,2,3]",
+            "data get storage ns:mw l",
+        ]);
+        assert_eq!(out, Outcome::ok(3));
+        let (_, out) = run(&[
+            "data modify storage ns:mw c set value {a:1,b:2}",
+            "data get storage ns:mw c",
+        ]);
+        assert_eq!(out, Outcome::ok(2));
+    }
+
+    #[test]
+    fn get_fails_on_no_match_and_on_several() {
+        let (it, out) = run(&["data get storage ns:mw missing"]);
+        assert_eq!(out, Outcome::FAILED);
+        assert!(!it.diagnostics.is_empty());
+
+        let (_, out) = run(&[
+            "data modify storage ns:mw l set value [1,2]",
+            "data get storage ns:mw l[]",
+        ]);
+        assert_eq!(out, Outcome::FAILED);
+    }
+
+    #[test]
+    fn set_value_creates_intermediates() {
+        let (it, out) = run(&["data modify storage ns:mw a.b.c set value 5"]);
+        assert_eq!(out, Outcome::ok(1));
+        assert_eq!(at(&it, "a.b.c"), vec![NbtValue::Int(5)]);
+    }
+
+    #[test]
+    fn set_from_copies_a_value() {
+        let (it, _) = run(&[
+            "data modify storage ns:mw src set value {k:1b}",
+            "data modify storage ns:mw dst set from storage ns:mw src",
+        ]);
+        assert_eq!(at(&it, "dst.k"), vec![NbtValue::Byte(1)]);
+    }
+
+    #[test]
+    fn set_from_fails_when_the_source_matches_several() {
+        let (_, out) = run(&[
+            "data modify storage ns:mw l set value [1,2]",
+            "data modify storage ns:mw dst set from storage ns:mw l[]",
+        ]);
+        assert_eq!(out, Outcome::FAILED);
+    }
+
+    #[test]
+    fn set_string_slices_with_negative_bounds() {
+        let (it, _) = run(&[
+            r#"data modify storage ns:mw s set value "abcdef""#,
+            "data modify storage ns:mw a set string storage ns:mw s 1 3",
+            "data modify storage ns:mw b set string storage ns:mw s -2",
+            "data modify storage ns:mw c set string storage ns:mw s",
+        ]);
+        assert_eq!(at(&it, "a"), vec![NbtValue::String("bc".into())]);
+        assert_eq!(at(&it, "b"), vec![NbtValue::String("ef".into())]);
+        assert_eq!(at(&it, "c"), vec![NbtValue::String("abcdef".into())]);
+    }
+
+    #[test]
+    fn list_operations_create_a_missing_list() {
+        let (it, _) = run(&[
+            "data modify storage ns:mw l append value 2",
+            "data modify storage ns:mw l prepend value 1",
+            "data modify storage ns:mw l insert 2 value 3",
+        ]);
+        assert_eq!(
+            at(&it, "l"),
+            vec![NbtValue::List(vec![
+                NbtValue::Int(1),
+                NbtValue::Int(2),
+                NbtValue::Int(3),
+            ])]
+        );
+    }
+
+    #[test]
+    fn merge_combines_compounds() {
+        let (it, _) = run(&[
+            "data modify storage ns:mw c set value {a:1}",
+            "data modify storage ns:mw c merge value {b:2}",
+            "data merge storage ns:mw {top:9}",
+        ]);
+        assert_eq!(at(&it, "c.a"), vec![NbtValue::Int(1)]);
+        assert_eq!(at(&it, "c.b"), vec![NbtValue::Int(2)]);
+        assert_eq!(at(&it, "top"), vec![NbtValue::Int(9)]);
+    }
+
+    #[test]
+    fn remove_reports_how_many_it_detached() {
+        let (it, out) = run(&[
+            "data modify storage ns:mw l set value [{k:1},{k:2},{k:1}]",
+            "data remove storage ns:mw l[{k:1}]",
+        ]);
+        assert_eq!(out.success, 2);
+        assert_eq!(at(&it, "l").len(), 1);
+
+        let (_, out) = run(&["data remove storage ns:mw nothing"]);
+        assert_eq!(out, Outcome::FAILED);
+    }
+
+    #[test]
+    fn storage_namespaces_do_not_leak_into_each_other() {
+        let (it, _) = run(&[
+            "data modify storage a:mw v set value 1",
+            "data modify storage b:mw v set value 2",
+        ]);
+        assert_eq!(
+            NbtPath::parse("v")
+                .unwrap()
+                .resolve(it.world.storage("a:mw")),
+            vec![NbtValue::Int(1)]
+        );
+    }
+
+    #[test]
+    fn entity_and_block_targets_parse_but_say_they_are_not_modelled() {
+        let (it, out) = run(&["data get entity @s Health"]);
+        assert_eq!(out, Outcome::FAILED);
+        assert!(
+            it.diagnostics[0].contains("not modelled"),
+            "{:?}",
+            it.diagnostics
+        );
+
+        let (it, out) = run(&["data get block 0 0 0 Items"]);
+        assert_eq!(out, Outcome::FAILED);
+        assert!(it.diagnostics[0].contains("not modelled"));
     }
 }

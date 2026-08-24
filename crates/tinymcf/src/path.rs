@@ -69,7 +69,18 @@ impl NbtPath {
     /// Applies `f` to every matched value, creating missing compounds along named
     /// steps. Returns how many values were visited.
     pub fn modify(&self, root: &mut NbtValue, f: &mut impl FnMut(&mut NbtValue)) -> usize {
-        walk(&self.0, root, f)
+        self.modify_creating(root, NbtValue::Compound(Compound::new()), f)
+    }
+
+    /// As [`NbtPath::modify`], but a created leaf takes the shape of `leaf` rather
+    /// than an empty compound. `data modify ... append` needs an empty list there.
+    pub fn modify_creating(
+        &self,
+        root: &mut NbtValue,
+        leaf: NbtValue,
+        f: &mut impl FnMut(&mut NbtValue),
+    ) -> usize {
+        walk_inner(&self.0, root, Some(&leaf), f)
     }
 
     /// Writes `value` to every match. Returns how many were written.
@@ -227,20 +238,17 @@ fn matches(value: &NbtValue, filter: &Compound) -> bool {
     })
 }
 
-/// Walks to every match, creating missing compounds along named steps.
-fn walk(steps: &[Step], value: &mut NbtValue, f: &mut impl FnMut(&mut NbtValue)) -> usize {
-    walk_inner(steps, value, true, f)
-}
-
 /// Walks to every match without creating anything.
 fn walk_existing(steps: &[Step], value: &mut NbtValue, f: &mut impl FnMut(&mut NbtValue)) -> usize {
-    walk_inner(steps, value, false, f)
+    walk_inner(steps, value, None, f)
 }
 
+/// `leaf` is `Some` when missing values may be created; it is the shape to give the
+/// final one.
 fn walk_inner(
     steps: &[Step],
     value: &mut NbtValue,
-    create: bool,
+    leaf: Option<&NbtValue>,
     f: &mut impl FnMut(&mut NbtValue),
 ) -> usize {
     let Some((step, rest)) = steps.split_first() else {
@@ -252,19 +260,26 @@ fn walk_inner(
             let NbtValue::Compound(fields) = value else {
                 return 0;
             };
-            if create && !fields.contains_key(name) {
+            if let Some(leaf) = leaf
+                && !fields.contains_key(name)
+            {
                 // Vanilla picks the created tag from what the *next* step addresses:
-                // an index wants a list, anything else wants a compound.
-                fields.insert(name.clone(), empty_parent_for(rest.first()));
+                // an index wants a list, anything else wants a compound. At the end of
+                // the path the operation decides instead.
+                let created = match rest.first() {
+                    None => leaf.clone(),
+                    next => empty_parent_for(next),
+                };
+                fields.insert(name.clone(), created);
             }
             match fields.get_mut(name) {
-                Some(child) => walk_inner(rest, child, create, f),
+                Some(child) => walk_inner(rest, child, leaf, f),
                 None => 0,
             }
         }
         Step::Match(filter) => {
             if matches(value, filter) {
-                walk_inner(rest, value, create, f)
+                walk_inner(rest, value, leaf, f)
             } else {
                 0
             }
@@ -276,7 +291,7 @@ fn walk_inner(
                 return 0;
             };
             match normalize(*n, items.len()) {
-                Some(i) => walk_inner(rest, &mut items[i], create, f),
+                Some(i) => walk_inner(rest, &mut items[i], leaf, f),
                 None => 0,
             }
         }
@@ -286,7 +301,7 @@ fn walk_inner(
             };
             items
                 .iter_mut()
-                .map(|item| walk_inner(rest, item, create, f))
+                .map(|item| walk_inner(rest, item, leaf, f))
                 .sum()
         }
         Step::Elements(filter) => {
@@ -296,7 +311,7 @@ fn walk_inner(
             items
                 .iter_mut()
                 .filter(|item| matches(item, filter))
-                .map(|item| walk_inner(rest, item, create, f))
+                .map(|item| walk_inner(rest, item, leaf, f))
                 .sum()
         }
     }
