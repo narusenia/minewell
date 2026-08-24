@@ -18,6 +18,7 @@ Edition datapacks (`.mcfunction`). The compiler is written in Rust.
 | `docs/02-spec.md` | Detailed spec: grammar EBNF, typing rules, lowering rules. Written ahead of each milestone. |
 | [`docs/03-plan.md`](docs/03-plan.md) | Implementation plan, task list, progress tracking. |
 | [`crates/tinymcf/SPEC.md`](crates/tinymcf/SPEC.md) | Which subset of mcfunction the interpreter models, and where it departs from vanilla. Ships with the crate. |
+| [`docs/04-handover.md`](docs/04-handover.md) | Where the work stands, what is deferred and why, and what the next milestone has to settle first. |
 
 `01-requirements.md` is the source of truth for *what* and *why*. If an implementation
 detail contradicts it, the implementation is wrong — or the requirements need an
@@ -108,6 +109,27 @@ mise run lint             clippy, warnings denied
 mise run fmt              format
 mise run ci               fmt:check + lint + test. Run before pushing
 ```
+
+## Things that have already caught people out
+
+**Read the generated commands before believing a lowering is right.** Two real bugs got
+through unit tests and were found by looking at the output:
+
+```
+cargo test -p mwlc --test vertical print_generated -- --ignored --nocapture
+```
+
+**`execute … run <cmd>` costs two commands, not one** — the `execute` and the command it
+runs (`crates/tinymcf/SPEC.md` §5). Cost assertions written from intuition have been
+wrong every time; derive them from the printed output.
+
+**Never set an environment variable inside a test.** Tests in one binary share the
+process and run in parallel. Pass the location in as a value instead — that is why
+`Toolchains` carries its root and `driver::build_with` takes one.
+
+**A test that asserts an error must be able to fail.** Two tests here passed while
+testing nothing: one because a helper swallowed the case, one because the reproduction
+was too weak. When writing a check for a bug, watch it fail first.
 
 ## Definition of done
 
