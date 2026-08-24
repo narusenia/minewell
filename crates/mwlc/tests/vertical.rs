@@ -620,3 +620,67 @@ mod contexts {
         assert_eq!(mc.commands_run, 2);
     }
 }
+
+/// The control register is per function and survives between invocations, so anything
+/// left in it has to be cleaned up before the next one.
+mod control_register {
+    use super::harness::{NS, load, local};
+
+    #[test]
+    fn a_function_that_returned_early_behaves_the_same_the_next_time() {
+        let mut mc = load(
+            "fn main() {
+                 let mut x = 0;
+                 if true { x = 1; return; }
+                 x = 2;
+             }",
+        );
+        mc.call(&format!("{NS}:main"));
+        assert_eq!(local(&mc, "main", "x"), Some(1));
+
+        // A stale control register would make the second call take a different path.
+        mc.run_line("scoreboard players set $main.x test.v 0");
+        mc.call(&format!("{NS}:main"));
+        assert_eq!(local(&mc, "main", "x"), Some(1), "the second call differed");
+        assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
+    }
+
+    #[test]
+    fn a_stale_return_does_not_make_the_next_call_return_too() {
+        // Call one returns from inside the loop, leaving the register raised. Call two
+        // finds no entities, so nothing raises it again — and must still reach the end.
+        let mut mc = load(
+            r#"fn main() {
+                   let mut n = 0;
+                   for z in @e[type=zombie] {
+                       n += 1;
+                       return;
+                   }
+                   raw!("say finished");
+               }"#,
+        );
+        super::harness::zombies(&mut mc, &["z1", "z2"]);
+        mc.call(&format!("{NS}:main"));
+        assert!(mc.effects.is_empty(), "call one returned before the end");
+
+        mc.world
+            .bind_selector("@e[type=zombie]", Vec::<String>::new());
+        mc.call(&format!("{NS}:main"));
+        assert_eq!(mc.effects.len(), 1, "call two should have reached the end");
+    }
+
+    #[test]
+    fn a_loop_after_an_early_return_still_runs_on_the_next_call() {
+        let mut mc = load(
+            "fn main() {
+                 let mut hits = 0;
+                 if hits == 99 { return; }
+                 while hits < 3 { hits += 1; }
+             }",
+        );
+        mc.call(&format!("{NS}:main"));
+        assert_eq!(local(&mc, "main", "hits"), Some(3));
+        mc.call(&format!("{NS}:main"));
+        assert_eq!(local(&mc, "main", "hits"), Some(3));
+    }
+}

@@ -270,11 +270,13 @@ pub fn lower(hir: &Hir) -> Mir {
         components,
         temps: Temps::default(),
         used: Vec::new(),
+        used_ctl: false,
         initialised: Vec::new(),
     };
     let mut functions = Vec::new();
     for f in &hir.functions {
         program.used.clear();
+        program.used_ctl = false;
         // Parameters arrive with values already in them, written by the caller.
         program.initialised.clear();
         program.initialised.extend(f.params.iter().copied());
@@ -292,7 +294,22 @@ pub fn lower(hir: &Hir) -> Mir {
         for stmt in &f.body {
             cx.stmt(stmt);
         }
-        let (insts, generated) = (cx.insts, cx.generated);
+        let (mut insts, generated) = (cx.insts, cx.generated);
+        // The register outlives the call: a `return` that reached the top left it
+        // raised, and the next invocation would read that as its own. Clear it on the
+        // way in, where the value can no longer mean anything.
+        if program.used_ctl {
+            insts.insert(
+                0,
+                Inst::Const {
+                    dst: Reg {
+                        holder: format!("${}.ctl", f.name),
+                        kind: RegKind::Var,
+                    },
+                    value: CTL_NORMAL,
+                },
+            );
+        }
         functions.push(Function {
             id: f.id,
             path: f.path.clone(),
@@ -335,6 +352,8 @@ struct Program<'a> {
     temps: Temps,
     /// Temporaries handed out in the function being lowered, in order.
     used: Vec<Reg>,
+    /// Whether the function being lowered touched the control register at all.
+    used_ctl: bool,
     /// Locals that have been given a value at this point in the lowering. A local
     /// whose `let` has not run yet holds nothing, and reading it to save it would fail
     /// the command — so it is not saved.
@@ -933,7 +952,8 @@ impl<'p> Lowering<'_, 'p> {
         });
     }
 
-    fn ctl(&self) -> Reg {
+    fn ctl(&mut self) -> Reg {
+        self.program.used_ctl = true;
         Reg {
             holder: format!("${}.ctl", self.function.name),
             kind: RegKind::Var,

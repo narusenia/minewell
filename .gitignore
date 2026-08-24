@@ -1,4 +1,5 @@
-/target
+# Anywhere, not just the root: each example under examples/ builds into its own.
+target/
 **/*.rs.bk
 *.pdb
 
