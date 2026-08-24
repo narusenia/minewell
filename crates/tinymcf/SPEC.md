@@ -334,17 +334,39 @@ skipped by a false `execute if` leaves nothing behind.
 Unrecognised commands are retained verbatim rather than rejected, so that a compiler
 emitting something outside this subset still produces a runnable trace.
 
-## 5. Limits and measurement — **partly done** (reporting is M0-11)
+## 5. Limits and measurement — **done**
 
 A run has a command budget, `maxCommandChainLength`, default 65536. Executing more
-commands than that stops the run and records a diagnostic.
+commands than that stops the run and records a diagnostic. This is not only fidelity to
+vanilla: it is what stops a runaway recursion in a test from hanging.
 
-This is not only fidelity to vanilla: it is what stops a runaway recursion in a test
-from hanging, so it is enforced from the moment functions can call each other.
+There is also a **call depth limit**, default 256, which exceeding fails with a
+diagnostic. This one is *not* vanilla — vanilla's executor is a queue and has no depth
+of its own. tinymcf walks calls recursively, so without a limit a runaway recursion
+overflows the native stack and takes the test process with it. Raising the limit means
+giving the interpreter a bigger thread stack to run on.
 
-Still to come (M0-11): a per-function breakdown and maximum call depth. These numbers
-are the evidence for optimisation work — a pass is justified when the count drops and
-the semantics tests still pass.
+A report is available at any point:
+
+| Field | Meaning |
+|---|---|
+| `commands` | every command executed, at any depth |
+| `per_function` | commands charged to each function |
+| `max_depth` | deepest nesting of function calls reached |
+| `over_budget` | whether the budget stopped the run |
+
+Accounting rules, so the numbers are derivable rather than magic:
+
+- **One command, one charge**, wherever it ran.
+- A command is charged to the **innermost function** it ran inside. Commands typed at
+  the top level are counted in `commands` but charged to no function.
+- `execute ... run <command>` charges **both**: the `execute` itself and the command it
+  ran. That mirrors what the game does, and it is why an `execute` chain is not free.
+- A `function` command is charged where it appears; the body's commands are charged to
+  the callee.
+
+These numbers are the evidence for optimisation work: a pass is justified when the
+count drops and the semantics tests still pass.
 
 ## 6. Determinism
 

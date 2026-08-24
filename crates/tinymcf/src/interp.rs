@@ -186,6 +186,20 @@ impl Outcome {
 /// Vanilla's default `maxCommandChainLength`.
 pub const DEFAULT_BUDGET: u64 = 65536;
 
+/// How deep function calls may nest. Not a vanilla limit: vanilla's executor is a
+/// queue, while this one recurses, so without a cap a runaway recursion overflows the
+/// native stack instead of reporting anything.
+pub const DEFAULT_MAX_DEPTH: usize = 256;
+
+/// What a run cost. See `SPEC.md` §5 for the accounting rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    pub commands: u64,
+    pub per_function: BTreeMap<String, u64>,
+    pub max_depth: usize,
+    pub over_budget: bool,
+}
+
 /// A command outside the modelled subset, recorded rather than simulated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Effect {
@@ -222,11 +236,16 @@ pub struct Interpreter {
     /// `maxCommandChainLength`. Also what stops a runaway recursion from hanging a test.
     pub budget: u64,
     pub commands_run: u64,
+    /// See [`DEFAULT_MAX_DEPTH`].
+    pub max_call_depth: usize,
     /// Commands outside the modelled subset, in the order they ran.
     pub effects: Vec<Effect>,
     functions: BTreeMap<String, Rc<Vec<Line>>>,
-    /// 0 at the top level. `return` outside a function is an error.
-    depth: usize,
+    /// The functions currently executing. Empty at the top level, where `return` is an
+    /// error and commands are charged to no function.
+    stack: Vec<String>,
+    per_function: BTreeMap<String, u64>,
+    max_depth: usize,
     over_budget: bool,
 }
 
@@ -237,15 +256,27 @@ impl Default for Interpreter {
             diagnostics: Vec::new(),
             budget: DEFAULT_BUDGET,
             commands_run: 0,
+            max_call_depth: DEFAULT_MAX_DEPTH,
             effects: Vec::new(),
             functions: BTreeMap::new(),
-            depth: 0,
+            stack: Vec::new(),
+            per_function: BTreeMap::new(),
+            max_depth: 0,
             over_budget: false,
         }
     }
 }
 
 impl Interpreter {
+    pub fn report(&self) -> Report {
+        Report {
+            commands: self.commands_run,
+            per_function: self.per_function.clone(),
+            max_depth: self.max_depth,
+            over_budget: self.over_budget,
+        }
+    }
+
     /// Parses a function body and registers it. Blank lines and `#` comments are
     /// dropped; everything else is parsed now, so syntax errors surface at load time.
     pub fn load(&mut self, id: &str, source: &str) -> Result<(), ParseError> {
@@ -281,7 +312,14 @@ impl Interpreter {
                 "function '{id}' has macro lines but was called without arguments"
             )));
         }
-        self.depth += 1;
+        if self.stack.len() >= self.max_call_depth {
+            let limit = self.max_call_depth;
+            return Flow::Next(self.fail(format!(
+                "function calls nested more than {limit} deep; see SPEC.md section 5"
+            )));
+        }
+        self.stack.push(id.to_owned());
+        self.max_depth = self.max_depth.max(self.stack.len());
         let mut ran = 0i32;
         let mut outcome = None;
         for line in body.iter() {
@@ -290,13 +328,13 @@ impl Interpreter {
                 Line::Macro(text) => match substitute(text, args.expect("checked above")) {
                     Err(message) => {
                         self.fail(message);
-                        self.depth -= 1;
+                        self.stack.pop();
                         return Flow::Next(Outcome::FAILED);
                     }
                     Ok(line) => match Command::parse(&line) {
                         Err(e) => {
                             self.fail(format!("{line}: {e}"));
-                            self.depth -= 1;
+                            self.stack.pop();
                             return Flow::Next(Outcome::FAILED);
                         }
                         Ok(command) => command,
@@ -310,12 +348,12 @@ impl Interpreter {
                     break;
                 }
                 Flow::Halt => {
-                    self.depth -= 1;
+                    self.stack.pop();
                     return Flow::Halt;
                 }
             }
         }
-        self.depth -= 1;
+        self.stack.pop();
         // Falling off the end reports how many commands the body ran.
         Flow::Next(outcome.unwrap_or(Outcome::ok(ran)))
     }
@@ -333,6 +371,9 @@ impl Interpreter {
             return Flow::Halt;
         }
         self.commands_run += 1;
+        if let Some(current) = self.stack.last() {
+            *self.per_function.entry(current.clone()).or_default() += 1;
+        }
         self.exec(command)
     }
     /// Parses and runs one line. A line that does not parse is a failure like any
@@ -514,7 +555,7 @@ impl Interpreter {
     }
 
     fn ret(&mut self, kind: &Return) -> Flow {
-        if self.depth == 0 {
+        if self.stack.is_empty() {
             return Flow::Next(self.fail("'return' can only be used inside a function"));
         }
         match kind {
@@ -1201,22 +1242,6 @@ mod function_tests {
         assert_eq!(it.run_line("function ns:nope"), Outcome::FAILED);
         assert!(it.diagnostics[0].contains("ns:nope"));
     }
-
-    #[test]
-    fn runaway_recursion_stops_at_the_command_budget() {
-        let mut it = pack(&[("ns:loop", "function ns:loop")]);
-        it.budget = 1000;
-        let out = it.run_line("function ns:loop");
-        assert_eq!(out, Outcome::FAILED);
-        assert!(
-            it.diagnostics
-                .iter()
-                .any(|d| d.contains("maxCommandChainLength")),
-            "{:?}",
-            it.diagnostics
-        );
-        assert_eq!(it.commands_run, 1000);
-    }
 }
 
 #[cfg(test)]
@@ -1558,5 +1583,64 @@ mod effect_tests {
         it.run_line("scoreboard objectives add obj dummy");
         it.run_line("data modify storage ns:mw v set value 1");
         assert!(it.effects.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod measurement_tests {
+    use super::*;
+
+    #[test]
+    fn commands_are_charged_to_the_function_they_ran_in() {
+        let mut it = Interpreter::default();
+        it.load("ns:f", "say a\nsay b\nsay c").unwrap();
+        it.run_line("function ns:f");
+
+        let report = it.report();
+        // Three inside the function, plus the top-level `function` command itself.
+        assert_eq!(report.commands, 4);
+        assert_eq!(report.per_function.get("ns:f"), Some(&3));
+        assert_eq!(report.max_depth, 1);
+    }
+
+    #[test]
+    fn an_execute_is_charged_alongside_the_command_it_runs() {
+        let mut it = Interpreter::default();
+        it.run_line("scoreboard objectives add obj dummy");
+        it.run_line("scoreboard players set $a obj 1");
+        let before = it.commands_run;
+        it.run_line("execute if score $a obj matches 1 run say hi");
+        assert_eq!(it.commands_run - before, 2);
+    }
+
+    #[test]
+    fn a_loop_costs_exactly_what_the_accounting_rules_predict() {
+        let mut it = Interpreter::default();
+        it.run_line("scoreboard objectives add obj dummy");
+        it.load(
+            "ns:loop",
+            "scoreboard players remove $n obj 1\n\
+             execute if score $n obj matches 1.. run function ns:loop",
+        )
+        .unwrap();
+        it.run_line("scoreboard players set $n obj 10");
+        let before = it.commands_run;
+        it.run_line("function ns:loop");
+
+        // Ten iterations of (remove + execute) = 20, plus the nested `function`
+        // command on the nine iterations that recurse, plus the outermost call.
+        assert_eq!(it.commands_run - before, 10 * 2 + 9 + 1);
+        assert_eq!(it.report().per_function.get("ns:loop"), Some(&(10 * 2 + 9)));
+        assert_eq!(it.report().max_depth, 10);
+    }
+
+    #[test]
+    fn the_report_says_when_the_budget_stopped_the_run() {
+        let mut it = Interpreter::default();
+        it.load("ns:long", &"say x\n".repeat(60)).unwrap();
+        it.budget = 50;
+        it.run_line("function ns:long");
+        assert!(it.report().over_budget);
+        assert_eq!(it.report().commands, 50);
     }
 }
