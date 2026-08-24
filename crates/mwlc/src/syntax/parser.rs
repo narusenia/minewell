@@ -151,10 +151,7 @@ impl Parser {
         self.expect(Punct::LBrace, "{")?;
         let mut methods = Vec::new();
         while self.peek() != Some(&TokenKind::Punct(Punct::RBrace)) {
-            match self.item() {
-                Some(method) => methods.push(method),
-                None => return None,
-            }
+            methods.push(self.item()?);
         }
         self.expect(Punct::RBrace, "}")?;
         let end = self.previous_end();
