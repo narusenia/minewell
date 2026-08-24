@@ -114,7 +114,8 @@ mise run ci               fmt:check + lint + test. Run before pushing
 A task is complete when:
 
 - The task's "test to write first" passes
-- `mise run ci` is green
+- `mise run ci` exits 0. **Check the exit status, not the output** — the tasks run in
+  parallel, so a green `test` line can sit above a failed `lint`
 - Snapshots are updated if output changed (`mise run snap`)
 - The checkbox and the summary table in `docs/03-plan.md` are both updated
 

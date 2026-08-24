@@ -340,7 +340,7 @@ mod tests {
             "scoreboard players set $a obj 1",
             "scoreboard objectives remove obj",
         ]);
-        assert_eq!(it.world.scoreboard.has_objective("obj"), false);
+        assert!(!it.world.scoreboard.has_objective("obj"));
     }
 
     #[test]
