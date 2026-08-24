@@ -9,6 +9,8 @@
 use mwlc::driver;
 use mwlc::emit::{Options, Source};
 use tinymcf::Interpreter;
+use tinymcf::nbt::NbtValue;
+use tinymcf::path::NbtPath;
 
 /// The namespace compiled programs are placed in.
 pub const NS: &str = "test";
@@ -51,6 +53,24 @@ pub fn local(mc: &Interpreter, function: &str, name: &str) -> Option<i32> {
         .scoreboard
         .get(&format!("{NS}.v"), &format!("${function}.{name}"))
         .expect("the objective exists")
+}
+
+/// The NBT a composite binding holds, by the name the author wrote.
+///
+/// Composite values live in storage rather than on the scoreboard, so reading one back
+/// means walking `mw.vars` (spec section 6.18) instead of asking for a score.
+pub fn stored(mc: &Interpreter, function: &str, name: &str) -> Option<NbtValue> {
+    at_path(mc, &format!("mw.vars.{function}.{name}"))
+}
+
+/// The NBT at a path under `<ns>:mw`, for asserting on a field directly.
+pub fn at_path(mc: &Interpreter, path: &str) -> Option<NbtValue> {
+    let root = mc.world.storage(&format!("{NS}:mw"));
+    NbtPath::parse(path)
+        .expect("a valid path")
+        .resolve(root)
+        .into_iter()
+        .next()
 }
 
 /// Declares entities and what a selector finds, standing in for a world.

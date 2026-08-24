@@ -336,6 +336,9 @@ fn print_generated_commands() {
         "fn main() { let mut x = 0; while x < 3 { x += 1; } }",
         "fn fact(n: i32) -> i32 { if n <= 1 { return 1; } return n * fact(n - 1); }
          fn main() { let x = fact(3); }",
+        "struct Inner { a: i32 } struct Outer { inner: Inner, b: bool }
+         fn take(o: Outer) {}
+         fn main() { let n = 2; let o = Outer { inner: Inner { a: n }, b: true }; take(o); }",
     ] {
         println!("=== {src}");
         let options = mwlc::emit::Options {
@@ -682,5 +685,116 @@ mod control_register {
         assert_eq!(local(&mc, "main", "hits"), Some(3));
         mc.call(&format!("{NS}:main"));
         assert_eq!(local(&mc, "main", "hits"), Some(3));
+    }
+}
+
+/// Composite values. Spec sections 3.10, 4.8 and 6.18: a `struct` is a compound in
+/// storage, so these ask what is in storage rather than what is in a register.
+mod structs {
+    use super::harness::{cost, load, run, stored};
+    use tinymcf::nbt::NbtValue;
+
+    fn compound(fields: &[(&str, NbtValue)]) -> NbtValue {
+        NbtValue::compound(fields.iter().map(|(k, v)| (*k, v.clone())))
+    }
+
+    #[test]
+    fn a_constant_construction_is_one_command() {
+        let mc = run("struct Point { x: i32, y: bool } \
+             fn main() { let p = Point { x: 1, y: true }; }");
+        assert_eq!(
+            stored(&mc, "main", "p"),
+            Some(compound(&[
+                ("x", NbtValue::Int(1)),
+                ("y", NbtValue::Byte(1))
+            ]))
+        );
+        assert_eq!(cost(&mc), 1, "the whole compound is one 'data modify'");
+    }
+
+    #[test]
+    fn a_runtime_field_is_written_after_the_constant_ones() {
+        let mc = run("struct Point { x: i32, y: i32 } \
+             fn main() { let n = 6; let p = Point { x: n * 7, y: 2 }; }");
+        assert_eq!(
+            stored(&mc, "main", "p"),
+            Some(compound(&[
+                ("x", NbtValue::Int(42)),
+                ("y", NbtValue::Int(2))
+            ]))
+        );
+    }
+
+    #[test]
+    fn a_bool_field_is_a_byte_even_when_it_is_computed() {
+        // Vanilla treats Byte(1) and Int(1) as different values and silently ignores
+        // the wrong one, so the tag is part of the answer.
+        let mc = run("struct Flags { on: bool } \
+             fn main() { let n = 3; let f = Flags { on: n > 1 }; }");
+        assert_eq!(
+            stored(&mc, "main", "f"),
+            Some(compound(&[("on", NbtValue::Byte(1))]))
+        );
+    }
+
+    #[test]
+    fn a_struct_can_hold_another_struct() {
+        let mc = run(
+            "struct Inner { a: i32 } struct Outer { inner: Inner, b: i32 } \
+             fn main() { let o = Outer { inner: Inner { a: 1 }, b: 2 }; }",
+        );
+        assert_eq!(
+            stored(&mc, "main", "o"),
+            Some(compound(&[
+                ("inner", compound(&[("a", NbtValue::Int(1))])),
+                ("b", NbtValue::Int(2)),
+            ]))
+        );
+    }
+
+    #[test]
+    fn a_nested_struct_can_be_a_binding_of_its_own() {
+        let mc = run("struct Inner { a: i32 } struct Outer { inner: Inner } \
+             fn main() { let i = Inner { a: 7 }; let o = Outer { inner: i }; }");
+        assert_eq!(
+            stored(&mc, "main", "o"),
+            Some(compound(&[("inner", compound(&[("a", NbtValue::Int(7))]))]))
+        );
+    }
+
+    #[test]
+    fn copying_a_binding_is_one_command() {
+        let mc = run("struct Point { x: i32 } \
+             fn main() { let p = Point { x: 5 }; let q = p; }");
+        assert_eq!(
+            stored(&mc, "main", "q"),
+            Some(compound(&[("x", NbtValue::Int(5))]))
+        );
+        assert_eq!(cost(&mc), 2, "one command to build, one to copy");
+    }
+
+    #[test]
+    fn a_struct_can_be_passed_to_a_function() {
+        let mut mc = load(
+            "struct Point { x: i32 } \
+             fn take(p: Point) { raw!(\"say taken\"); } \
+             fn main() { let p = Point { x: 9 }; take(p); }",
+        );
+        mc.call("test:main");
+        assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
+        assert_eq!(
+            stored(&mc, "take", "p"),
+            Some(compound(&[("x", NbtValue::Int(9))]))
+        );
+    }
+
+    #[test]
+    fn a_mutable_binding_can_be_replaced_wholesale() {
+        let mc = run("struct Point { x: i32 } \
+             fn main() { let mut p = Point { x: 1 }; p = Point { x: 2 }; }");
+        assert_eq!(
+            stored(&mc, "main", "p"),
+            Some(compound(&[("x", NbtValue::Int(2))]))
+        );
     }
 }

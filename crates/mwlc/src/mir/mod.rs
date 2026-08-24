@@ -13,7 +13,7 @@
 //!
 //! Today every function is one block. Control flow arrives in M3.
 
-use crate::hir::{self, FnId, Hir, LocalId, Type};
+use crate::hir::{self, FnId, Hir, LocalId, StructDef, Type};
 use crate::syntax::ast::{BinaryOp, UnaryOp};
 use crate::syntax::lexer::Span;
 
@@ -107,6 +107,16 @@ pub enum Inst {
     Restore { reg: Reg, slot: u32 },
     /// `return <value>`
     Return { value: i32 },
+    /// `data modify storage <ns>:mw <path> set value <snbt>`
+    SetValue { path: String, value: String },
+    /// `data modify storage <ns>:mw <dst> set from storage <ns>:mw <src>`
+    CopyData { dst: String, src: String },
+    /// `execute store result storage <ns>:mw <path> <tag> 1 run <inst>`
+    StoreData {
+        path: String,
+        tag: &'static str,
+        inst: Box<Inst>,
+    },
     /// `execute <cond> run <inst>`. Still one command, so still one instruction.
     Guarded { cond: Cond, inst: Box<Inst> },
     /// `execute as|at <selector> run <inst>`.
@@ -267,6 +277,7 @@ pub fn lower(hir: &Hir) -> Mir {
     let components = strongly_connected(hir);
     let mut program = Program {
         functions: &hir.functions,
+        structs: &hir.structs,
         components,
         temps: Temps::default(),
         used: Vec::new(),
@@ -346,6 +357,7 @@ impl Temps {
 /// State shared by every block of one program.
 struct Program<'a> {
     functions: &'a [hir::Function],
+    structs: &'a [StructDef],
     /// Which strongly connected component each function belongs to. Two functions in
     /// the same one can reach each other, so a call between them is recursive.
     components: Vec<u32>,
@@ -530,6 +542,23 @@ fn param_reg(function: &hir::Function, local: LocalId) -> Reg {
     local_reg(function, local)
 }
 
+/// Where a composite binding lives: `mw.vars.<function>.<binding>` in `<ns>:mw`
+/// (spec section 6.18). Qualified by function for the same reason a register is.
+fn local_path(function: &hir::Function, local: LocalId) -> String {
+    format!(
+        "mw.vars.{}.{}",
+        function.name, function.locals[local.0 as usize].name
+    )
+}
+
+/// The NBT tag a scalar field is written as (requirements section 4.2).
+fn tag_of(ty: Type) -> &'static str {
+    match ty {
+        Type::Bool => "byte",
+        _ => "int",
+    }
+}
+
 struct Lowering<'a, 'p> {
     function: &'a hir::Function,
     program: &'a mut Program<'p>,
@@ -575,6 +604,15 @@ impl<'p> Lowering<'_, 'p> {
                 text: raw.text.clone(),
                 span: raw.span,
             }),
+            hir::Stmt::Let { local, value, .. } if self.local_ty(*local).is_storage() => {
+                let path = local_path(self.function, *local);
+                self.store_struct(&path, value);
+                self.program.initialised.push(*local);
+            }
+            hir::Stmt::Assign { local, value, .. } if self.local_ty(*local).is_storage() => {
+                let path = local_path(self.function, *local);
+                self.store_struct(&path, value);
+            }
             hir::Stmt::Let { local, value, .. } => {
                 let dst = self.local(*local);
                 self.store(dst, None, value);
@@ -587,6 +625,89 @@ impl<'p> Lowering<'_, 'p> {
             } => {
                 let dst = self.local(*local);
                 self.store(dst, *op, value);
+            }
+        }
+    }
+
+    fn local_ty(&self, local: LocalId) -> Type {
+        self.function.locals[local.0 as usize].ty
+    }
+
+    /// Writes a composite value to `path`.
+    ///
+    /// One `set value` puts everything that is known now in place, and only the fields
+    /// that are not get a command of their own (spec section 6.18).
+    fn store_struct(&mut self, path: &str, value: &hir::Expr) {
+        match &value.kind {
+            hir::ExprKind::Struct { .. } => {
+                let snbt = self.snbt(value);
+                self.insts.push(Inst::SetValue {
+                    path: path.to_owned(),
+                    value: snbt,
+                });
+                self.write_runtime_fields(path, value);
+            }
+            hir::ExprKind::Local(local) => {
+                let src = local_path(self.function, *local);
+                self.insts.push(Inst::CopyData {
+                    dst: path.to_owned(),
+                    src,
+                });
+            }
+            other => unreachable!("{other:?} is not a composite value"),
+        }
+    }
+
+    /// The value as SNBT, with a placeholder wherever it is not known until runtime.
+    ///
+    /// The placeholder costs nothing: the key has to be in the compound either way,
+    /// and writing it here means the store that follows overwrites rather than
+    /// creates — one fewer way for a mistake to leave the field quietly absent.
+    fn snbt(&self, value: &hir::Expr) -> String {
+        match &value.kind {
+            hir::ExprKind::Int(n) => n.to_string(),
+            hir::ExprKind::Bool(b) => format!("{}b", i32::from(*b)),
+            hir::ExprKind::Struct { id, fields } => {
+                let def = &self.program.structs[id.0 as usize];
+                let body = def
+                    .fields
+                    .iter()
+                    .zip(fields)
+                    .map(|(field, value)| format!("{}:{}", field.name, self.snbt(value)))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{{{body}}}")
+            }
+            // Not known now: leave room for the write that follows.
+            _ => match value.ty {
+                Type::Bool => "0b".to_owned(),
+                Type::Struct(_) => "{}".to_owned(),
+                _ => "0".to_owned(),
+            },
+        }
+    }
+
+    /// Writes the fields `snbt` could only leave a placeholder for.
+    fn write_runtime_fields(&mut self, path: &str, value: &hir::Expr) {
+        let hir::ExprKind::Struct { id, fields } = &value.kind else {
+            return;
+        };
+        let def = self.program.structs[id.0 as usize].clone();
+        for (field, value) in def.fields.iter().zip(fields) {
+            let path = format!("{path}.{}", field.name);
+            match &value.kind {
+                hir::ExprKind::Int(_) | hir::ExprKind::Bool(_) => {}
+                hir::ExprKind::Struct { .. } => self.write_runtime_fields(&path, value),
+                _ if field.ty.is_storage() => self.store_struct(&path, value),
+                _ => {
+                    let src = self.expr(value);
+                    let src = self.materialise(src);
+                    self.insts.push(Inst::StoreData {
+                        path,
+                        tag: tag_of(field.ty),
+                        inst: Box::new(Inst::Get { src }),
+                    });
+                }
             }
         }
     }
@@ -968,7 +1089,12 @@ impl<'p> Lowering<'_, 'p> {
 
         // Arguments are evaluated before anything is saved: they are expressions in
         // the caller's frame and must be read while that frame is still intact.
-        let values: Vec<Value> = args.iter().map(|arg| self.expr(arg)).collect();
+        // A composite argument is written straight into the callee's storage path
+        // below; there is no register to hold it in the meantime.
+        let values: Vec<Option<Value>> = args
+            .iter()
+            .map(|arg| (!arg.ty.is_storage()).then(|| self.expr(arg)))
+            .collect();
 
         let saved = if recursive {
             let saved = self.live_registers();
@@ -984,9 +1110,14 @@ impl<'p> Lowering<'_, 'p> {
             Vec::new()
         };
 
-        for (value, param) in values.into_iter().zip(&callee_fn.params) {
-            let dst = param_reg(callee_fn, *param);
-            self.copy_into(dst, value);
+        for ((value, arg), param) in values.into_iter().zip(args).zip(&callee_fn.params) {
+            match value {
+                Some(value) => self.copy_into(param_reg(callee_fn, *param), value),
+                None => {
+                    let path = local_path(callee_fn, *param);
+                    self.store_struct(&path, arg);
+                }
+            }
         }
 
         let call = Inst::Call {
@@ -1100,6 +1231,9 @@ impl<'p> Lowering<'_, 'p> {
                 unreachable!("a {} has no runtime value", expr.ty.name())
             }
             hir::ExprKind::Str(_) => unreachable!("strings have no runtime value until M8"),
+            // Composite values live in storage; every path that produces one goes
+            // through `store_struct`, which never asks for a register.
+            hir::ExprKind::Struct { .. } => unreachable!("a struct is not a register value"),
         }
     }
 

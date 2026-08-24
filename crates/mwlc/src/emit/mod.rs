@@ -275,6 +275,18 @@ fn command(inst: &Inst, ns: &str) -> String {
                 "execute store result score {r} {robj} run data get storage {ns}:mw mw.stack[-1].r{slot}"
             )
         }
+        Inst::SetValue { path, value } => {
+            format!("data modify storage {ns}:mw {path} set value {value}")
+        }
+        Inst::CopyData { dst, src } => {
+            format!("data modify storage {ns}:mw {dst} set from storage {ns}:mw {src}")
+        }
+        Inst::StoreData { path, tag, inst } => {
+            format!(
+                "execute store result storage {ns}:mw {path} {tag} 1 run {}",
+                command(inst, ns)
+            )
+        }
         Inst::Return { value } => format!("return {value}"),
         Inst::Guarded { cond, inst } => {
             format!("execute {} run {}", condition(cond, ns), command(inst, ns))

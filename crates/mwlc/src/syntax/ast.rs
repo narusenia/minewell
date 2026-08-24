@@ -24,6 +24,23 @@ pub struct Item {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ItemKind {
     Fn(FnItem),
+    Struct(StructItem),
+}
+
+/// `struct Point { x: i32, y: i32 }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructItem {
+    pub name: Ident,
+    pub fields: Vec<FieldDef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldDef {
+    /// `#[nbt(..)]` and friends. Carried so an unknown one can be reported (M7-3).
+    pub attrs: Vec<Attribute>,
+    pub name: Ident,
+    pub ty: TypeName,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +152,22 @@ pub enum Expr {
     Selector(SelectorLit),
     Resource(ResourceLit),
     Macro(MacroCall),
+    Struct(StructLit),
+}
+
+/// `Point { x: 1, y: 2 }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructLit {
+    pub name: Ident,
+    pub fields: Vec<FieldInit>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldInit {
+    pub name: Ident,
+    pub value: Expr,
+    pub span: Span,
 }
 
 /// `@e[type=zombie]`, body verbatim. Its contents are the game's grammar, not this
@@ -173,6 +206,7 @@ impl Expr {
             Expr::Selector(e) => e.span,
             Expr::Resource(e) => e.span,
             Expr::Macro(e) => e.span,
+            Expr::Struct(e) => e.span,
         }
     }
 }

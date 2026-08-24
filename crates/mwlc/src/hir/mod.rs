@@ -27,6 +27,10 @@ pub struct FnId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LocalId(pub u32);
 
+/// Identifies a `struct` definition within the program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StructId(pub u32);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
     I32,
@@ -38,6 +42,9 @@ pub enum Type {
     Resource,
     /// `pos!(~ ~1 ~)`. Compile-time only.
     Pos,
+    /// A composite value. It lives in storage rather than in a register, which is a
+    /// third category: neither a score nor compile-time only (spec section 5).
+    Struct(StructId),
 }
 
 impl Type {
@@ -57,6 +64,11 @@ impl Type {
         matches!(self, Type::Selector | Type::Resource | Type::Pos)
     }
 
+    /// Whether values of this type live in storage rather than on the scoreboard.
+    pub fn is_storage(&self) -> bool {
+        matches!(self, Type::Struct(_))
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Type::I32 => "i32",
@@ -64,13 +76,46 @@ impl Type {
             Type::Selector => "selector",
             Type::Resource => "ResourceLocation",
             Type::Pos => "Pos",
+            // Only reachable where the struct table is out of reach; every diagnostic
+            // that can name the struct goes through `type_name` instead.
+            Type::Struct(_) => "struct",
         }
+    }
+}
+
+/// A type as a diagnostic should spell it, which for a `struct` is its own name.
+fn type_name(ty: Type, structs: &[StructDef]) -> String {
+    match ty {
+        Type::Struct(id) => structs[id.0 as usize].name.clone(),
+        other => other.name().to_owned(),
+    }
+}
+
+/// A `struct` definition: an NBT compound with a known shape (spec section 4.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructDef {
+    pub id: StructId,
+    pub name: String,
+    pub fields: Vec<Field>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Field {
+    pub name: String,
+    pub ty: Type,
+}
+
+impl StructDef {
+    pub fn field(&self, name: &str) -> Option<&Field> {
+        self.fields.iter().find(|f| f.name == name)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hir {
     pub functions: Vec<Function>,
+    pub structs: Vec<StructDef>,
     /// Ids the program names but does not define. Checked once the datapack is known
     /// (`driver`), because whether one resolves depends on files this stage cannot see.
     pub references: Vec<Reference>,
@@ -233,6 +278,11 @@ pub enum ExprKind {
     Pos(String),
     /// A whole command, already rendered. One command, one line.
     Command(String),
+    /// A composite value, its fields in declaration order.
+    Struct {
+        id: StructId,
+        fields: Vec<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,13 +354,16 @@ pub fn lower(
 ) -> (Hir, Vec<SyntaxError>) {
     let mut errors = Vec::new();
     let mut references = Vec::new();
+    let (structs, struct_ids) = collect_structs(file, &mut errors);
     let mut signatures: HashMap<String, Signature> = HashMap::new();
     let mut items: Vec<(&ast::Item, &ast::FnItem)> = Vec::new();
 
     // First pass: signatures only. Without it, calling a function defined further down
     // the file would be an error — a rule about text order rather than about programs.
     for item in &file.items {
-        let ItemKind::Fn(f) = &item.kind;
+        let ItemKind::Fn(f) = &item.kind else {
+            continue;
+        };
         if signatures.contains_key(&f.name.name) {
             let name = &f.name.name;
             errors.push(SyntaxError::new(
@@ -322,12 +375,21 @@ pub fn lower(
         let params = f
             .params
             .iter()
-            .map(|param| named_type(&param.ty, &mut errors).unwrap_or(Type::I32))
+            .map(|param| resolve_type(&param.ty, &struct_ids, &mut errors).unwrap_or(Type::I32))
             .collect();
         let ret = f
             .ret
             .as_ref()
-            .and_then(|written| named_type(written, &mut errors));
+            .and_then(|written| resolve_type(written, &struct_ids, &mut errors));
+        // Vanilla's function return is a single integer, so there is nowhere for a
+        // compound to come back in.
+        if let (Some(Type::Struct(_)), Some(written)) = (ret, f.ret.as_ref()) {
+            errors.push(SyntaxError::new(
+                written.span,
+                "returning a struct is not implemented yet: a function's return value \
+                 is a single number, so a compound has nowhere to come back in",
+            ));
+        }
         // Read from the attribute directly: signatures are needed before any body is
         // lowered, and this is the only part of the attributes a caller cares about.
         let ctx = declared_ctx(&item.attrs);
@@ -348,6 +410,8 @@ pub fn lower(
         let signature = signatures[&f.name.name].clone();
         let mut cx = FnLowering {
             locals: Vec::new(),
+            structs: &structs,
+            struct_ids: &struct_ids,
             scopes: vec![HashMap::new()],
             selector_aliases: HashMap::new(),
             provided: Vec::new(),
@@ -408,10 +472,109 @@ pub fn lower(
     (
         Hir {
             functions,
+            structs,
             references,
         },
         errors,
     )
+}
+
+/// The program's `struct` definitions, resolved in two passes so that a field can name
+/// a struct declared further down the file.
+fn collect_structs(
+    file: &SourceFile,
+    errors: &mut Vec<SyntaxError>,
+) -> (Vec<StructDef>, HashMap<String, StructId>) {
+    let mut ids: HashMap<String, StructId> = HashMap::new();
+    let mut items = Vec::new();
+    for item in &file.items {
+        let ItemKind::Struct(declared) = &item.kind else {
+            continue;
+        };
+        if ids.contains_key(&declared.name.name) {
+            let name = &declared.name.name;
+            errors.push(SyntaxError::new(
+                declared.name.span,
+                format!("a type named '{name}' is already defined"),
+            ));
+            continue;
+        }
+        ids.insert(declared.name.name.clone(), StructId(items.len() as u32));
+        items.push((item, declared));
+    }
+
+    let mut structs = Vec::new();
+    for (item, declared) in items {
+        for attr in &item.attrs {
+            errors.push(SyntaxError::new(
+                attr.span,
+                "attributes on a struct are not implemented yet",
+            ));
+        }
+        let mut fields: Vec<Field> = Vec::new();
+        for field in &declared.fields {
+            for attr in &field.attrs {
+                errors.push(SyntaxError::new(
+                    attr.span,
+                    "field attributes are not implemented yet; the NBT tag of a field \
+                     is its type's default for now",
+                ));
+            }
+            let Some(ty) = resolve_type(&field.ty, &ids, errors) else {
+                continue;
+            };
+            if fields.iter().any(|f| f.name == field.name.name) {
+                let name = &field.name.name;
+                errors.push(SyntaxError::new(
+                    field.name.span,
+                    format!("the field '{name}' is declared twice"),
+                ));
+                continue;
+            }
+            fields.push(Field {
+                name: field.name.name.clone(),
+                ty,
+            });
+        }
+        structs.push(StructDef {
+            id: StructId(structs.len() as u32),
+            name: declared.name.name.clone(),
+            fields,
+            span: declared.name.span,
+        });
+    }
+
+    for def in &structs {
+        if contains_itself(&structs, def.id) {
+            let name = &def.name;
+            errors.push(SyntaxError::new(
+                def.span,
+                format!("'{name}' contains itself, so it has no value a compound could hold"),
+            ));
+        }
+    }
+    (structs, ids)
+}
+
+/// Whether a struct can reach itself through its fields, directly or through others.
+fn contains_itself(structs: &[StructDef], start: StructId) -> bool {
+    let mut stack = vec![start];
+    let mut seen: Vec<StructId> = Vec::new();
+    while let Some(id) = stack.pop() {
+        for field in &structs[id.0 as usize].fields {
+            let Type::Struct(next) = field.ty else {
+                continue;
+            };
+            if next == start {
+                return true;
+            }
+            if !seen.contains(&next) {
+                seen.push(next);
+                stack.push(next);
+            }
+        }
+    }
+    false
 }
 
 /// The `#[ctx(..)]` kinds on an item, ignoring anything malformed — the body pass
@@ -438,18 +601,23 @@ fn declared_ctx(attrs: &[ast::Attribute]) -> Vec<Ctx> {
     kinds
 }
 
-fn named_type(written: &ast::TypeName, errors: &mut Vec<SyntaxError>) -> Option<Type> {
-    match Type::parse(&written.name) {
-        Some(ty) => Some(ty),
-        None => {
-            let name = &written.name;
-            errors.push(SyntaxError::new(
-                written.span,
-                format!("unknown type '{name}'"),
-            ));
-            None
-        }
+fn resolve_type(
+    written: &ast::TypeName,
+    structs: &HashMap<String, StructId>,
+    errors: &mut Vec<SyntaxError>,
+) -> Option<Type> {
+    if let Some(ty) = Type::parse(&written.name) {
+        return Some(ty);
     }
+    if let Some(id) = structs.get(&written.name) {
+        return Some(Type::Struct(*id));
+    }
+    let name = &written.name;
+    errors.push(SyntaxError::new(
+        written.span,
+        format!("unknown type '{name}'"),
+    ));
+    None
 }
 
 /// Whether control cannot reach the end of a statement list without returning.
@@ -472,6 +640,8 @@ fn always_returns(stmts: &[Stmt]) -> bool {
 
 struct FnLowering<'a> {
     locals: Vec<Local>,
+    structs: &'a [StructDef],
+    struct_ids: &'a HashMap<String, StructId>,
     ret: Option<Type>,
     signatures: &'a HashMap<String, Signature>,
     /// The command surface of the configured Minecraft version, if there is one.
@@ -619,7 +789,7 @@ impl FnLowering<'_> {
                 if expr.ty != want {
                     self.error(
                         expr.span,
-                        format!("expected {}, found {}", want.name(), expr.ty.name()),
+                        format!("expected {}, found {}", self.ty(want), self.ty(expr.ty)),
                     );
                     return None;
                 }
@@ -630,7 +800,8 @@ impl FnLowering<'_> {
                 return None;
             }
             (None, Some(want)) => {
-                self.error(span, format!("expected a {} to return", want.name()));
+                let want = self.ty(want);
+                self.error(span, format!("expected a {want} to return"));
                 return None;
             }
         };
@@ -791,7 +962,7 @@ impl FnLowering<'_> {
         if cond.ty != Type::Bool {
             self.error(
                 cond.span,
-                format!("a condition must be bool, found {}", cond.ty.name()),
+                format!("a condition must be bool, found {}", self.ty(cond.ty)),
             );
             return None;
         }
@@ -815,16 +986,10 @@ impl FnLowering<'_> {
         let ty = match &stmt.ty {
             None => value.ty,
             Some(written) => {
-                let Some(ty) = Type::parse(&written.name) else {
-                    let name = &written.name;
-                    self.error(written.span, format!("unknown type '{name}'"));
-                    return None;
-                };
+                let ty = self.resolve(written)?;
                 if ty != value.ty {
-                    self.error(
-                        stmt.value.span(),
-                        format!("expected {}, found {}", ty.name(), value.ty.name()),
-                    );
+                    let (want, found) = (self.ty(ty), self.ty(value.ty));
+                    self.error(stmt.value.span(), format!("expected {want}, found {found}"));
                     return None;
                 }
                 ty
@@ -860,7 +1025,7 @@ impl FnLowering<'_> {
                 assign.span,
                 format!(
                     "compound assignment needs i32, found {}",
-                    declared.ty.name()
+                    self.ty(declared.ty)
                 ),
             );
             return None;
@@ -868,7 +1033,11 @@ impl FnLowering<'_> {
         if declared.ty != value.ty {
             self.error(
                 assign.value.span(),
-                format!("expected {}, found {}", declared.ty.name(), value.ty.name()),
+                format!(
+                    "expected {}, found {}",
+                    self.ty(declared.ty),
+                    self.ty(value.ty)
+                ),
             );
             return None;
         }
@@ -910,7 +1079,7 @@ impl FnLowering<'_> {
                 if operand.ty != want {
                     self.error(
                         span,
-                        format!("expected {}, found {}", want.name(), operand.ty.name()),
+                        format!("expected {}, found {}", want.name(), self.ty(operand.ty)),
                     );
                     return None;
                 }
@@ -979,6 +1148,7 @@ impl FnLowering<'_> {
                 self.error(span, format!("'{name}!' does not produce a value"));
                 None
             }
+            AstExpr::Struct(lit) => self.struct_lit(lit),
         }
     }
 
@@ -987,6 +1157,16 @@ impl FnLowering<'_> {
         for side in [lhs, rhs] {
             if side.ty.is_compile_time() {
                 self.error(span, format!("a {} has no runtime value", side.ty.name()));
+                return None;
+            }
+            // Two compounds cannot be compared or combined: `execute if data` matches
+            // against a literal, never against another path (spec section 4.8).
+            if side.ty.is_storage() {
+                let name = self.ty(side.ty);
+                self.error(
+                    span,
+                    format!("'{name}' is a struct, and the game cannot compare two compounds"),
+                );
                 return None;
             }
         }
@@ -1014,7 +1194,11 @@ impl FnLowering<'_> {
         if lhs.ty != rhs.ty {
             self.error(
                 span,
-                format!("cannot compare {} with {}", lhs.ty.name(), rhs.ty.name()),
+                format!(
+                    "cannot compare {} with {}",
+                    self.ty(lhs.ty),
+                    self.ty(rhs.ty)
+                ),
             );
             return None;
         }
@@ -1099,7 +1283,7 @@ impl FnLowering<'_> {
                             None
                         };
                     }
-                    _ => value.ty.name(),
+                    _ => &self.ty(value.ty),
                 };
                 self.error(
                     value.span,
@@ -1163,7 +1347,7 @@ impl FnLowering<'_> {
             if arg.ty != want {
                 self.error(
                     arg.span,
-                    format!("expected {}, found {}", want.name(), arg.ty.name()),
+                    format!("expected {}, found {}", self.ty(want), self.ty(arg.ty)),
                 );
                 return None;
             }
@@ -1272,6 +1456,72 @@ impl FnLowering<'_> {
                 None
             }
         }
+    }
+
+    /// A type as a diagnostic should spell it.
+    fn ty(&self, ty: Type) -> String {
+        type_name(ty, self.structs)
+    }
+
+    fn resolve(&mut self, written: &ast::TypeName) -> Option<Type> {
+        resolve_type(written, self.struct_ids, self.errors)
+    }
+
+    /// `Point { x: 1, y: 2 }`: every field, exactly once, at its declared type.
+    ///
+    /// Omission is not allowed. A compound missing a key is not an error in NBT —
+    /// vanilla reads it as absent and carries on — so a partial construction would
+    /// only show up as a value that is quietly never there.
+    fn struct_lit(&mut self, lit: &ast::StructLit) -> Option<Expr> {
+        let Some(id) = self.struct_ids.get(&lit.name.name).copied() else {
+            let name = &lit.name.name;
+            self.error(lit.name.span, format!("unknown type '{name}'"));
+            return None;
+        };
+        let def = self.structs[id.0 as usize].clone();
+        let mut values: Vec<Option<Expr>> = vec![None; def.fields.len()];
+        for init in &lit.fields {
+            let Some(index) = def.fields.iter().position(|f| f.name == init.name.name) else {
+                let (name, ty) = (&init.name.name, &def.name);
+                self.error(
+                    init.name.span,
+                    format!("'{ty}' has no field named '{name}'"),
+                );
+                return None;
+            };
+            let value = self.expr(&init.value)?;
+            if value.ty != def.fields[index].ty {
+                let (want, found) = (self.ty(def.fields[index].ty), self.ty(value.ty));
+                self.error(value.span, format!("expected {want}, found {found}"));
+                return None;
+            }
+            if values[index].is_some() {
+                let name = &init.name.name;
+                self.error(init.name.span, format!("the field '{name}' is set twice"));
+                return None;
+            }
+            values[index] = Some(value);
+        }
+        let missing: Vec<String> = def
+            .fields
+            .iter()
+            .zip(&values)
+            .filter(|(_, value)| value.is_none())
+            .map(|(field, _)| format!("'{}'", field.name))
+            .collect();
+        if !missing.is_empty() {
+            let (ty, list) = (&def.name, missing.join(", "));
+            self.error(lit.span, format!("'{ty}' is missing a value for {list}"));
+            return None;
+        }
+        Some(Expr {
+            kind: ExprKind::Struct {
+                id,
+                fields: values.into_iter().flatten().collect(),
+            },
+            ty: Type::Struct(id),
+            span: lit.span,
+        })
     }
 
     fn declare(&mut self, name: &str, ty: Type, mutable: bool) -> LocalId {
@@ -1915,5 +2165,103 @@ mod tests {
     fn lowering_reports_every_problem_it_finds() {
         let errors = lower_err("#[tik] fn main() { nope!(); }");
         assert_eq!(errors.len(), 2);
+    }
+    /// `struct`, spec sections 3.10 and 4.8. Composite values live in storage, so most
+    /// of what this stage does for them is refuse the shapes vanilla cannot hold.
+    mod structs {
+        use super::*;
+
+        #[test]
+        fn a_construction_missing_a_field_is_reported() {
+            let errors =
+                lower_err("struct Point { x: i32, y: i32 } fn main() { let p = Point { x: 1 }; }");
+            assert!(errors[0].message.contains('y'), "{errors:?}");
+        }
+
+        #[test]
+        fn a_field_that_is_not_declared_is_reported() {
+            let errors = lower_err("struct Point { x: i32 } fn main() { let p = Point { z: 1 }; }");
+            assert!(
+                errors[0].message.contains("no field named 'z'"),
+                "{errors:?}"
+            );
+        }
+
+        #[test]
+        fn a_field_set_twice_is_reported() {
+            let errors =
+                lower_err("struct Point { x: i32 } fn main() { let p = Point { x: 1, x: 2 }; }");
+            assert!(errors[0].message.contains("twice"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_field_of_the_wrong_type_is_reported() {
+            let errors =
+                lower_err("struct Point { x: i32 } fn main() { let p = Point { x: true }; }");
+            assert!(errors[0].message.contains("expected i32"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_struct_names_itself_in_a_diagnostic() {
+            let errors =
+                lower_err("struct Point { x: i32 } fn main() { let p: i32 = Point { x: 1 }; }");
+            assert!(errors[0].message.contains("found Point"), "{errors:?}");
+        }
+
+        #[test]
+        fn two_structs_cannot_be_compared() {
+            let errors = lower_err(
+                "struct Point { x: i32 } \
+                 fn main() { let p = Point { x: 1 }; let q = Point { x: 1 }; let b = p == q; }",
+            );
+            assert!(errors[0].message.contains("compare"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_struct_cannot_be_returned() {
+            let errors =
+                lower_err("struct Point { x: i32 } fn make() -> Point { return Point { x: 1 }; }");
+            assert!(errors[0].message.contains("not implemented"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_struct_containing_itself_is_reported() {
+            let errors = lower_err("struct Node { next: Node }");
+            assert!(errors[0].message.contains("contains itself"), "{errors:?}");
+            // Through another struct, too: the cycle is what matters, not its length.
+            let errors = lower_err("struct A { b: B } struct B { a: A }");
+            assert!(!errors.is_empty(), "a two-step cycle is still a cycle");
+        }
+
+        #[test]
+        fn a_compile_time_type_cannot_be_a_field() {
+            // `selector` has no spellable name (spec section 4.2), so a field asking
+            // for one never gets as far as the storage question.
+            let errors = lower_err("struct Held { who: selector }");
+            assert!(errors[0].message.contains("unknown type"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_field_attribute_says_it_is_not_implemented() {
+            let errors = lower_err("struct Mob { #[nbt(byte)] hp: i32 }");
+            assert!(errors[0].message.contains("not implemented"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_struct_declared_twice_is_reported() {
+            let errors = lower_err("struct A { x: i32 } struct A { y: i32 }");
+            assert!(errors[0].message.contains("already defined"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_struct_can_be_annotated_and_passed() {
+            let hir = lower_ok(
+                "struct Point { x: i32 } \
+                 fn take(p: Point) {} \
+                 fn main() { let p: Point = Point { x: 1 }; take(p); }",
+            );
+            assert_eq!(hir.structs.len(), 1);
+            assert_eq!(hir.structs[0].fields[0].name, "x");
+        }
     }
 }

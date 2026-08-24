@@ -177,7 +177,7 @@ debug ビルドで生成 mcfunction に埋める `# src/foo.mwl:42` の両方が
 
 ---
 
-## 3. 構文 — M6 の範囲まで確定
+## 3. 構文 — M6 と `struct` の範囲まで確定
 
 M1 は `fn main() { raw!("say hi"); }` を全レイヤ貫通させることだけを目的とする
 （[`03-plan.md`](./03-plan.md) M1）。ここで確定させるのはその範囲に限る。
@@ -305,6 +305,25 @@ setblock(pos!(~ ~1 ~), minecraft:stone);
   （絶対 / `~` 相対 / `^` ローカルの混在は不可）
 - ユーザ定義関数とコマンドは名前空間を共有する。同名の関数を定義するとコマンドを覆い隠す
 
+### 3.10 `struct` — 確定（M7）
+
+```
+item        += struct_item
+struct_item := "struct" IDENT "{" [field_defs] "}"
+field_defs  := field_def {"," field_def} [","]
+field_def   := {ATTRIBUTE} IDENT ":" type
+
+primary     += struct_lit
+struct_lit  := IDENT "{" [field_inits] "}"
+field_inits := field_init {"," field_init} [","]
+field_init  := IDENT ":" expr
+```
+
+- 構築はフィールドを**全部**書く。省略も既定値も無い（[§4.8](#48-struct--確定m7)）
+- **`if` / `while` の条件と `as` / `at` / `for` のセレクタには構造体リテラルを書けない。**
+  `if p { .. }` の `{` がブロックなのかリテラルなのか決まらないため。Rust と同じ制限で、
+  括弧の中でなら書ける
+
 ### 3.5 未定
 
 以降のタスクが、実装の直前に確定させる。
@@ -312,12 +331,12 @@ setblock(pos!(~ ~1 ~), minecraft:stone);
 | 節 | 内容 | タスク |
 |---|---|---|
 | 3.7 | `if` 式 | M7（`match` と一緒に） |
-| 3.9 | `struct` / `enum` / `match` / ジェネリクス / `impl` | M7 |
-| 3.10 | `mod` / `use` / `pub` / `extern fn` | 完全版は M7 |
+| 3.11 | `enum` / `match` / ジェネリクス / `impl` | M7 |
+| 3.12 | `mod` / `use` / `pub` / `extern fn` | 完全版は M7 |
 
 ---
 
-## 4. 意味論 — M6 の範囲まで確定
+## 4. 意味論 — M6 と `struct` の範囲まで確定
 
 ### 4.1 名前解決
 
@@ -426,19 +445,42 @@ Rust では代入式は `()` を返すが、minewell に `()` 型は無い。値
 `RawArg` は、brigadier の引数型のうち minewell に対応物が無いものを受ける型。
 文字列リテラルだけを受け付け、中身は検査しない。
 
-## 5. 型の表現 — M2 の範囲のみ確定
+### 4.8 `struct` — 確定（M7）
+
+`struct` は storage 上の NBT compound（要件定義 §4.2）。型は `Struct(<定義>)` を追加する。
+
+| 式 | 要求 | 結果 |
+|---|---|---|
+| `S { f: e, .. }` | `S` は `struct`、フィールドが過不足なく、それぞれ同型 | `S` |
+
+- **フィールドは全部初期化する。** 足りない・知らない・同じ名前が 2 度、いずれもエラー。
+  NBT は欠けたフィールドを黙って無視するので、省略を許した時点で
+  「書いたつもりの値が無い」が実行時まで分からなくなる
+- フィールドの型は `i32` / `bool` / 他の `struct`。既定の NBT タグは `i32`→`Int`、
+  `bool`→`Byte`（要件定義 §4.2）。タグを指定する `#[nbt(...)]` は M7-3
+- **自分を含む `struct` はエラー。** 有限の値を構築できない
+- **`==` / `!=` で比較できない。** 実行時の compound どうしを比べる手段がバニラに無い
+- **戻り値にできない。** バニラの関数の戻り値は整数 1 つで、compound を返す場所が無い
+- 引数にはできる。呼び出し側の storage から呼び出し先の storage への 1 コマンドの複製
+
+## 5. 型の表現 — M6 と `struct` の範囲まで確定
 
 | 型 | 置き場所 | 表現 |
 |---|---|---|
 | `i32` | scoreboard | そのまま |
 | `bool` | scoreboard | `0` または `1` |
+| `struct` | storage | NBT compound（[§6.18](#618-struct-の配置と構築--確定m7)） |
+| `Selector` / `ResourceLocation` / `Pos` | どこにも置かない | コンパイル時のみ |
+
+置き場所は **score / storage / コンパイル時のみ** の 3 分類になる。2 分類（実行時か否か）
+では `struct` が入らない — 実行時の型でありながらレジスタに乗らないため。
 
 `bool` を scoreboard の 0/1 で持つのは、`execute store success` が 0/1 を書き、
 `execute if score ... matches 1` が読めるため。バニラの真偽値の扱いがそもそもこれ。
 
-`fix<S>` / storage 専用型 / `String` / `Vec<T>` / ドメイン型は M7・M8。
+`enum` / `Vec<T>` / `String` は M7 の後続タスク、`fix<S>` と NBT 相互運用の数値型は M8。
 
-## 6. lowering — M6 の範囲まで確定
+## 6. lowering — M6 と `struct` の範囲まで確定
 
 各構文から mcfunction への写像。生成コマンド数は `tinymcf` の計測 API で検証する
 （[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §5）。
@@ -800,3 +842,37 @@ setblock(pos!(~ ~1 ~), minecraft:stone)
 
 toolchain 無しでも動くようにするのは、コンパイラにコマンド表を埋め込まないため。
 埋め込めば「版非依存のコンパイラ」（要件定義 §1.2）が嘘になる。
+
+---
+
+### 6.18 `struct` の配置と構築 — 確定（M7）
+
+| 対象 | 場所 |
+|---|---|
+| `struct` のローカル束縛 | `<ns>:mw` の `mw.vars.<関数名>.<束縛名>` |
+| そのフィールド | 上に `.<フィールド名>` を継ぎ足す。ネストも同じ |
+
+scoreboard 側の `$<関数名>.<束縛名>`（[§6.1](#61-名前)）と同じく関数名で修飾する。理由も同じで、
+別々の関数の同名ローカルが踏み合わないようにするため。
+
+構築は**コンパイル時に分かる部分を 1 コマンドで置き**、残りだけを後から書く。
+
+```
+let p = Point { x: 1, y: true };
+→  data modify storage <ns>:mw mw.vars.main.p set value {x:1,y:1b}
+
+let q = Point { x: n, y: true };     // n は実行時の値
+→  data modify storage <ns>:mw mw.vars.main.q set value {x:0,y:1b}
+   execute store result storage <ns>:mw mw.vars.main.q.x int 1 \
+       run scoreboard players get $main.n <ns>.v
+```
+
+実行時の値のフィールドも `set value` に**プレースホルダとして書く。** キーの無い compound を
+作ってから書き足してもコマンド数は変わらず、書き損じたときに静かに欠けるだけになる。
+
+束縛どうしの複製と引数渡しは 1 コマンド。
+
+```
+let q = p;   →  data modify storage <ns>:mw mw.vars.main.q set from storage <ns>:mw mw.vars.main.p
+f(p)         →  data modify storage <ns>:mw mw.vars.f.p    set from storage <ns>:mw mw.vars.main.p
+```

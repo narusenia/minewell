@@ -29,6 +29,7 @@ pub fn parse(src: &str) -> (SourceFile, Vec<SyntaxError>) {
         at: 0,
         errors,
         end: src.len(),
+        no_struct_lit: false,
     };
     let items = parser.items();
     (SourceFile { items }, parser.errors)
@@ -39,6 +40,9 @@ struct Parser {
     at: usize,
     errors: Vec<SyntaxError>,
     end: usize,
+    /// Whether a `{` here starts a block rather than a struct literal. True while
+    /// parsing the head of an `if`, `while`, `as`, `at` or `for` (spec section 3.10).
+    no_struct_lit: bool,
 }
 
 impl Parser {
@@ -58,6 +62,7 @@ impl Parser {
         let attrs = self.attributes();
         match self.peek() {
             Some(TokenKind::Keyword(Keyword::Fn)) => {}
+            Some(TokenKind::Keyword(Keyword::Struct)) => return self.struct_item(attrs, start),
             Some(TokenKind::Reserved(word)) => {
                 let word = word.clone();
                 self.error(format!(
@@ -101,6 +106,42 @@ impl Parser {
                 body,
             }),
             span,
+        })
+    }
+
+    /// `struct Point { x: i32, y: i32 }`.
+    fn struct_item(&mut self, attrs: Vec<Attribute>, start: usize) -> Option<Item> {
+        self.bump();
+        let name = self.ident()?;
+        self.expect(Punct::LBrace, "{")?;
+        let mut fields = Vec::new();
+        while self.peek() != Some(&TokenKind::Punct(Punct::RBrace)) {
+            fields.push(self.field_def()?);
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        self.expect(Punct::RBrace, "}")?;
+        let end = self.previous_end();
+        Some(Item {
+            attrs,
+            kind: ItemKind::Struct(StructItem { name, fields }),
+            span: Span { start, end },
+        })
+    }
+
+    fn field_def(&mut self) -> Option<FieldDef> {
+        let start = self.span().start;
+        let attrs = self.attributes();
+        let name = self.binding_name()?;
+        self.expect(Punct::Colon, ":")?;
+        let ty = self.type_name()?;
+        let end = self.previous_end();
+        Some(FieldDef {
+            attrs,
+            name,
+            ty,
+            span: Span { start, end },
         })
     }
 
@@ -230,7 +271,7 @@ impl Parser {
     fn if_stmt(&mut self, attrs: Vec<Attribute>) -> Option<IfStmt> {
         let start = self.span().start;
         self.bump();
-        let cond = self.expr()?;
+        let cond = self.head_expr()?;
         let then = self.block()?;
         let otherwise = if self.eat_keyword(Keyword::Else) {
             Some(Box::new(
@@ -271,7 +312,7 @@ impl Parser {
         } else {
             None
         };
-        let selector = self.expr()?;
+        let selector = self.head_expr()?;
         let body = self.block()?;
         let end = self.previous_end();
         Some(ContextStmt {
@@ -289,7 +330,7 @@ impl Parser {
         let conditional = self.peek() == Some(&TokenKind::Keyword(Keyword::While));
         self.bump();
         let cond = if conditional {
-            Some(self.expr()?)
+            Some(self.head_expr()?)
         } else {
             None
         };
@@ -347,6 +388,18 @@ impl Parser {
 
     fn expr(&mut self) -> Option<Expr> {
         self.assign()
+    }
+
+    /// The expression before a block: a condition, or a selector.
+    ///
+    /// A struct literal cannot appear here, because `if p { .. }` would otherwise not
+    /// say whether the brace opens a block or a value. Rust draws the line in the same
+    /// place, and parentheses lift the restriction.
+    fn head_expr(&mut self) -> Option<Expr> {
+        let outer = std::mem::replace(&mut self.no_struct_lit, true);
+        let expr = self.expr();
+        self.no_struct_lit = outer;
+        expr
     }
 
     fn assign(&mut self) -> Option<Expr> {
@@ -491,7 +544,11 @@ impl Parser {
             }
             Some(TokenKind::Punct(Punct::LParen)) => {
                 self.bump();
-                let inner = self.expr()?;
+                // Inside brackets there is no block to be confused with.
+                let outer = std::mem::replace(&mut self.no_struct_lit, false);
+                let inner = self.expr();
+                self.no_struct_lit = outer;
+                let inner = inner?;
                 self.expect(Punct::RParen, ")")?;
                 Some(inner)
             }
@@ -515,6 +572,9 @@ impl Parser {
                 match self.peek() {
                     Some(TokenKind::Punct(Punct::Bang)) => self.macro_call(name),
                     Some(TokenKind::Punct(Punct::LParen)) => self.call(name),
+                    Some(TokenKind::Punct(Punct::LBrace)) if !self.no_struct_lit => {
+                        self.struct_lit(name)
+                    }
                     _ => Some(Expr::Path(name)),
                 }
             }
@@ -540,6 +600,40 @@ impl Parser {
         Some(Expr::Call(CallExpr {
             callee,
             args,
+            span: Span { start, end },
+        }))
+    }
+
+    /// `Point { x: 1, y: 2 }`.
+    fn struct_lit(&mut self, name: Ident) -> Option<Expr> {
+        let start = name.span.start;
+        self.bump();
+        let mut fields = Vec::new();
+        while self.peek() != Some(&TokenKind::Punct(Punct::RBrace)) {
+            let field_start = self.span().start;
+            let field = self.ident()?;
+            self.expect(Punct::Colon, ":")?;
+            // A field's value is a full expression again: the brace is already open.
+            let outer = std::mem::replace(&mut self.no_struct_lit, false);
+            let value = self.expr();
+            self.no_struct_lit = outer;
+            fields.push(FieldInit {
+                name: field,
+                value: value?,
+                span: Span {
+                    start: field_start,
+                    end: self.previous_end(),
+                },
+            });
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        self.expect(Punct::RBrace, "}")?;
+        let end = self.previous_end();
+        Some(Expr::Struct(StructLit {
+            name,
+            fields,
             span: Span { start, end },
         }))
     }
@@ -715,6 +809,7 @@ mod tests {
     fn fn_item(file: &SourceFile, i: usize) -> &FnItem {
         match &file.items[i].kind {
             ItemKind::Fn(f) => f,
+            other => panic!("expected a function, found {other:?}"),
         }
     }
 
@@ -825,5 +920,52 @@ mod tests {
     fn lexer_errors_come_through_too() {
         let errors = parse_err("fn main() { raw!(\"unterminated); }");
         assert!(!errors.is_empty());
+    }
+    #[test]
+    fn a_struct_item_and_its_fields() {
+        let file = parse_ok("struct Point { x: i32, y: bool }");
+        let ItemKind::Struct(item) = &file.items[0].kind else {
+            panic!("expected a struct")
+        };
+        assert_eq!(item.name.name, "Point");
+        assert_eq!(item.fields.len(), 2);
+        assert_eq!(item.fields[1].ty.name, "bool");
+    }
+
+    #[test]
+    fn a_struct_literal_is_an_expression() {
+        let file = parse_ok("fn main() { let p = Point { x: 1 }; }");
+        let Stmt::Let(let_stmt) = &fn_item(&file, 0).body.stmts[0] else {
+            panic!("expected a let")
+        };
+        let Expr::Struct(lit) = &let_stmt.value else {
+            panic!("expected a struct literal, found {:?}", let_stmt.value)
+        };
+        assert_eq!(lit.name.name, "Point");
+        assert_eq!(lit.fields[0].name.name, "x");
+    }
+
+    /// Spec section 3.10: in the head of an `if`, a `{` opens the block. Without this
+    /// rule `if p { .. }` would have two readings and the parser would pick one.
+    #[test]
+    fn a_brace_after_a_condition_opens_the_block() {
+        let file = parse_ok("fn main() { if p { } }");
+        let Stmt::If(if_stmt) = &fn_item(&file, 0).body.stmts[0] else {
+            panic!("expected an if")
+        };
+        assert!(matches!(if_stmt.cond, Expr::Path(_)));
+        assert!(if_stmt.then.stmts.is_empty());
+    }
+
+    #[test]
+    fn parentheses_bring_the_literal_back() {
+        let file = parse_ok("fn main() { if (Flag { on: true }) == f { } }");
+        let Stmt::If(if_stmt) = &fn_item(&file, 0).body.stmts[0] else {
+            panic!("expected an if")
+        };
+        let Expr::Binary(cond) = &if_stmt.cond else {
+            panic!("expected a comparison")
+        };
+        assert!(matches!(*cond.lhs, Expr::Struct(_)));
     }
 }
