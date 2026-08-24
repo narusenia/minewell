@@ -1,7 +1,8 @@
 # 引き継ぎ
 
-2026-08-24 時点。**61 / 90 タスク完了、テスト 317、コミット 52。**
-M0〜M6 完了、次は M7（複合型）。
+2026-08-24 時点。**66 / 90 タスク完了、テスト 393、コミット 60。**
+M0〜M6 完了。M7（複合型）は 5 / 9 まで進み、**完了判定（struct と enum の状態機械が
+`tinymcf` 上で動く）は満たしている**。残りは `Vec<T>`・ジェネリクス・参照。
 
 ---
 
@@ -22,6 +23,16 @@ M0〜M6 完了、次は M7（複合型）。
 ## 今どこまで動くか
 
 ```rust
+enum Phase { Idle, Warmup { ticks: i32 } }
+struct Turret { phase: Phase, #[nbt(short)] shots: i32 }
+
+fn step(t: Turret) {
+    match t.phase {
+        Phase::Idle => { raw!("say idle"); }
+        Phase::Warmup { ticks } => { if ticks > 0 { raw!("say warming"); } }
+    }
+}
+
 #[ctx(entity)]
 fn ignite() { raw!("data merge entity @s {Fire: 100s}"); }
 
@@ -41,44 +52,50 @@ fn tick() {
 `break`・`continue`・`return` / 関数・引数・戻り値・再帰（相互再帰含む）/
 `as`・`at`・`for` と `#[ctx]` 検査 / セレクタ・`pos!`・リソースロケーション /
 toolchain 由来のコマンド呼び出し / `#[tick]`・`#[load]` タグ / `data/` パススルー /
-存在しない関数参照の検出 / debug の行番号コメントと実行者ガード。
+存在しない関数参照の検出 / debug の行番号コメントと実行者ガード /
+**`struct`・フィールド読み書き・`#[nbt(タグ / rename)]`・`enum`・`match`**。
 
-動かないもの: `struct`・`enum`・`match`・`Vec`・ジェネリクス・`String` の値・
-`fix<S>`・`Option`・`text!`・`nbt!`・release 最適化・`mwl new`/`check`/`test`/`install`。
+動かないもの: `Vec`・ジェネリクス・`impl` とメソッド・`&`/`&mut`・`String` の値・
+`fix<S>`・`Option`（`#[nbt(optional)]` 含む）・`text!`・`nbt!`・release 最適化・
+`mwl new`/`check`/`test`/`install`。
 
----
-
-## 次の作業（M7: 複合型）
-
-9 タスク。`storage` が初めて本格的に使われる。
-
-**着手前に確定させること**（[`02-spec.md`](./02-spec.md) に節を足す）:
-
-1. **`struct` の storage レイアウト。** `<ns>:mw` の `mw.vars` 配下のどこに、どの名前で置くか。
-   関数ローカルと同じく関数名で修飾するのか、それとも別の割り付けか
-2. **`enum` のタグ表現。** 要件定義 §4.2 は `{tag:"Idle"}`。`match` は
-   `execute if data storage ... {tag:"Idle"}` の連鎖になる
-3. **`if` を式にするか。** 仕様 §3.5 で「`match` と一緒に考える」と保留してある。
-   合流点で値を作る仕組みが要る
-4. **`String` の値。** 仕様では今 `Type::Resource` に相乗りしている（コマンド引数専用）。
-   M7 か M8 で本物の storage 上の文字列型に分ける必要がある
-
-**既知の落とし穴:**
-
-- `Type::is_compile_time()` が `Selector`/`Resource`/`Pos` を弾いている。
-  `struct` は**実行時型**なので、この分類にそのまま乗らない。storage 常駐という
-  第 3 のカテゴリが要る
-- MIR の `Reg` は scoreboard 前提。storage 上の値には別の場所指定（NBT パス）が要る
-- 再帰時の退避（`live_registers()`）は scoreboard レジスタしか見ていない。
-  storage 上のローカルを持つ関数が再帰したら**壊れる**。M7 で必ず対処すること
+複合型で**意図して入れていないもの**（診断が「まだ無い」と言う）:
+`struct`/`enum` を関数の戻り値にすること（バニラの戻り値は整数 1 つ）、
+compound どうしの `==`、タプル型バリアント（`V(i32)`）。
 
 ---
+
+## 次の作業（M7 の残り: `Vec<T>` とジェネリクス）
+
+4 タスク（M7-6 〜 M7-9）。**着手前に確定させることは M7-6 の分だけ残っている。**
+
+- **`Vec<T>` のパスと `len`。** 要素は `mw.vars.<fn>.<binding>[i]`。定数添字は NBT パス、
+  実行時添字はマクロ関数（要件定義 §4.4）。マクロ関数はまだ 1 つも生成していない
+- **`String` の値。** いまも `Type::Resource` に相乗り（コマンド引数専用）。
+  storage 上の本物の文字列型に分けるのは M7-6 か M8。`#[nbt(string)]` もそのとき
+
+**M7 で確定させた設計**（詳細は仕様 §3.10〜3.12・§4.8〜4.10・§6.18〜6.20）:
+
+- 置き場所は score / storage / コンパイル時のみ の **3 分類**。`is_compile_time()` の
+  2 分法には `struct` が乗らない → `Type::is_storage()` を足した
+- `struct` / `enum` は `mw.vars.<関数名>.<束縛名>`、フィールドはそこにキーを継ぎ足すだけ
+- `enum` は `{tag:"Chasing",target:3}`。`match` は腕ごとの `execute if data`
+- **`if` も `match` も式にしない**（決定。理由は仕様 §3.12）
+
+**まだ効いている落とし穴:**
+
+- MIR の `Reg` は scoreboard 前提。storage 上の値は `Slot::Data`（パス）で別に持つ。
+  再帰時の退避は両方を見る（`live_slots`）。**新しく storage に置くものを足したら、
+  必ず退避対象に入れること** — `Vec` のテンポラリも同じ
+- storage のテンポラリは `mw.tmp.m<n>`。プログラム全体で単調増加、再帰では退避される
 
 ## 積み残し（理由つき）
 
 | 項目 | なぜ後回しか | 予定 |
 |---|---|---|
-| **宛先駆動の式 lowering** | 呼び出し・算術・`&&` の結果がテンポラリ経由でコピーされ 1 コマンド余分。M4 で 3 箇所に散らすと一貫性を失うため 1 変更にまとめる | M9-10 |
+| **宛先駆動の式 lowering** | 呼び出し・算術・`&&`・`return <フィールド>` の結果がテンポラリ経由でコピーされ 1 コマンド余分。散らすと一貫性を失うため 1 変更にまとめる | M9-10 |
+| **`#[nbt(optional)]`** | `Option<T>` として読む以上 `enum` の上に載る型が要る。診断は「まだ実装されていない」と言う | M7 の後 |
+| **`match` の控えの省略** | 腕が評価対象を書き換えないと分かれば `mw.tmp` へのコピー 1 コマンドは要らない。静的に判定できるが、まず正しさを優先した | M9（最適化） |
 | **`positioned`/`in`/`if block`/`if predicate`**（tinymcf） | 座標・次元・ブロック・predicate のモデルが要り、まだ誰も使わない | 必要になった時 |
 | **`mwl toolchain install`** | 取得先の Release がまだ存在せず、HTTP クライアントを足しても検証できない | X-2 の後 |
 | **predicate / loot table の ID 検査** | parser 名が版で揺れる。実物の `commands.json` を見てから | 実データ入手後 |
@@ -120,6 +137,12 @@ toolchain 由来のコマンド呼び出し / `#[tick]`・`#[load]` タグ / `da
    残す。`#[tick]` 関数なら一度早期 return しただけで以降ずっと何もしなくなる
 3. **退避対象に未初期化のローカルが混ざる。** `let rest = f(n-1);` の途中で退避すると
    まだ空の `rest` を読もうとしてコマンドが失敗する
+4. **storage のローカルを score として退避していた。** 再帰の退避が `scoreboard players get`
+   を出し、存在しないスコアを読んで失敗。引き継ぎに書いてあったとおりの罠で、
+   再帰する関数に `struct` のローカルを置いたテストで再現してから直した
+5. **`match` の腕が評価対象を書き換えると、後続の腕も走る。** ガードは順に評価されるので、
+   `s = State::Waking;` した直後に `State::Waking` の腕が一致する。状態機械を書いた
+   最初のテストで踏んだ。評価対象を `mw.tmp` に控えてから判定するように直した
 
 **教訓は AGENTS.md の「Things that have already caught people out」に集約してある。**
 
