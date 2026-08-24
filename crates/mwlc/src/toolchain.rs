@@ -15,7 +15,7 @@ use miette::Diagnostic;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::schema::Schema;
+use crate::schema::{Overrides, Schema};
 
 /// A directory of installed toolchains.
 ///
@@ -57,6 +57,8 @@ pub struct Toolchain {
     pub version: String,
     pub metadata: Metadata,
     pub schema: Schema,
+    /// Renames in `overrides.toml` that matched nothing in this version.
+    pub stale_overrides: Vec<String>,
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -87,10 +89,18 @@ pub enum Error {
         #[source]
         source: serde_json::Error,
     },
+
+    #[error("{path} is not valid TOML")]
+    Toml {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
 }
 
 const METADATA: &str = "toolchain.json";
 const COMMANDS: &str = "commands.json";
+const OVERRIDES: &str = "overrides.toml";
 
 impl Toolchains {
     pub fn installed(&self) -> Vec<String> {
@@ -123,14 +133,27 @@ impl Toolchains {
             version: version.to_owned(),
             file: COMMANDS.to_owned(),
         })?;
-        let schema = Schema::parse(&commands).map_err(|source| Error::Json {
+        let mut schema = Schema::parse(&commands).map_err(|source| Error::Json {
             path: dir.join(COMMANDS),
             source,
         })?;
+
+        let overrides_path = dir.join(OVERRIDES);
+        let mut stale_overrides = Vec::new();
+        if overrides_path.exists() {
+            let text = read(&overrides_path)?;
+            let overrides: Overrides = toml::from_str(&text).map_err(|source| Error::Toml {
+                path: overrides_path,
+                source,
+            })?;
+            stale_overrides = schema.rename(&overrides);
+        }
+
         Ok(Toolchain {
             version: version.to_owned(),
             metadata,
             schema,
+            stale_overrides,
         })
     }
 
@@ -227,6 +250,21 @@ mod tests {
         assert_eq!(toolchain.metadata.pack_format, 61);
         assert!(toolchain.schema.get("setblock").is_some());
         assert_eq!(tc.installed(), vec!["1.21.4"]);
+    }
+
+    #[test]
+    fn an_overrides_file_renames_commands_on_load() {
+        let (_dir, tc) = empty();
+        let installed = tc.add("1.21.4", &commands(), 61).expect("adds");
+        std::fs::write(
+            installed.join("overrides.toml"),
+            "[rename]\ndata_get_entity = \"data_get\"\ngone = \"elsewhere\"\n",
+        )
+        .unwrap();
+
+        let toolchain = tc.load("1.21.4").expect("loads");
+        assert!(toolchain.schema.get("data_get").is_some());
+        assert_eq!(toolchain.stale_overrides, vec!["gone"]);
     }
 
     #[test]

@@ -141,6 +141,37 @@ impl Schema {
     pub fn get(&self, name: &str) -> Option<&Signature> {
         self.commands.get(name)
     }
+
+    /// Applies hand-written renames.
+    ///
+    /// Machine-generated names come from the literal path, which for the deeper
+    /// commands produces things nobody would type
+    /// (`data_modify_storage_target_path_set_from_entity`). Renaming those is the one
+    /// piece of judgement the generator cannot supply. Nothing else is overridable:
+    /// changing a signature by hand would put the command set back in human keeping,
+    /// which is what generating it was meant to avoid.
+    pub fn rename(&mut self, overrides: &Overrides) -> Vec<String> {
+        let mut unmatched = Vec::new();
+        for (from, to) in &overrides.rename {
+            match self.commands.remove(from) {
+                Some(mut signature) => {
+                    signature.name = to.clone();
+                    self.commands.insert(to.clone(), signature);
+                }
+                // A rename for a command this version does not have is not an error:
+                // one file covers several versions.
+                None => unmatched.push(from.clone()),
+            }
+        }
+        unmatched
+    }
+}
+
+/// `overrides.toml`, beside a toolchain's `commands.json`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Overrides {
+    #[serde(default)]
+    pub rename: BTreeMap<String, String>,
 }
 
 fn walk(
@@ -252,6 +283,32 @@ mod tests {
         );
         let odd = s.get("experiment").expect("present").clone();
         assert_eq!(odd.params[0].ty, ArgType::Raw);
+    }
+
+    #[test]
+    fn a_rename_moves_a_command_to_a_usable_name() {
+        let mut s = schema();
+        let overrides = Overrides {
+            rename: [("data_get_entity".to_owned(), "data_get".to_owned())]
+                .into_iter()
+                .collect(),
+        };
+        assert!(s.rename(&overrides).is_empty());
+        assert!(s.get("data_get_entity").is_none());
+        assert_eq!(s.get("data_get").expect("renamed").name, "data_get");
+    }
+
+    #[test]
+    fn a_rename_for_a_command_this_version_lacks_is_reported_not_fatal() {
+        // One overrides file covers several versions, so a name that is not here yet
+        // (or not here any more) is information, not a failure.
+        let mut s = schema();
+        let overrides = Overrides {
+            rename: [("nope".to_owned(), "whatever".to_owned())]
+                .into_iter()
+                .collect(),
+        };
+        assert_eq!(s.rename(&overrides), vec!["nope"]);
     }
 
     #[test]
