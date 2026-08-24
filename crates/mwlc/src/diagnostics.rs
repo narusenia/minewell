@@ -15,7 +15,7 @@ use crate::syntax::SyntaxError;
 
 /// Every problem found in one file.
 #[derive(Debug, Error, Diagnostic)]
-#[error("{} problem(s) in {path}", problems.len())]
+#[error("{}", self.summary())]
 pub struct Report {
     path: String,
     #[related]
@@ -33,6 +33,13 @@ pub struct Problem {
 }
 
 impl Report {
+    fn summary(&self) -> String {
+        match self.problems.len() {
+            1 => format!("1 problem in {}", self.path),
+            n => format!("{n} problems in {}", self.path),
+        }
+    }
+
     pub fn new(path: &str, src: &str, errors: Vec<SyntaxError>) -> Self {
         let problems = errors
             .into_iter()
@@ -108,7 +115,10 @@ mod tests {
         let text = render(&report);
         assert!(text.contains("first"), "{text}");
         assert!(text.contains("second"), "{text}");
-        assert!(text.contains('2'), "the summary counts them: {text}");
+        assert!(
+            text.contains("2 problems"),
+            "the summary counts them: {text}"
+        );
     }
 
     #[test]
@@ -143,6 +153,6 @@ mod tests {
             ))
         }
         let err = build().unwrap_err();
-        assert!(err.to_string().contains('1'));
+        assert_eq!(err.to_string(), "1 problem in x.mwl");
     }
 }
