@@ -47,6 +47,8 @@ pub struct VariantDef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructItem {
     pub name: Ident,
+    /// Type parameters, monomorphised at every use (spec section 3.14).
+    pub generics: Vec<Ident>,
     pub fields: Vec<FieldDef>,
 }
 
@@ -62,6 +64,7 @@ pub struct FieldDef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FnItem {
     pub name: Ident,
+    pub generics: Vec<Ident>,
     pub params: Vec<Param>,
     pub ret: Option<TypeName>,
     pub body: Block,

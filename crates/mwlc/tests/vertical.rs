@@ -343,6 +343,10 @@ fn print_generated_commands() {
         "fn main() { let mut v = [1, 2, 3]; let i = 2; v[i] = 9; let x = v[i]; v.push(x);
                      let n = v.len(); }",
         "fn main() { let v = [1, 2, 3]; let mut sum = 0; for x in v { sum += x; } }",
+        "struct Pair<T> { a: T, b: T }
+         fn first<T>(p: Pair<T>) -> i32 { return 1; }
+         fn main() { let p = Pair { a: 1, b: 2 }; let n = first(p);
+                     let q = Pair { a: true, b: false }; let m = first(q); }",
         "enum State { Idle, Chasing { target: i32 } }
          fn main() { let mut s = State::Chasing { target: 3 }; let mut x = 0;
                      match s { State::Idle => { x = 1; }
@@ -1355,5 +1359,99 @@ mod iteration {
         let mc = run("fn main() { let v = [1, 2]; let mut sum = 0; \
                          for a in v { for b in v { sum += a * b; } } }");
         assert_eq!(local(&mc, "main", "sum"), Some(9), "(1+2) * (1+2)");
+    }
+}
+
+/// Monomorphisation. Spec sections 3.14, 4.12 and 6.23: one instance per set of type
+/// arguments, and the template itself is never emitted.
+mod generics {
+    use super::harness::{local, run, stored};
+    use tinymcf::nbt::NbtValue;
+
+    fn functions(src: &str) -> Vec<String> {
+        let pack =
+            mwlc::driver::compile(src, "test", &mwlc::emit::Options::default()).expect("compiles");
+        pack.files
+            .keys()
+            .filter_map(|path| {
+                path.strip_prefix("data/test/function/")?
+                    .strip_suffix(".mcfunction")
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    /// The task's "test to write first": asking twice for the same type arguments does
+    /// not make a second instance.
+    #[test]
+    fn one_instance_per_set_of_type_arguments() {
+        let names = functions(
+            "fn hold<T>(x: T) -> i32 { return 1; } \
+             fn main() { let a = hold(1); let b = hold(2); let c = hold(true); }",
+        );
+        assert!(names.contains(&"hold_i32".to_owned()), "{names:?}");
+        assert!(names.contains(&"hold_bool".to_owned()), "{names:?}");
+        assert_eq!(
+            names.iter().filter(|n| n.starts_with("hold")).count(),
+            2,
+            "{names:?}"
+        );
+        assert!(
+            !names.contains(&"hold".to_owned()),
+            "the template is not emitted"
+        );
+    }
+
+    #[test]
+    fn an_instance_computes_with_the_argument_it_was_given() {
+        let mc = run("fn twice<T>(x: T) -> T { return x; } \
+             fn main() { let a = twice(21); let b = twice(true); }");
+        assert_eq!(local(&mc, "main", "a"), Some(21));
+        assert_eq!(local(&mc, "main", "b"), Some(1));
+    }
+
+    #[test]
+    fn a_type_parameter_can_be_nested_in_the_argument() {
+        let mc = run("fn count<T>(v: Vec<T>) -> i32 { return v.len(); } \
+             fn main() { let v = [1, 2, 3]; let n = count(v); }");
+        assert_eq!(local(&mc, "main", "n"), Some(3));
+    }
+
+    #[test]
+    fn a_generic_struct_is_instantiated_by_its_fields() {
+        let mc = run("struct Pair<T> { a: T, b: T } \
+             fn main() { let p = Pair { a: 1, b: 2 }; let x = p.b; }");
+        assert_eq!(local(&mc, "main", "x"), Some(2));
+    }
+
+    #[test]
+    fn a_generic_struct_can_be_annotated() {
+        let mc = run("struct Pair<T> { a: T, b: T } \
+             fn main() { let p: Pair<bool> = Pair { a: true, b: false }; }");
+        assert_eq!(
+            stored(&mc, "main", "p"),
+            Some(NbtValue::compound([
+                ("a", NbtValue::Byte(1)),
+                ("b", NbtValue::Byte(0)),
+            ]))
+        );
+    }
+
+    #[test]
+    fn a_generic_function_can_recurse() {
+        let mc = run("fn countdown<T>(x: T, n: i32) -> i32 { \
+                 if n <= 0 { return 0; } \
+                 return 1 + countdown(x, n - 1); \
+             } \
+             fn main() { let n = countdown(true, 3); }");
+        assert_eq!(local(&mc, "main", "n"), Some(3));
+    }
+
+    #[test]
+    fn instances_of_two_types_do_not_share_registers() {
+        let mc = run("fn keep<T>(x: T, tag: i32) -> i32 { return tag; } \
+             fn main() { let a = keep(1, 10); let b = keep(true, 20); }");
+        assert_eq!(local(&mc, "main", "a"), Some(10));
+        assert_eq!(local(&mc, "main", "b"), Some(20));
     }
 }

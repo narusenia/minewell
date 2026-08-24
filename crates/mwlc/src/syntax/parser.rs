@@ -79,6 +79,7 @@ impl Parser {
         self.bump();
 
         let name = self.ident()?;
+        let generics = self.generics()?;
         self.expect(Punct::LParen, "(")?;
         let mut params = Vec::new();
         while self.peek() != Some(&TokenKind::Punct(Punct::RParen)) {
@@ -102,6 +103,7 @@ impl Parser {
             attrs,
             kind: ItemKind::Fn(FnItem {
                 name,
+                generics,
                 params,
                 ret,
                 body,
@@ -114,6 +116,7 @@ impl Parser {
     fn struct_item(&mut self, attrs: Vec<Attribute>, start: usize) -> Option<Item> {
         self.bump();
         let name = self.ident()?;
+        let generics = self.generics()?;
         self.expect(Punct::LBrace, "{")?;
         let mut fields = Vec::new();
         while self.peek() != Some(&TokenKind::Punct(Punct::RBrace)) {
@@ -126,7 +129,11 @@ impl Parser {
         let end = self.previous_end();
         Some(Item {
             attrs,
-            kind: ItemKind::Struct(StructItem { name, fields }),
+            kind: ItemKind::Struct(StructItem {
+                name,
+                generics,
+                fields,
+            }),
             span: Span { start, end },
         })
     }
@@ -177,6 +184,22 @@ impl Parser {
             fields,
             span: Span { start, end },
         })
+    }
+
+    /// `<T, U>` after a name. Empty when there are none.
+    fn generics(&mut self) -> Option<Vec<Ident>> {
+        let mut names = Vec::new();
+        if !self.eat_punct(Punct::Lt) {
+            return Some(names);
+        }
+        while self.peek() != Some(&TokenKind::Punct(Punct::Gt)) {
+            names.push(self.ident()?);
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        self.expect(Punct::Gt, ">")?;
+        Some(names)
     }
 
     fn field_def(&mut self) -> Option<FieldDef> {

@@ -46,7 +46,7 @@ pub struct EnumId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VecId(pub u32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Type {
     I32,
     Bool,
@@ -64,6 +64,9 @@ pub enum Type {
     Enum(EnumId),
     /// An NBT list in storage (spec section 4.11).
     Vec(VecId),
+    /// A type parameter, inside a template that has not been instantiated yet
+    /// (spec section 4.12). No value ever has this type: instantiation replaces it.
+    Param(u32),
 }
 
 impl Type {
@@ -100,6 +103,7 @@ impl Type {
             Type::Struct(_) => "struct",
             Type::Enum(_) => "enum",
             Type::Vec(_) => "Vec",
+            Type::Param(_) => "a type parameter",
         }
     }
 }
@@ -107,12 +111,25 @@ impl Type {
 /// Every type the program defines, and the names they answer to.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Types {
-    pub structs: Vec<StructDef>,
+    /// Every concrete struct, including the instances monomorphisation creates. Behind
+    /// a cell because an instance is made while the table is only borrowed to read.
+    structs: RefCell<Vec<StructDef>>,
     pub enums: Vec<EnumDef>,
+    /// Generic structs, kept as written. A template is never a type on its own.
+    templates: Vec<StructTemplate>,
     by_name: HashMap<String, Type>,
-    /// Element type per `VecId`. Interned on demand, which is why it is behind a cell:
-    /// a list literal creates its type while the table is only borrowed to read.
+    template_by_name: HashMap<String, usize>,
+    /// Element type per `VecId`, interned the same way.
     vecs: RefCell<Vec<Type>>,
+}
+
+/// A generic `struct`, whose field types may mention `Type::Param`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructTemplate {
+    pub name: String,
+    pub generics: Vec<String>,
+    pub fields: Vec<Field>,
+    pub span: Span,
 }
 
 impl Types {
@@ -120,8 +137,148 @@ impl Types {
         self.by_name.get(name).copied()
     }
 
-    pub fn struct_def(&self, id: StructId) -> &StructDef {
-        &self.structs[id.0 as usize]
+    /// A struct by id. Returned by value: the table can grow while one is in hand.
+    pub fn struct_def(&self, id: StructId) -> StructDef {
+        self.structs.borrow()[id.0 as usize].clone()
+    }
+
+    pub fn struct_count(&self) -> usize {
+        self.structs.borrow().len()
+    }
+
+    pub fn template(&self, name: &str) -> Option<&StructTemplate> {
+        self.template_by_name
+            .get(name)
+            .map(|index| &self.templates[*index])
+    }
+
+    /// The concrete struct for `name<args>`, made once and then found again.
+    pub fn instantiate(&self, name: &str, args: &[Type]) -> Option<Type> {
+        let index = *self.template_by_name.get(name)?;
+        let key = (index, args.to_vec());
+        if let Some(known) = self
+            .structs
+            .borrow()
+            .iter()
+            .find(|def| def.from.as_ref() == Some(&key))
+        {
+            return Some(Type::Struct(known.id));
+        }
+        let template = &self.templates[index];
+        let fields = template
+            .fields
+            .iter()
+            .map(|field| {
+                let ty = self.substitute(field.ty, args);
+                Field {
+                    ty,
+                    // A field whose type came from a parameter takes the tag of what
+                    // the parameter turned out to be: `T = bool` is a Byte.
+                    tag: match self.mentions_param(field.ty) {
+                        true => NbtTag::default_for(ty),
+                        false => field.tag,
+                    },
+                    ..field.clone()
+                }
+            })
+            .collect();
+        let mut structs = self.structs.borrow_mut();
+        let id = StructId(structs.len() as u32);
+        let spelled = args
+            .iter()
+            .map(|ty| self.name_of(*ty))
+            .collect::<Vec<_>>()
+            .join(", ");
+        structs.push(StructDef {
+            id,
+            name: format!("{}<{spelled}>", template.name),
+            fields,
+            span: template.span,
+            from: Some(key),
+        });
+        Some(Type::Struct(id))
+    }
+
+    /// Replaces the type parameters in `ty` with `args`.
+    pub fn substitute(&self, ty: Type, args: &[Type]) -> Type {
+        match ty {
+            Type::Param(index) => args
+                .get(index as usize)
+                .copied()
+                // Out of range only when the arity was already reported.
+                .unwrap_or(Type::I32),
+            Type::Vec(id) => self.vec_of(self.substitute(self.element(id), args)),
+            Type::Struct(id) => {
+                let def = self.struct_def(id);
+                match def.from {
+                    Some((_, ref targs)) if targs.iter().any(|t| self.mentions_param(*t)) => {
+                        let name = self.templates[def.from.as_ref().expect("from").0]
+                            .name
+                            .clone();
+                        let targs: Vec<Type> =
+                            targs.iter().map(|t| self.substitute(*t, args)).collect();
+                        self.instantiate(&name, &targs).unwrap_or(ty)
+                    }
+                    _ => ty,
+                }
+            }
+            other => other,
+        }
+    }
+
+    fn mentions_param(&self, ty: Type) -> bool {
+        match ty {
+            Type::Param(_) => true,
+            Type::Vec(id) => self.mentions_param(self.element(id)),
+            Type::Struct(id) => match self.struct_def(id).from {
+                Some((_, args)) => args.iter().any(|t| self.mentions_param(*t)),
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Matches a declared type against an actual one, binding type parameters.
+    ///
+    /// Structural, not a solver: every parameter is bound by appearing somewhere in an
+    /// argument's type, and anything else is a mismatch.
+    pub fn unify(&self, declared: Type, actual: Type, args: &mut [Option<Type>]) -> bool {
+        match (declared, actual) {
+            (Type::Param(index), actual) => match args[index as usize] {
+                Some(known) => known == actual,
+                None => {
+                    args[index as usize] = Some(actual);
+                    true
+                }
+            },
+            (Type::Vec(a), Type::Vec(b)) => self.unify(self.element(a), self.element(b), args),
+            (Type::Struct(a), Type::Struct(b)) => {
+                let (a, b) = (self.struct_def(a), self.struct_def(b));
+                match (&a.from, &b.from) {
+                    (Some((ta, aargs)), Some((tb, bargs))) if ta == tb => aargs
+                        .iter()
+                        .zip(bargs)
+                        .all(|(x, y)| self.unify(*x, *y, args)),
+                    _ => a.id == b.id,
+                }
+            }
+            (declared, actual) => declared == actual,
+        }
+    }
+
+    /// The type as a datapack path can spell it (spec section 6.23).
+    pub fn mangle(&self, ty: Type) -> String {
+        match ty {
+            Type::Vec(id) => format!("vec_{}", self.mangle(self.element(id))),
+            Type::Struct(_) | Type::Enum(_) => self
+                .name_of(ty)
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect::<String>()
+                .trim_matches('_')
+                .to_lowercase(),
+            other => other.name().to_owned(),
+        }
     }
 
     pub fn enum_def(&self, id: EnumId) -> &EnumDef {
@@ -157,14 +314,14 @@ impl Types {
     }
 
     /// The fields a composite type holds, across every variant of an `enum`.
-    fn fields(&self, ty: Type) -> Vec<&Field> {
+    fn fields(&self, ty: Type) -> Vec<Field> {
         match ty {
-            Type::Struct(id) => self.struct_def(id).fields.iter().collect(),
+            Type::Struct(id) => self.struct_def(id).fields,
             Type::Enum(id) => self
                 .enum_def(id)
                 .variants
                 .iter()
-                .flat_map(|variant| variant.fields.iter())
+                .flat_map(|variant| variant.fields.iter().cloned())
                 .collect(),
             _ => Vec::new(),
         }
@@ -212,6 +369,8 @@ pub struct StructDef {
     pub name: String,
     pub fields: Vec<Field>,
     pub span: Span,
+    /// Which template and type arguments this came from, for a generic struct.
+    pub from: Option<(usize, Vec<Type>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -594,11 +753,64 @@ const PLANNED_ATTRS: &[&str] = &["score", "storage", "nbt", "unroll", "derive"];
 /// no matter which order the two were written in.
 #[derive(Debug, Clone)]
 struct Signature {
-    id: FnId,
+    /// The id of the one function this name means, or `None` for a template: a
+    /// generic function has an id per set of type arguments, not one of its own.
+    id: Option<FnId>,
+    /// Type parameter names, empty for an ordinary function.
+    generics: Vec<String>,
+    /// Parameter types, which for a template may mention `Type::Param`.
     params: Vec<Type>,
     ret: Option<Type>,
     /// What the function requires of its caller, from `#[ctx(..)]`.
     ctx: Vec<Ctx>,
+    /// Index into the item list, so an instance can find the body to lower.
+    item: usize,
+}
+
+/// The instances monomorphisation has been asked for (spec section 6.23).
+#[derive(Debug, Default)]
+struct Instances {
+    /// Which id a template and its type arguments resolved to, so the same pair is
+    /// never instantiated twice.
+    by_key: HashMap<(usize, Vec<Type>), FnId>,
+    /// Instances still to be lowered, in the order they were asked for.
+    pending: Vec<Pending>,
+    next: u32,
+}
+
+#[derive(Debug, Clone)]
+struct Pending {
+    id: FnId,
+    /// The item the template was written as.
+    item: usize,
+    args: Vec<Type>,
+    /// The name the instance is emitted under.
+    name: String,
+}
+
+impl Instances {
+    fn get_or_create(&mut self, item: usize, args: Vec<Type>, base: &str, types: &Types) -> FnId {
+        let key = (item, args.clone());
+        if let Some(id) = self.by_key.get(&key) {
+            return *id;
+        }
+        let id = FnId(self.next);
+        self.next += 1;
+        let suffix = args
+            .iter()
+            .map(|ty| types.mangle(*ty))
+            .collect::<Vec<_>>()
+            .join("_");
+        let name = format!("{base}_{suffix}");
+        self.by_key.insert(key, id);
+        self.pending.push(Pending {
+            id,
+            item,
+            args,
+            name,
+        });
+        id
+    }
 }
 
 pub fn lower(
@@ -611,6 +823,8 @@ pub fn lower(
     let types = collect_types(file, &mut errors);
     let mut signatures: HashMap<String, Signature> = HashMap::new();
     let mut items: Vec<(&ast::Item, &ast::FnItem)> = Vec::new();
+    // How many functions have an id already; instances are numbered after them.
+    let mut concrete = 0usize;
 
     // First pass: signatures only. Without it, calling a function defined further down
     // the file would be an error — a rule about text order rather than about programs.
@@ -626,15 +840,18 @@ pub fn lower(
             ));
             continue;
         }
+        let generics: Vec<String> = f.generics.iter().map(|g| g.name.clone()).collect();
         let params = f
             .params
             .iter()
-            .map(|param| resolve_type(&param.ty, &types, &mut errors).unwrap_or(Type::I32))
+            .map(|param| {
+                resolve_written(&param.ty, &types, &generics, &mut errors).unwrap_or(Type::I32)
+            })
             .collect();
         let ret = f
             .ret
             .as_ref()
-            .and_then(|written| resolve_type(written, &types, &mut errors));
+            .and_then(|written| resolve_written(written, &types, &generics, &mut errors));
         // Vanilla's function return is a single integer, so there is nowhere for a
         // compound to come back in.
         if let (Some(ty), Some(written)) = (ret, f.ret.as_ref())
@@ -650,34 +867,157 @@ pub fn lower(
         // Read from the attribute directly: signatures are needed before any body is
         // lowered, and this is the only part of the attributes a caller cares about.
         let ctx = declared_ctx(&item.attrs);
+        let index = items.len();
+        // A template has no id of its own: only its instances are real functions.
+        let id = generics.is_empty().then_some(FnId(concrete as u32));
+        if id.is_some() {
+            concrete += 1;
+        }
         signatures.insert(
             f.name.name.clone(),
             Signature {
-                id: FnId(items.len() as u32),
+                id,
+                generics,
                 params,
                 ret,
                 ctx,
+                item: index,
             },
         );
         items.push((item, f));
     }
 
+    let mut instances = Instances {
+        next: concrete as u32,
+        ..Instances::default()
+    };
     let mut functions = Vec::new();
-    for (item, f) in items {
+    for (item, f) in &items {
         let signature = signatures[&f.name.name].clone();
+        // Templates are lowered once per set of type arguments, further down.
+        let Some(id) = signature.id else {
+            continue;
+        };
+        let lowered = lower_function(
+            LowerOne {
+                item,
+                f,
+                id,
+                name: f.name.name.clone(),
+                signature: &signature,
+                type_params: HashMap::new(),
+            },
+            namespace,
+            &types,
+            &signatures,
+            toolchain,
+            &mut instances,
+            &mut references,
+            &mut errors,
+        );
+        functions.push(lowered);
+    }
+
+    // Instances, in the order they were asked for. Lowering one can ask for more, so
+    // the list is walked by index rather than iterated.
+    let mut at = 0;
+    while at < instances.pending.len() {
+        let pending = instances.pending[at].clone();
+        at += 1;
+        let (item, f) = items[pending.item];
+        let signature = signatures[&f.name.name].clone();
+        let type_params: HashMap<String, Type> = signature
+            .generics
+            .iter()
+            .cloned()
+            .zip(pending.args.iter().copied())
+            .collect();
+        let instance = Signature {
+            id: Some(pending.id),
+            params: signature
+                .params
+                .iter()
+                .map(|ty| types.substitute(*ty, &pending.args))
+                .collect(),
+            ret: signature.ret.map(|ty| types.substitute(ty, &pending.args)),
+            ..signature.clone()
+        };
+        let lowered = lower_function(
+            LowerOne {
+                item,
+                f,
+                id: pending.id,
+                name: pending.name.clone(),
+                signature: &instance,
+                type_params,
+            },
+            namespace,
+            &types,
+            &signatures,
+            toolchain,
+            &mut instances,
+            &mut references,
+            &mut errors,
+        );
+        functions.push(lowered);
+    }
+    (
+        Hir {
+            functions,
+            types,
+            references,
+        },
+        errors,
+    )
+}
+
+/// One function to lower: the template it came from, and what it was instantiated with.
+struct LowerOne<'a> {
+    item: &'a ast::Item,
+    f: &'a ast::FnItem,
+    id: FnId,
+    /// The name it is emitted under, which for an instance carries its type arguments.
+    name: String,
+    signature: &'a Signature,
+    /// Type parameters bound to what this instance was asked for.
+    type_params: HashMap<String, Type>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_function(
+    one: LowerOne,
+    namespace: &str,
+    types: &Types,
+    signatures: &HashMap<String, Signature>,
+    toolchain: Option<&Schema>,
+    instances: &mut Instances,
+    references: &mut Vec<Reference>,
+    errors: &mut Vec<SyntaxError>,
+) -> Function {
+    let LowerOne {
+        item,
+        f,
+        id,
+        name,
+        signature,
+        type_params,
+    } = one;
+    {
         let mut cx = FnLowering {
             locals: Vec::new(),
-            types: &types,
+            types,
+            type_params,
+            instances,
             scopes: vec![HashMap::new()],
             selector_aliases: HashMap::new(),
             provided: Vec::new(),
             in_entity_loop: false,
             loop_depth: 0,
             ret: signature.ret,
-            signatures: &signatures,
+            signatures,
             toolchain,
-            references: &mut references,
-            errors: &mut errors,
+            references,
+            errors,
         };
         let attrs = cx.attrs(&item.attrs);
         cx.provided = attrs
@@ -707,32 +1047,26 @@ pub fn lower(
             .collect();
         let body = cx.block(&f.body);
         let locals = cx.locals;
-        if signature.ret.is_some() && !always_returns(&body) {
+        let returns = always_returns(&body);
+        let errors = cx.errors;
+        if signature.ret.is_some() && !returns {
             errors.push(SyntaxError::new(
                 f.name.span,
                 "this function can reach its end without returning a value",
             ));
         }
-        functions.push(Function {
-            id: signature.id,
-            name: f.name.name.clone(),
-            path: format!("{namespace}:{}", f.name.name),
+        Function {
+            id,
+            path: format!("{namespace}:{name}"),
+            name,
             attrs,
             params,
             ret: signature.ret,
             locals,
             body,
             span: item.span,
-        });
+        }
     }
-    (
-        Hir {
-            functions,
-            types,
-            references,
-        },
-        errors,
-    )
 }
 
 /// The program's `struct` and `enum` definitions.
@@ -743,8 +1077,27 @@ fn collect_types(file: &SourceFile, errors: &mut Vec<SyntaxError>) -> Types {
     let mut types = Types::default();
     let mut structs = Vec::new();
     let mut enums = Vec::new();
+    let mut templates = Vec::new();
     for item in &file.items {
         let (name, ty) = match &item.kind {
+            ItemKind::Struct(declared) if !declared.generics.is_empty() => {
+                // A template is not a type: only `Pair<i32>` is (spec section 4.12).
+                if types.template_by_name.contains_key(&declared.name.name)
+                    || types.by_name.contains_key(&declared.name.name)
+                {
+                    let text = &declared.name.name;
+                    errors.push(SyntaxError::new(
+                        declared.name.span,
+                        format!("a type named '{text}' is already defined"),
+                    ));
+                    continue;
+                }
+                types
+                    .template_by_name
+                    .insert(declared.name.name.clone(), templates.len());
+                templates.push((item, declared));
+                continue;
+            }
             ItemKind::Struct(declared) => {
                 let ty = Type::Struct(StructId(structs.len() as u32));
                 structs.push((item, declared));
@@ -770,10 +1123,29 @@ fn collect_types(file: &SourceFile, errors: &mut Vec<SyntaxError>) -> Types {
 
     for (item, declared) in structs {
         reject_item_attrs(item, "a struct", errors);
-        let fields = collect_fields(&declared.fields, &types, errors);
-        types.structs.push(StructDef {
-            id: StructId(types.structs.len() as u32),
+        let fields = collect_fields(&declared.fields, &types, &[], errors);
+        let id = StructId(types.struct_count() as u32);
+        types.structs.borrow_mut().push(StructDef {
+            id,
             name: declared.name.name.clone(),
+            fields,
+            span: declared.name.span,
+            from: None,
+        });
+    }
+    // Templates last: their fields may name a plain struct, and their own parameters
+    // are in scope only here.
+    for (item, declared) in templates {
+        reject_item_attrs(item, "a struct", errors);
+        let generics: Vec<String> = declared
+            .generics
+            .iter()
+            .map(|name| name.name.clone())
+            .collect();
+        let fields = collect_fields(&declared.fields, &types, &generics, errors);
+        types.templates.push(StructTemplate {
+            name: declared.name.name.clone(),
+            generics,
             fields,
             span: declared.name.span,
         });
@@ -784,7 +1156,7 @@ fn collect_types(file: &SourceFile, errors: &mut Vec<SyntaxError>) -> Types {
             .variants
             .iter()
             .map(|variant| {
-                let fields = collect_fields(&variant.fields, &types, errors);
+                let fields = collect_fields(&variant.fields, &types, &[], errors);
                 // The tag shares the compound with the payload, so no field can be
                 // stored under its key.
                 if let Some(clash) = fields.iter().find(|f| f.nbt == TAG_KEY) {
@@ -831,6 +1203,7 @@ fn collect_types(file: &SourceFile, errors: &mut Vec<SyntaxError>) -> Types {
 
     let composites: Vec<Type> = types
         .structs
+        .borrow()
         .iter()
         .map(|def| Type::Struct(def.id))
         .chain(types.enums.iter().map(|def| Type::Enum(def.id)))
@@ -866,11 +1239,12 @@ fn reject_item_attrs(item: &ast::Item, what: &str, errors: &mut Vec<SyntaxError>
 fn collect_fields(
     declared: &[ast::FieldDef],
     types: &Types,
+    generics: &[String],
     errors: &mut Vec<SyntaxError>,
 ) -> Vec<Field> {
     let mut fields: Vec<Field> = Vec::new();
     for field in declared {
-        let Some(ty) = resolve_type(&field.ty, types, errors) else {
+        let Some(ty) = resolve_written(&field.ty, types, generics, errors) else {
             continue;
         };
         if fields.iter().any(|f| f.name == field.name.name) {
@@ -950,6 +1324,11 @@ fn nbt_attrs(
                 continue;
             }
             match NbtTag::parse(option) {
+                Some(_) if matches!(ty, Type::Param(_)) => errors.push(SyntaxError::new(
+                    token.span,
+                    "the tag of a field whose type is a parameter comes from the type \
+                     argument, so it cannot be written here",
+                )),
                 Some(_) if ty == Type::Bool => errors.push(SyntaxError::new(
                     token.span,
                     "a bool is stored as a byte; vanilla has no other boolean tag",
@@ -1025,6 +1404,27 @@ fn resolve_type(
     types: &Types,
     errors: &mut Vec<SyntaxError>,
 ) -> Option<Type> {
+    resolve_written(written, types, &[], errors)
+}
+
+/// As `resolve_type`, with type parameters in scope.
+fn resolve_written(
+    written: &ast::TypeName,
+    types: &Types,
+    generics: &[String],
+    errors: &mut Vec<SyntaxError>,
+) -> Option<Type> {
+    if let Some(index) = generics.iter().position(|name| *name == written.name) {
+        if !written.args.is_empty() {
+            let name = &written.name;
+            errors.push(SyntaxError::new(
+                written.span,
+                format!("'{name}' is a type parameter; it does not take type arguments"),
+            ));
+            return None;
+        }
+        return Some(Type::Param(index as u32));
+    }
     if written.name == "Vec" {
         let [elem] = written.args.as_slice() else {
             errors.push(SyntaxError::new(
@@ -1033,7 +1433,7 @@ fn resolve_type(
             ));
             return None;
         };
-        let elem = resolve_type(elem, types, errors)?;
+        let elem = resolve_written(elem, types, generics, errors)?;
         if elem.is_compile_time() {
             let name = elem.name();
             errors.push(SyntaxError::new(
@@ -1043,6 +1443,23 @@ fn resolve_type(
             return None;
         }
         return Some(types.vec_of(elem));
+    }
+    if let Some(template) = types.template(&written.name) {
+        let wanted = template.generics.len();
+        if written.args.len() != wanted {
+            let name = &written.name;
+            let given = written.args.len();
+            errors.push(SyntaxError::new(
+                written.span,
+                format!("'{name}' takes {wanted} type argument(s), but {given} were given"),
+            ));
+            return None;
+        }
+        let mut args = Vec::new();
+        for arg in &written.args {
+            args.push(resolve_written(arg, types, generics, errors)?);
+        }
+        return types.instantiate(&written.name, &args);
     }
     if !written.args.is_empty() {
         let name = &written.name;
@@ -1089,6 +1506,9 @@ fn always_returns(stmts: &[Stmt]) -> bool {
 struct FnLowering<'a> {
     locals: Vec<Local>,
     types: &'a Types,
+    /// The type parameters of the instance being lowered, already concrete.
+    type_params: HashMap<String, Type>,
+    instances: &'a mut Instances,
     ret: Option<Type>,
     signatures: &'a HashMap<String, Signature>,
     /// The command surface of the configured Minecraft version, if there is one.
@@ -1204,8 +1624,7 @@ impl FnLowering<'_> {
                 }))
             }
             ast::Stmt::Expr(AstExpr::Call(call)) => {
-                let (callee, _) = self.call_signature(call)?;
-                let args = self.call_args(call)?;
+                let (callee, _, args) = self.call_parts(call)?;
                 Some(Stmt::CallFor {
                     callee,
                     args,
@@ -1949,13 +2368,12 @@ impl FnLowering<'_> {
                 self.command(call)
             }
             AstExpr::Call(call) => {
-                let (callee, ty) = self.call_signature(call)?;
+                let (callee, ty, args) = self.call_parts(call)?;
                 let Some(ty) = ty else {
                     let name = &call.callee.name;
                     self.error(span, format!("'{name}' does not return a value"));
                     return None;
                 };
-                let args = self.call_args(call)?;
                 Some(Expr {
                     kind: ExprKind::Call { callee, args },
                     ty,
@@ -2161,11 +2579,74 @@ impl FnLowering<'_> {
         Some(rendered)
     }
 
-    fn call_signature(&mut self, call: &ast::CallExpr) -> Option<(FnId, Option<Type>)> {
-        match self.signatures.get(&call.callee.name) {
-            Some(sig) => {
-                let missing: Vec<Ctx> = sig
-                    .ctx
+    /// The callee and what it returns, with a generic call resolved to its instance.
+    fn call_parts(&mut self, call: &ast::CallExpr) -> Option<(FnId, Option<Type>, Vec<Expr>)> {
+        let sig = self.signatures.get(&call.callee.name)?.clone();
+        self.check_ctx(call, &sig.ctx);
+        if sig.generics.is_empty() {
+            let args = self.call_args(call)?;
+            return Some((sig.id.expect("a plain function has an id"), sig.ret, args));
+        }
+        // The argument types decide the type arguments (spec section 4.12).
+        if call.args.len() != sig.params.len() {
+            let name = &call.callee.name;
+            let (n, m) = (sig.params.len(), call.args.len());
+            self.error(
+                call.span,
+                format!("'{name}' takes {n} argument(s), but {m} were given"),
+            );
+            return None;
+        }
+        let mut args = Vec::new();
+        for arg in &call.args {
+            args.push(self.expr(arg)?);
+        }
+        let mut bound: Vec<Option<Type>> = vec![None; sig.generics.len()];
+        for (declared, arg) in sig.params.iter().zip(&args) {
+            self.types.unify(*declared, arg.ty, &mut bound);
+        }
+        let Some(type_args) = bound.iter().copied().collect::<Option<Vec<Type>>>() else {
+            let unknown: Vec<&str> = sig
+                .generics
+                .iter()
+                .zip(&bound)
+                .filter(|(_, known)| known.is_none())
+                .map(|(name, _)| name.as_str())
+                .collect();
+            let (name, list) = (&call.callee.name, unknown.join(", "));
+            self.error(
+                call.span,
+                format!(
+                    "cannot tell what {list} is in the call to '{name}'; \
+                     no argument mentions it"
+                ),
+            );
+            return None;
+        };
+        // Now that the parameters are concrete, they are checked as any others are.
+        for (declared, arg) in sig.params.iter().zip(&args) {
+            let want = self.types.substitute(*declared, &type_args);
+            if arg.ty != want {
+                let (want, found) = (self.ty(want), self.ty(arg.ty));
+                self.error(arg.span, format!("expected {want}, found {found}"));
+                return None;
+            }
+        }
+        let id = self.instances.get_or_create(
+            sig.item,
+            type_args.clone(),
+            &call.callee.name,
+            self.types,
+        );
+        let ret = sig.ret.map(|ty| self.types.substitute(ty, &type_args));
+        Some((id, ret, args))
+    }
+
+    /// Complains when the call needs a context the caller does not have.
+    fn check_ctx(&mut self, call: &ast::CallExpr, ctx: &[Ctx]) {
+        {
+            {
+                let missing: Vec<Ctx> = ctx
                     .iter()
                     .copied()
                     .filter(|ctx| !self.provided.contains(ctx))
@@ -2186,12 +2667,6 @@ impl FnLowering<'_> {
                         ),
                     );
                 }
-                Some((sig.id, sig.ret))
-            }
-            None => {
-                let name = &call.callee.name;
-                self.error(call.callee.span, format!("'{name}' is not defined"));
-                None
             }
         }
     }
@@ -2330,11 +2805,26 @@ impl FnLowering<'_> {
     }
 
     fn resolve(&mut self, written: &ast::TypeName) -> Option<Type> {
+        // Inside an instance, a type parameter is already a concrete type.
+        if let Some(ty) = self.type_params.get(&written.name).copied() {
+            if !written.args.is_empty() {
+                let name = &written.name;
+                self.error(
+                    written.span,
+                    format!("'{name}' is a type parameter; it does not take type arguments"),
+                );
+                return None;
+            }
+            return Some(ty);
+        }
         resolve_type(written, self.types, self.errors)
     }
 
     /// `Point { x: 1, y: 2 }` and `State::Chasing { target: 3 }`.
     fn composite_lit(&mut self, lit: &ast::StructLit) -> Option<Expr> {
+        if let Some(template) = self.types.template(&lit.name.name).cloned() {
+            return self.generic_struct_lit(lit, &template);
+        }
         let Some(ty) = self.types.get(&lit.name.name) else {
             let name = &lit.name.name;
             self.error(lit.name.span, format!("unknown type '{name}'"));
@@ -2342,7 +2832,7 @@ impl FnLowering<'_> {
         };
         match (ty, &lit.variant) {
             (Type::Struct(id), None) => {
-                let def = self.types.struct_def(id).clone();
+                let def = self.types.struct_def(id);
                 let fields = self.init_fields(&def.fields, lit, &def.name)?;
                 Some(Expr {
                     kind: ExprKind::Struct { id, fields },
@@ -2351,7 +2841,7 @@ impl FnLowering<'_> {
                 })
             }
             (Type::Struct(id), Some(variant)) => {
-                let (name, wanted) = (self.types.struct_def(id).name.clone(), &variant.name);
+                let (name, wanted) = (self.types.struct_def(id).name, &variant.name);
                 self.error(
                     variant.span,
                     format!("'{name}' is a struct, so it has no variant '{wanted}'"),
@@ -2445,6 +2935,63 @@ impl FnLowering<'_> {
         })
     }
 
+    /// `Pair { a: 1, b: 2 }` for a generic struct: the values decide the type
+    /// arguments (spec section 4.12).
+    fn generic_struct_lit(
+        &mut self,
+        lit: &ast::StructLit,
+        template: &StructTemplate,
+    ) -> Option<Expr> {
+        if let Some(variant) = &lit.variant {
+            let (name, wanted) = (&template.name, &variant.name);
+            self.error(
+                variant.span,
+                format!("'{name}' is a struct, so it has no variant '{wanted}'"),
+            );
+            return None;
+        }
+        let mut written = Vec::new();
+        for init in &lit.fields {
+            let value = self.expr(&init.value)?;
+            written.push((init.name.clone(), value));
+        }
+        let mut args: Vec<Option<Type>> = vec![None; template.generics.len()];
+        for (name, value) in &written {
+            if let Some(field) = template.fields.iter().find(|f| f.name == name.name) {
+                self.types.unify(field.ty, value.ty, &mut args);
+            }
+        }
+        let Some(args) = args.iter().copied().collect::<Option<Vec<Type>>>() else {
+            let unknown: Vec<&str> = template
+                .generics
+                .iter()
+                .zip(&args)
+                .filter(|(_, bound)| bound.is_none())
+                .map(|(name, _)| name.as_str())
+                .collect();
+            let (name, list) = (&template.name, unknown.join(", "));
+            self.error(
+                lit.span,
+                format!(
+                    "cannot tell what {list} is in '{name}' here; annotate the binding, \
+                     as in 'let p: {name}<i32> = ..'"
+                ),
+            );
+            return None;
+        };
+        let ty = self.types.instantiate(&template.name, &args)?;
+        let Type::Struct(id) = ty else {
+            unreachable!("a struct template instantiates to a struct")
+        };
+        let def = self.types.struct_def(id);
+        let fields = self.check_fields(&def.fields, written, lit.span, &def.name)?;
+        Some(Expr {
+            kind: ExprKind::Struct { id, fields },
+            ty,
+            span: lit.span,
+        })
+    }
+
     /// Checks an initialiser list against a declaration: every field, exactly once, at
     /// its declared type.
     ///
@@ -2457,25 +3004,38 @@ impl FnLowering<'_> {
         lit: &ast::StructLit,
         what: &str,
     ) -> Option<Vec<Expr>> {
-        let mut values: Vec<Option<Expr>> = vec![None; declared.len()];
+        let mut written = Vec::new();
         for init in &lit.fields {
-            let Some(index) = declared.iter().position(|f| f.name == init.name.name) else {
-                let name = &init.name.name;
-                self.error(
-                    init.name.span,
-                    format!("'{what}' has no field named '{name}'"),
-                );
+            let value = self.expr(&init.value)?;
+            written.push((init.name.clone(), value));
+        }
+        self.check_fields(declared, written, lit.span, what)
+    }
+
+    /// As `init_fields`, for values that have already been lowered.
+    fn check_fields(
+        &mut self,
+        declared: &[Field],
+        written: Vec<(ast::Ident, Expr)>,
+        span: Span,
+        what: &str,
+    ) -> Option<Vec<Expr>> {
+        let mut values: Vec<Option<Expr>> = vec![None; declared.len()];
+        for (name, value) in written {
+            let init = name;
+            let Some(index) = declared.iter().position(|f| f.name == init.name) else {
+                let name = &init.name;
+                self.error(init.span, format!("'{what}' has no field named '{name}'"));
                 return None;
             };
-            let value = self.expr(&init.value)?;
             if value.ty != declared[index].ty {
                 let (want, found) = (self.ty(declared[index].ty), self.ty(value.ty));
                 self.error(value.span, format!("expected {want}, found {found}"));
                 return None;
             }
             if values[index].is_some() {
-                let name = &init.name.name;
-                self.error(init.name.span, format!("the field '{name}' is set twice"));
+                let name = &init.name;
+                self.error(init.span, format!("the field '{name}' is set twice"));
                 return None;
             }
             values[index] = Some(value);
@@ -2488,7 +3048,7 @@ impl FnLowering<'_> {
             .collect();
         if !missing.is_empty() {
             let list = missing.join(", ");
-            self.error(lit.span, format!("'{what}' is missing a value for {list}"));
+            self.error(span, format!("'{what}' is missing a value for {list}"));
             return None;
         }
         Some(values.into_iter().flatten().collect())
@@ -3512,14 +4072,55 @@ mod tests {
         }
 
         #[test]
+        fn a_type_parameter_no_argument_mentions_is_reported() {
+            let errors =
+                lower_err("fn hold<T>(x: i32) -> i32 { return x; } fn main() { let a = hold(1); }");
+            assert!(
+                errors[0].message.contains("cannot tell what T"),
+                "{errors:?}"
+            );
+        }
+
+        #[test]
+        fn a_generic_struct_checks_its_arity() {
+            let errors = lower_err("struct Pair<T> { a: T, b: T } fn f(p: Pair) {}");
+            assert!(errors[0].message.contains("type argument"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_template_is_not_a_type_on_its_own() {
+            let errors = lower_err(
+                "struct Pair<T> { a: T, b: T } \
+                 fn main() { let p = Pair { a: 1, b: true }; }",
+            );
+            // `a` binds T to i32, so `b` has to be one too.
+            assert!(errors[0].message.contains("expected i32"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_tag_cannot_be_written_on_a_parameter_field() {
+            let errors = lower_err("struct Holder<T> { #[nbt(byte)] value: T }");
+            assert!(errors[0].message.contains("type argument"), "{errors:?}");
+        }
+
+        #[test]
+        fn an_argument_still_has_to_match_after_substitution() {
+            let errors = lower_err(
+                "fn pair<T>(a: T, b: T) -> i32 { return 1; } \
+                 fn main() { let n = pair(1, true); }",
+            );
+            assert!(errors[0].message.contains("expected i32"), "{errors:?}");
+        }
+
+        #[test]
         fn a_struct_can_be_annotated_and_passed() {
             let hir = lower_ok(
                 "struct Point { x: i32 } \
                  fn take(p: Point) {} \
                  fn main() { let p: Point = Point { x: 1 }; take(p); }",
             );
-            assert_eq!(hir.types.structs.len(), 1);
-            assert_eq!(hir.types.structs[0].fields[0].name, "x");
+            assert_eq!(hir.types.struct_count(), 1);
+            assert_eq!(hir.types.struct_def(StructId(0)).fields[0].name, "x");
         }
     }
 }
