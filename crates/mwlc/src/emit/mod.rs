@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
-use crate::hir::Attr;
-use crate::mir::{Cmp, Cond, Function, Inst, Mir, Op, Reg, RegKind};
+use crate::hir::{Attr, Ctx};
+use crate::mir::{Cmp, Cond, ExecuteAs, Function, Inst, Mir, Op, Reg, RegKind};
 use crate::syntax::lexer::Span;
 
 /// The datapack layout Minecraft 1.21+ expects. `function` is singular; it was
@@ -158,6 +158,9 @@ fn pack_mcmeta(options: &Options) -> String {
 
 fn function_body(function: &Function, options: &Options, namespace: &str) -> String {
     let mut out = String::new();
+    if let Some(guard) = executor_guard(function, options) {
+        out.push_str(&guard);
+    }
     for block in &function.blocks {
         for inst in &block.insts {
             if let Inst::Raw { span, .. } = inst
@@ -276,6 +279,13 @@ fn command(inst: &Inst, ns: &str) -> String {
         Inst::Guarded { cond, inst } => {
             format!("execute {} run {}", condition(cond, ns), command(inst, ns))
         }
+        Inst::Context { clause, inst } => {
+            let clause = match clause {
+                ExecuteAs::As(selector) => format!("as {selector}"),
+                ExecuteAs::At(selector) => format!("at {selector}"),
+            };
+            format!("execute {clause} run {}", command(inst, ns))
+        }
     }
 }
 
@@ -322,6 +332,31 @@ fn range(min: Option<i32>, max: Option<i32>) -> String {
         (None, Some(b)) => format!("..{b}"),
         (None, None) => "..".to_owned(),
     }
+}
+
+/// A debug-build check that the executor a function requires is actually there.
+///
+/// `#[ctx(entity)]` says the caller must supply an executor, and the compiler enforces
+/// that (`docs/02-spec.md` section 4.6). What it cannot know is whether the entity is
+/// still alive by the time the function runs — an `as` block whose entity died partway
+/// through keeps going, and every `@s` command in it quietly does nothing. In debug
+/// builds that gets said out loud; in release it costs nothing because it is not
+/// emitted (requirements section 6.3).
+fn executor_guard(function: &Function, options: &Options) -> Option<String> {
+    if options.profile != Profile::Debug {
+        return None;
+    }
+    let needs_entity = function.attrs.iter().any(|attr| match attr {
+        Attr::Ctx(kinds) => kinds.contains(&Ctx::Entity),
+        _ => false,
+    });
+    if !needs_entity {
+        return None;
+    }
+    let path = &function.path;
+    Some(format!(
+        "execute unless entity @s run tellraw @a {{\"text\":\"minewell: {path} ran with no executor\",\"color\":\"red\"}}\n"
+    ))
 }
 
 /// `# src/main.mwl:12`, in debug builds only. Requirements section 15: the generated
@@ -494,6 +529,26 @@ mod tests {
                 .files
                 .contains_key("data/minecraft/tags/function/tick.json")
         );
+    }
+
+    #[test]
+    fn a_debug_build_checks_that_the_executor_is_really_there() {
+        let src = "#[ctx(entity)] fn hurt() {} fn main() { as @e[type=zombie] { hurt(); } }";
+        let debug = compile(src, &Options::default()).files;
+        assert!(
+            debug["data/myns/function/hurt.mcfunction"].contains("unless entity @s"),
+            "{}",
+            debug["data/myns/function/hurt.mcfunction"]
+        );
+
+        let release = compile(src, &release()).files;
+        assert_eq!(release["data/myns/function/hurt.mcfunction"], "");
+    }
+
+    #[test]
+    fn a_function_with_no_context_requirement_gets_no_guard() {
+        let pack = compile("fn main() {}", &Options::default());
+        assert!(!pack.files["data/myns/function/main.mcfunction"].contains("unless entity"));
     }
 
     #[test]

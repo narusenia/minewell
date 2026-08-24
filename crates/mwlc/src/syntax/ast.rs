@@ -54,6 +54,8 @@ pub enum Stmt {
     If(IfStmt),
     /// `while c { .. }` and `loop { .. }`; the latter has no condition.
     Loop(LoopStmt),
+    /// `as <sel> { }`, `at <sel> { }` and `for e in <sel> { }`.
+    Context(ContextStmt),
     Break(Span),
     Continue(Span),
     Return {
@@ -75,6 +77,24 @@ pub struct IfStmt {
 pub enum Else {
     Block(Block),
     If(IfStmt),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextStmt {
+    pub attrs: Vec<Attribute>,
+    pub kind: ContextKind,
+    /// The binding `for` introduces.
+    pub binding: Option<Ident>,
+    pub selector: Expr,
+    pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextKind {
+    As,
+    At,
+    For,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +131,16 @@ pub enum Expr {
     Binary(BinaryExpr),
     Assign(AssignExpr),
     Call(CallExpr),
+    Selector(SelectorLit),
     Macro(MacroCall),
+}
+
+/// `@e[type=zombie]`, body verbatim. Its contents are the game's grammar, not this
+/// language's, so they are carried through untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectorLit {
+    pub text: String,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +160,7 @@ impl Expr {
             Expr::Binary(e) => e.span,
             Expr::Assign(e) => e.span,
             Expr::Call(e) => e.span,
+            Expr::Selector(e) => e.span,
             Expr::Macro(e) => e.span,
         }
     }

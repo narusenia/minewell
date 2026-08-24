@@ -506,3 +506,117 @@ mod functions {
         assert!(mc.effects.is_empty());
     }
 }
+
+/// Execution contexts. Spec sections 3.8, 4.6 and 6.15.
+mod contexts {
+    use super::harness::{NS, load, zombies};
+
+    #[test]
+    fn an_as_block_runs_the_body_once_per_entity() {
+        let mut mc = load(r#"fn main() { as @e[type=zombie] { raw!("say hi"); } }"#);
+        zombies(&mut mc, &["z1", "z2", "z3"]);
+        mc.call(&format!("{NS}:main"));
+        assert_eq!(mc.effects.len(), 3);
+        assert_eq!(
+            mc.effects.iter().filter_map(|e| e.executor.clone()).count(),
+            3,
+            "each ran as one of them"
+        );
+    }
+
+    #[test]
+    fn a_for_loop_is_the_same_thing_with_a_name() {
+        let mut mc = load(r#"fn main() { for z in @e[type=zombie] { raw!("say hi"); } }"#);
+        zombies(&mut mc, &["z1", "z2"]);
+        mc.call(&format!("{NS}:main"));
+        assert_eq!(mc.effects.len(), 2);
+    }
+
+    #[test]
+    fn no_entities_means_the_body_never_runs() {
+        let mut mc = load(r#"fn main() { as @e[type=zombie] { raw!("say hi"); } }"#);
+        mc.call(&format!("{NS}:main"));
+        assert!(mc.effects.is_empty());
+    }
+
+    #[test]
+    fn the_binding_stands_for_the_current_entity() {
+        let mut mc = load(r#"fn main() { for z in @e[type=zombie] { at z { raw!("say hi"); } } }"#);
+        zombies(&mut mc, &["z1", "z2"]);
+        mc.call(&format!("{NS}:main"));
+        assert_eq!(mc.effects.len(), 2);
+    }
+
+    #[test]
+    fn continue_in_a_for_body_skips_only_that_entity() {
+        // The body is one function per entity, so returning from it is what "next
+        // entity" means — and it must not stop the rest.
+        let mut mc = load(
+            r#"fn main() {
+                   let mut n = 0;
+                   for z in @e[type=zombie] {
+                       n += 1;
+                       if n == 2 { continue; }
+                       raw!("say hi");
+                   }
+               }"#,
+        );
+        zombies(&mut mc, &["z1", "z2", "z3"]);
+        mc.call(&format!("{NS}:main"));
+        assert_eq!(mc.effects.len(), 2, "the second entity skipped its body");
+    }
+
+    #[test]
+    fn break_in_a_for_body_stops_the_remaining_entities_doing_anything() {
+        let mut mc = load(
+            r#"fn main() {
+                   let mut n = 0;
+                   for z in @e[type=zombie] {
+                       n += 1;
+                       if n == 2 { break; }
+                       raw!("say hi");
+                   }
+               }"#,
+        );
+        zombies(&mut mc, &["z1", "z2", "z3"]);
+        mc.call(&format!("{NS}:main"));
+        assert_eq!(mc.effects.len(), 1, "only the first entity got to act");
+    }
+
+    #[test]
+    fn return_from_inside_a_for_leaves_the_function() {
+        let mut mc = load(
+            r#"fn main() {
+                   for z in @e[type=zombie] { return; }
+                   raw!("say after");
+               }"#,
+        );
+        zombies(&mut mc, &["z1", "z2"]);
+        mc.call(&format!("{NS}:main"));
+        assert!(
+            mc.effects.is_empty(),
+            "the statement after the loop should not run"
+        );
+    }
+
+    #[test]
+    fn a_function_that_needs_an_executor_gets_one_from_the_call_site() {
+        let mut mc = load(
+            r#"#[ctx(entity)] fn shout() { raw!("say hi"); }
+               fn main() { as @e[type=zombie] { shout(); } }"#,
+        );
+        zombies(&mut mc, &["z1", "z2"]);
+        mc.call(&format!("{NS}:main"));
+        assert_eq!(mc.effects.len(), 2);
+        assert_eq!(mc.effects[0].executor.as_deref(), Some("z1"));
+    }
+
+    #[test]
+    fn a_single_statement_context_block_stays_inline() {
+        let mut mc = load(r#"fn main() { as @e[type=zombie] { raw!("say hi"); } }"#);
+        zombies(&mut mc, &["z1"]);
+        mc.call(&format!("{NS}:main"));
+        // The `execute as` and the `say` it runs. No function in between.
+        assert_eq!(mc.commands_run, 2);
+    }
+}

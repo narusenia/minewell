@@ -53,6 +53,14 @@ pub fn local(mc: &Interpreter, function: &str, name: &str) -> Option<i32> {
         .expect("the objective exists")
 }
 
+/// Declares entities and what a selector finds, standing in for a world.
+pub fn zombies(mc: &mut Interpreter, ids: &[&str]) {
+    for (i, id) in ids.iter().enumerate() {
+        mc.world.spawn(id, [i as f64, 64.0, 0.0]);
+    }
+    mc.world.bind_selector("@e[type=zombie]", ids.to_vec());
+}
+
 /// How many commands the last run cost. Generated command count is a requirement, not
 /// a detail, so tests are allowed to care.
 pub fn cost(mc: &Interpreter) -> u64 {

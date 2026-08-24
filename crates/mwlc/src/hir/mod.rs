@@ -30,6 +30,9 @@ pub struct LocalId(pub u32);
 pub enum Type {
     I32,
     Bool,
+    /// A compile-time selector. It has no runtime representation: the only thing that
+    /// can be done with one is hand it to `as`, `at` or `for`.
+    Selector,
 }
 
 impl Type {
@@ -37,6 +40,8 @@ impl Type {
         match name {
             "i32" => Some(Type::I32),
             "bool" => Some(Type::Bool),
+            // Deliberately not spellable in a type annotation: a selector is inferred
+            // from the literal, never declared.
             _ => None,
         }
     }
@@ -45,6 +50,7 @@ impl Type {
         match self {
             Type::I32 => "i32",
             Type::Bool => "bool",
+            Type::Selector => "selector",
         }
     }
 }
@@ -110,6 +116,14 @@ pub enum Stmt {
         args: Vec<Expr>,
         span: Span,
     },
+    /// `as` / `at` / `for`. The body runs once per entity the selector finds.
+    Context {
+        kind: ContextKind,
+        selector: Selector,
+        body: Vec<Stmt>,
+        inline: Inline,
+        span: Span,
+    },
     Break(Span),
     Continue(Span),
     Return {
@@ -131,6 +145,20 @@ pub enum Stmt {
 }
 
 /// A `raw!` command. Interpolation arrives in M9; today the text is literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextKind {
+    As,
+    At,
+    For,
+}
+
+/// A selector, resolved at compile time. `@s` is what a `for` binding means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selector {
+    pub text: String,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawCommand {
     pub text: String,
@@ -151,7 +179,12 @@ pub enum ExprKind {
     Local(LocalId),
     Unary(UnaryOp, Box<Expr>),
     Binary(BinaryOp, Box<Expr>, Box<Expr>),
-    Call { callee: FnId, args: Vec<Expr> },
+    Call {
+        callee: FnId,
+        args: Vec<Expr>,
+    },
+    /// A compile-time selector. Never evaluated into a register.
+    Selector(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +193,33 @@ pub enum Attr {
     Load,
     Inline,
     NoInline,
+    /// What execution context this function requires of its caller.
+    Ctx(Vec<Ctx>),
+}
+
+/// A kind of execution context. `dimension` is absent because there is no way to enter
+/// one yet, and a requirement nothing can satisfy is not a requirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Ctx {
+    Entity,
+    Position,
+}
+
+impl Ctx {
+    fn parse(name: &str) -> Option<Ctx> {
+        match name {
+            "entity" => Some(Ctx::Entity),
+            "position" => Some(Ctx::Position),
+            _ => None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Ctx::Entity => "entity",
+            Ctx::Position => "position",
+        }
+    }
 }
 
 impl Attr {
@@ -176,7 +236,7 @@ impl Attr {
 
 /// Attributes the language will have but does not act on yet. Named so the diagnostic
 /// can say "not implemented" rather than "unknown", which is a different problem.
-const PLANNED_ATTRS: &[&str] = &["ctx", "score", "storage", "nbt", "unroll", "derive"];
+const PLANNED_ATTRS: &[&str] = &["score", "storage", "nbt", "unroll", "derive"];
 
 /// A function's shape, known before any body is lowered so that a call can be checked
 /// no matter which order the two were written in.
@@ -185,6 +245,8 @@ struct Signature {
     id: FnId,
     params: Vec<Type>,
     ret: Option<Type>,
+    /// What the function requires of its caller, from `#[ctx(..)]`.
+    ctx: Vec<Ctx>,
 }
 
 pub fn lower(file: &SourceFile, namespace: &str) -> (Hir, Vec<SyntaxError>) {
@@ -213,12 +275,16 @@ pub fn lower(file: &SourceFile, namespace: &str) -> (Hir, Vec<SyntaxError>) {
             .ret
             .as_ref()
             .and_then(|written| named_type(written, &mut errors));
+        // Read from the attribute directly: signatures are needed before any body is
+        // lowered, and this is the only part of the attributes a caller cares about.
+        let ctx = declared_ctx(&item.attrs);
         signatures.insert(
             f.name.name.clone(),
             Signature {
                 id: FnId(items.len() as u32),
                 params,
                 ret,
+                ctx,
             },
         );
         items.push((item, f));
@@ -230,12 +296,34 @@ pub fn lower(file: &SourceFile, namespace: &str) -> (Hir, Vec<SyntaxError>) {
         let mut cx = FnLowering {
             locals: Vec::new(),
             scopes: vec![HashMap::new()],
+            selector_aliases: HashMap::new(),
+            provided: Vec::new(),
+            in_entity_loop: false,
             loop_depth: 0,
             ret: signature.ret,
             signatures: &signatures,
             errors: &mut errors,
         };
         let attrs = cx.attrs(&item.attrs);
+        cx.provided = attrs
+            .iter()
+            .filter_map(|attr| match attr {
+                Attr::Ctx(kinds) => Some(kinds.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        // A function tag invokes with no executor, so a tick or load function that
+        // needs one is guaranteed to do nothing at runtime — silently. Vanilla can
+        // never tell you this.
+        let tagged = attrs.iter().any(|a| matches!(a, Attr::Tick | Attr::Load));
+        if tagged && !cx.provided.is_empty() {
+            cx.error(
+                f.name.span,
+                "a #[tick] or #[load] function cannot require a context: function tags \
+                 invoke it with no executor, so it would silently do nothing",
+            );
+        }
         let params = f
             .params
             .iter()
@@ -263,6 +351,30 @@ pub fn lower(file: &SourceFile, namespace: &str) -> (Hir, Vec<SyntaxError>) {
         });
     }
     (Hir { functions }, errors)
+}
+
+/// The `#[ctx(..)]` kinds on an item, ignoring anything malformed — the body pass
+/// reports those with a span.
+fn declared_ctx(attrs: &[ast::Attribute]) -> Vec<Ctx> {
+    let mut kinds = Vec::new();
+    for attr in attrs {
+        let Some(TokenKind::Ident(name)) = attr.tokens.first().map(|t| &t.kind) else {
+            continue;
+        };
+        if name != "ctx" {
+            continue;
+        }
+        for token in attr.tokens.iter().skip(1) {
+            if let TokenKind::Ident(kind) = &token.kind
+                && let Some(kind) = Ctx::parse(kind)
+            {
+                kinds.push(kind);
+            }
+        }
+    }
+    kinds.sort();
+    kinds.dedup();
+    kinds
 }
 
 fn named_type(written: &ast::TypeName, errors: &mut Vec<SyntaxError>) -> Option<Type> {
@@ -303,6 +415,14 @@ struct FnLowering<'a> {
     signatures: &'a HashMap<String, Signature>,
     /// Innermost scope last. A `let` shadows an outer binding of the same name.
     scopes: Vec<HashMap<String, LocalId>>,
+    /// Bindings that stand for a selector rather than a value.
+    selector_aliases: HashMap<LocalId, String>,
+    /// The contexts available at this point: the function's own `#[ctx]`, plus
+    /// whatever the enclosing `as` / `at` / `for` blocks add.
+    provided: Vec<Ctx>,
+    /// Whether the innermost loop is a `for` over entities, where `continue` is just
+    /// returning from the body.
+    in_entity_loop: bool,
     /// How many loops enclose the statement being lowered. `break` outside one is an
     /// error, and it is only detectable here.
     loop_depth: u32,
@@ -318,6 +438,9 @@ impl FnLowering<'_> {
                     self.error(attr.span, "expected an attribute name");
                     return None;
                 };
+                if name == "ctx" {
+                    return self.ctx_attr(attr);
+                }
                 match Attr::parse(name) {
                     Some(attr) => Some(attr),
                     None if PLANNED_ATTRS.contains(&name.as_str()) => {
@@ -334,6 +457,41 @@ impl FnLowering<'_> {
                 }
             })
             .collect()
+    }
+
+    /// `#[ctx(entity)]`, `#[ctx(entity, position)]`.
+    fn ctx_attr(&mut self, attr: &ast::Attribute) -> Option<Attr> {
+        let mut kinds = Vec::new();
+        // tokens are: `ctx` `(` name `,` name `)`
+        for token in attr.tokens.iter().skip(1) {
+            match &token.kind {
+                TokenKind::Ident(name) => match Ctx::parse(name) {
+                    Some(kind) => kinds.push(kind),
+                    None => {
+                        self.error(
+                            token.span,
+                            format!("unknown context '{name}'; expected entity or position"),
+                        );
+                        return None;
+                    }
+                },
+                TokenKind::Punct(_) => {}
+                _ => {
+                    self.error(token.span, "expected a context name");
+                    return None;
+                }
+            }
+        }
+        if kinds.is_empty() {
+            self.error(
+                attr.span,
+                "#[ctx(..)] needs at least one of entity, position",
+            );
+            return None;
+        }
+        kinds.sort();
+        kinds.dedup();
+        Some(Attr::Ctx(kinds))
     }
 
     fn block(&mut self, block: &ast::Block) -> Vec<Stmt> {
@@ -369,6 +527,7 @@ impl FnLowering<'_> {
             }
             ast::Stmt::If(if_stmt) => self.if_stmt(if_stmt),
             ast::Stmt::Loop(loop_stmt) => self.loop_stmt(loop_stmt),
+            ast::Stmt::Context(ctx_stmt) => self.context_stmt(ctx_stmt),
             ast::Stmt::Break(span) => self.jump(*span, "break").map(|()| Stmt::Break(*span)),
             ast::Stmt::Continue(span) => {
                 self.jump(*span, "continue").map(|()| Stmt::Continue(*span))
@@ -437,6 +596,95 @@ impl FnLowering<'_> {
         })
     }
 
+    fn context_stmt(&mut self, stmt: &ast::ContextStmt) -> Option<Stmt> {
+        let selector = self.selector(&stmt.selector)?;
+        let kind = match stmt.kind {
+            ast::ContextKind::As => ContextKind::As,
+            ast::ContextKind::At => ContextKind::At,
+            ast::ContextKind::For => ContextKind::For,
+        };
+        // `@s` only means something when there is already an executor.
+        if selector.text == "@s" {
+            self.require(Ctx::Entity, selector.span, "@s");
+        }
+        let inline = self.inline_attr(&stmt.attrs)?;
+
+        self.provided.push(match kind {
+            ContextKind::At => Ctx::Position,
+            _ => Ctx::Entity,
+        });
+        self.scopes.push(HashMap::new());
+        if let Some(binding) = &stmt.binding {
+            // The binding is a compile-time alias for `@s` inside the body.
+            let local = self.declare(&binding.name, Type::Selector, false);
+            self.selector_aliases.insert(local, "@s".to_owned());
+        }
+        // All three iterate over what the selector found, so `break` and `continue`
+        // mean something inside them.
+        self.loop_depth += 1;
+        // The body is one function per entity, so returning from it is what "next
+        // entity" means. `while`'s rules for `continue` do not apply inside.
+        let outer_loop = std::mem::replace(&mut self.in_entity_loop, true);
+        let body = stmt
+            .body
+            .stmts
+            .iter()
+            .filter_map(|stmt| self.stmt(stmt))
+            .collect();
+        self.in_entity_loop = outer_loop;
+        self.loop_depth -= 1;
+        self.scopes.pop();
+        self.provided.pop();
+
+        Some(Stmt::Context {
+            kind,
+            selector,
+            body,
+            inline,
+            span: stmt.span,
+        })
+    }
+
+    /// A selector expression: a literal, or a name bound to one.
+    fn selector(&mut self, expr: &AstExpr) -> Option<Selector> {
+        let value = self.expr(expr)?;
+        match value.kind {
+            ExprKind::Selector(text) => Some(Selector {
+                text,
+                span: value.span,
+            }),
+            ExprKind::Local(local) => match self.selector_aliases.get(&local) {
+                Some(text) => Some(Selector {
+                    text: text.clone(),
+                    span: value.span,
+                }),
+                None => {
+                    self.error(value.span, "expected a selector");
+                    None
+                }
+            },
+            _ => {
+                self.error(value.span, "expected a selector");
+                None
+            }
+        }
+    }
+
+    /// Records that something here needs a context, and complains if it is missing.
+    fn require(&mut self, ctx: Ctx, span: Span, what: &str) {
+        if self.provided.contains(&ctx) {
+            return;
+        }
+        let name = ctx.name();
+        self.error(
+            span,
+            format!(
+                "{what} needs an {name} context here; wrap it in an 'as' block, \
+                 or declare #[ctx({name})] on this function"
+            ),
+        );
+    }
+
     fn loop_stmt(&mut self, stmt: &ast::LoopStmt) -> Option<Stmt> {
         let cond = match &stmt.cond {
             Some(cond) => Some(self.condition(cond)?),
@@ -448,7 +696,9 @@ impl FnLowering<'_> {
             return None;
         }
         self.loop_depth += 1;
+        let outer = std::mem::replace(&mut self.in_entity_loop, false);
         let body = self.block(&stmt.body);
+        self.in_entity_loop = outer;
         self.loop_depth -= 1;
         Some(Stmt::Loop {
             cond,
@@ -506,6 +756,10 @@ impl FnLowering<'_> {
             }
         };
         let local = self.declare(&stmt.name.name, ty, stmt.mutable);
+        // A selector binding is a compile-time alias, not a value in a register.
+        if let ExprKind::Selector(text) = &value.kind {
+            self.selector_aliases.insert(local, text.clone());
+        }
         Some(Stmt::Let {
             local,
             value,
@@ -621,6 +875,11 @@ impl FnLowering<'_> {
                     span,
                 })
             }
+            AstExpr::Selector(lit) => Some(Expr {
+                kind: ExprKind::Selector(lit.text.clone()),
+                ty: Type::Selector,
+                span,
+            }),
             AstExpr::Macro(call) => {
                 let name = &call.name.name;
                 self.error(span, format!("'{name}!' does not produce a value"));
@@ -631,6 +890,13 @@ impl FnLowering<'_> {
 
     fn binary_type(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr, span: Span) -> Option<Type> {
         use BinaryOp::*;
+        if lhs.ty == Type::Selector || rhs.ty == Type::Selector {
+            self.error(
+                span,
+                "a selector has no runtime value; it can only be given to 'as', 'at' or 'for'",
+            );
+            return None;
+        }
         let (want, result) = match op {
             Add | Sub | Mul | Div | Rem => (Some(Type::I32), Type::I32),
             Lt | Le | Gt | Ge => (Some(Type::I32), Type::Bool),
@@ -664,7 +930,31 @@ impl FnLowering<'_> {
 
     fn call_signature(&mut self, call: &ast::CallExpr) -> Option<(FnId, Option<Type>)> {
         match self.signatures.get(&call.callee.name) {
-            Some(sig) => Some((sig.id, sig.ret)),
+            Some(sig) => {
+                let missing: Vec<Ctx> = sig
+                    .ctx
+                    .iter()
+                    .copied()
+                    .filter(|ctx| !self.provided.contains(ctx))
+                    .collect();
+                if !missing.is_empty() {
+                    let name = &call.callee.name;
+                    let kinds = missing
+                        .iter()
+                        .map(|c| c.name())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.error(
+                        call.span,
+                        format!(
+                            "'{name}' declares #[ctx({kinds})] but no {kinds} context is \
+                             available here; wrap the call in an 'as' block, or declare \
+                             #[ctx({kinds})] on this function too"
+                        ),
+                    );
+                }
+                Some((sig.id, sig.ret))
+            }
             None => {
                 let name = &call.callee.name;
                 self.error(call.callee.span, format!("'{name}' is not defined"));
@@ -1139,6 +1429,144 @@ mod tests {
             lower_err("fn f() -> i32 { return; }")[0]
                 .message
                 .contains("expected a i32")
+        );
+    }
+
+    // The checks below are why minewell exists: vanilla cannot detect any of them,
+    // and every one of them fails silently at runtime.
+
+    #[test]
+    fn calling_a_function_that_needs_an_executor_without_one_is_an_error() {
+        let errors = lower_err(
+            "#[ctx(entity)] fn hurt() {}
+             fn main() { hurt(); }",
+        );
+        assert!(errors[0].message.contains("entity"), "{errors:?}");
+        assert!(
+            errors[0].message.contains("as") && errors[0].message.contains("#[ctx(entity)]"),
+            "the diagnostic should say both ways out: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn an_as_block_supplies_the_executor() {
+        assert!(
+            lower_ok(
+                "#[ctx(entity)] fn hurt() {}
+                 fn main() { as @e[type=zombie] { hurt(); } }"
+            )
+            .functions
+            .len()
+                == 2
+        );
+    }
+
+    #[test]
+    fn declaring_the_context_passes_the_requirement_to_the_caller() {
+        assert!(
+            lower_ok(
+                "#[ctx(entity)] fn hurt() {}
+                 #[ctx(entity)] fn wrapper() { hurt(); }"
+            )
+            .functions
+            .len()
+                == 2
+        );
+        // ...and the caller of *that* still has to supply it.
+        assert!(
+            !lower_err(
+                "#[ctx(entity)] fn hurt() {}
+             #[ctx(entity)] fn wrapper() { hurt(); }
+             fn main() { wrapper(); }"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_for_loop_supplies_the_executor_too() {
+        assert!(
+            lower_ok(
+                "#[ctx(entity)] fn hurt() {}
+                 fn main() { for z in @e[type=zombie] { hurt(); } }"
+            )
+            .functions
+            .len()
+                == 2
+        );
+    }
+
+    #[test]
+    fn at_supplies_position_and_not_entity() {
+        assert!(
+            !lower_err(
+                "#[ctx(entity)] fn hurt() {}
+             fn main() { at @e[type=zombie] { hurt(); } }"
+            )
+            .is_empty()
+        );
+        assert!(
+            lower_ok(
+                "#[ctx(position)] fn place() {}
+                 fn main() { at @e[type=zombie] { place(); } }"
+            )
+            .functions
+            .len()
+                == 2
+        );
+    }
+
+    #[test]
+    fn at_s_needs_an_executor_to_be_at() {
+        assert!(!lower_err("fn main() { at @s { } }").is_empty());
+        assert!(
+            lower_ok("fn main() { as @e[type=zombie] { at @s { } } }")
+                .functions
+                .len()
+                == 1
+        );
+    }
+
+    #[test]
+    fn a_tick_function_cannot_require_a_context() {
+        // A function tag invokes with no executor, so this would silently do nothing.
+        let errors = lower_err("#[tick] #[ctx(entity)] fn t() {}");
+        assert!(errors[0].message.contains("silently"), "{errors:?}");
+    }
+
+    #[test]
+    fn the_context_ends_with_the_block() {
+        assert!(
+            !lower_err(
+                "#[ctx(entity)] fn hurt() {}
+             fn main() { as @e[type=zombie] { } hurt(); }"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_selector_can_be_named() {
+        assert!(
+            lower_ok("fn main() { let zombies = @e[type=zombie]; as zombies { } }")
+                .functions
+                .len()
+                == 1
+        );
+    }
+
+    #[test]
+    fn a_selector_is_not_a_value() {
+        assert!(!lower_err("fn main() { let x = @s == @s; }").is_empty());
+        assert!(!lower_err("fn f(s: i32) {} fn main() { f(@s); }").is_empty());
+    }
+
+    #[test]
+    fn an_unknown_context_kind_is_reported() {
+        assert!(
+            lower_err("#[ctx(dimension)] fn f() {}")[0]
+                .message
+                .contains("dimension")
         );
     }
 

@@ -109,6 +109,14 @@ pub enum Inst {
     Return { value: i32 },
     /// `execute <cond> run <inst>`. Still one command, so still one instruction.
     Guarded { cond: Cond, inst: Box<Inst> },
+    /// `execute as|at <selector> run <inst>`.
+    Context { clause: ExecuteAs, inst: Box<Inst> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecuteAs {
+    As(String),
+    At(String),
 }
 
 /// A test that can be written straight into an `execute`.
@@ -205,6 +213,12 @@ fn escapes(stmts: &[hir::Stmt]) -> Escapes {
                 returns: escapes(body).returns,
                 ..Escapes::default()
             },
+            // A context block consumes its own `continue`: returning from the body is
+            // what going to the next entity means. `break` and `return` get out.
+            hir::Stmt::Context { body, .. } => Escapes {
+                continues: false,
+                ..escapes(body)
+            },
             _ => Escapes::default(),
         })
     })
@@ -272,6 +286,8 @@ pub fn lower(hir: &Hir) -> Mir {
             prefix: f.path.clone(),
             counter: 0,
             top_level: true,
+            in_entity_body: false,
+            entity_body_root: false,
         };
         for stmt in &f.body {
             cx.stmt(stmt);
@@ -506,6 +522,10 @@ struct Lowering<'a, 'p> {
     counter: u32,
     /// A plain `return` only reaches the caller from the function's own top level.
     top_level: bool,
+    /// Whether this block is inside the body of a context block.
+    in_entity_body: bool,
+    /// Whether this block *is* that body, rather than something nested in it.
+    entity_body_root: bool,
 }
 
 impl<'p> Lowering<'_, 'p> {
@@ -517,6 +537,13 @@ impl<'p> Lowering<'_, 'p> {
             hir::Stmt::CallFor { callee, args, .. } => {
                 self.call(*callee, args, false);
             }
+            hir::Stmt::Context {
+                kind,
+                selector,
+                body,
+                inline,
+                ..
+            } => self.context_stmt(*kind, selector, body, *inline),
             hir::Stmt::If {
                 cond,
                 then,
@@ -637,7 +664,18 @@ impl<'p> Lowering<'_, 'p> {
 
     /// `break`, `continue` and `return` all leave the same way: record why in the
     /// control register, then return. Only `return` survives past the enclosing loop.
+    ///
+    /// Inside a `for` over entities, `continue` is the exception: the body is one
+    /// function per entity, so returning from it *is* going to the next one, and
+    /// raising the register would make every later entity skip itself as well.
     fn jump(&mut self, code: i32) {
+        // Returning from the body function is already "next entity", so at the body's
+        // own top level `continue` needs nothing else. From a block nested inside it,
+        // the return has to be carried out through the control register first.
+        if code == CTL_CONTINUE && self.entity_body_root {
+            self.insts.push(Inst::Return { value: 0 });
+            return;
+        }
         let ctl = self.ctl();
         self.insts.push(Inst::Const {
             dst: ctl,
@@ -689,6 +727,86 @@ impl<'p> Lowering<'_, 'p> {
             });
         }
         if escaping.any() {
+            self.propagate();
+        }
+    }
+
+    /// `as` / `at` / `for`: the body becomes a function, run once per entity.
+    fn context_stmt(
+        &mut self,
+        kind: hir::ContextKind,
+        selector: &hir::Selector,
+        body: &[hir::Stmt],
+        inline: hir::Inline,
+    ) {
+        let escaping = escapes(body);
+        let clause = match kind {
+            hir::ContextKind::At => ExecuteAs::At(selector.text.clone()),
+            _ => ExecuteAs::As(selector.text.clone()),
+        };
+
+        // A single command that cannot transfer control needs no function.
+        let inlinable = body.len() == 1 && !escaping.any() && inline != hir::Inline::Never;
+        if inlinable {
+            let before = self.insts.len();
+            self.stmt(&body[0]);
+            if self.insts.len() == before + 1 {
+                let inst = self.insts.pop().expect("just pushed");
+                self.insts.push(Inst::Context {
+                    clause,
+                    inst: Box::new(inst),
+                });
+                return;
+            }
+            self.insts.truncate(before);
+        }
+
+        let name = match kind {
+            hir::ContextKind::As => "as",
+            hir::ContextKind::At => "at",
+            hir::ContextKind::For => "for",
+        };
+        let path = format!("{}/{name}_{}", self.prefix, self.counter);
+        self.counter += 1;
+
+        let mut inner = self.child(path.clone());
+        inner.in_entity_body = true;
+        inner.entity_body_root = true;
+        // A `continue` raised from a nested block has done its job by the time it
+        // reaches here, so clear it before the guard below could mistake it for a
+        // `break`.
+        if escaping.continues {
+            inner.consume(CTL_CONTINUE);
+        }
+        // The body runs once per entity, and nothing can stop `execute as` partway
+        // through. A `break` or `return` therefore makes every later entity return
+        // immediately instead.
+        if escaping.breaks || escaping.returns {
+            let ctl = inner.ctl();
+            inner.insts.push(Inst::Guarded {
+                cond: Cond::Matches {
+                    src: ctl,
+                    min: Some(CTL_BREAK),
+                    max: None,
+                    negated: false,
+                },
+                inst: Box::new(Inst::Return { value: 0 }),
+            });
+        }
+        for stmt in body {
+            inner.stmt(stmt);
+        }
+        let (insts, generated) = inner.finish();
+        self.record(path.clone(), insts, generated);
+
+        self.insts.push(Inst::Context {
+            clause,
+            inst: Box::new(Inst::Call { path }),
+        });
+        if escaping.breaks {
+            self.consume(CTL_BREAK);
+        }
+        if escaping.returns {
             self.propagate();
         }
     }
@@ -947,6 +1065,9 @@ impl<'p> Lowering<'_, 'p> {
             hir::ExprKind::Call { callee, args } => {
                 Value::Reg(self.call(*callee, args, true).expect("a value was wanted"))
             }
+            // A selector never reaches a register: HIR only lets one be handed to
+            // `as`, `at` or `for`, which consume it at compile time.
+            hir::ExprKind::Selector(_) => unreachable!("a selector has no runtime value"),
         }
     }
 
@@ -1125,6 +1246,8 @@ impl<'p> Lowering<'_, 'p> {
             prefix,
             counter: 0,
             top_level: false,
+            in_entity_body: self.in_entity_body,
+            entity_body_root: false,
         }
     }
 

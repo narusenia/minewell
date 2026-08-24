@@ -184,6 +184,9 @@ impl Parser {
             Some(TokenKind::Keyword(Keyword::While | Keyword::Loop)) => {
                 self.loop_stmt(attrs).map(Stmt::Loop)
             }
+            Some(TokenKind::Keyword(Keyword::As | Keyword::At | Keyword::For)) => {
+                self.context_stmt(attrs).map(Stmt::Context)
+            }
             _ => {
                 if let Some(attr) = attrs.first() {
                     self.errors.push(SyntaxError::new(
@@ -246,6 +249,37 @@ impl Parser {
             cond,
             then,
             otherwise,
+            span: Span { start, end },
+        })
+    }
+
+    fn context_stmt(&mut self, attrs: Vec<Attribute>) -> Option<ContextStmt> {
+        let start = self.span().start;
+        let kind = match self.peek() {
+            Some(TokenKind::Keyword(Keyword::As)) => ContextKind::As,
+            Some(TokenKind::Keyword(Keyword::At)) => ContextKind::At,
+            _ => ContextKind::For,
+        };
+        self.bump();
+        let binding = if kind == ContextKind::For {
+            let name = self.ident()?;
+            if !self.eat_keyword(Keyword::In) {
+                self.error("expected 'in'");
+                return None;
+            }
+            Some(name)
+        } else {
+            None
+        };
+        let selector = self.expr()?;
+        let body = self.block()?;
+        let end = self.previous_end();
+        Some(ContextStmt {
+            attrs,
+            kind,
+            binding,
+            selector,
+            body,
             span: Span { start, end },
         })
     }
@@ -460,6 +494,11 @@ impl Parser {
                 let inner = self.expr()?;
                 self.expect(Punct::RParen, ")")?;
                 Some(inner)
+            }
+            Some(TokenKind::Selector(text)) => {
+                let text = text.clone();
+                self.bump();
+                Some(Expr::Selector(SelectorLit { text, span }))
             }
             Some(TokenKind::Ident(_)) => {
                 let name = self.ident()?;
