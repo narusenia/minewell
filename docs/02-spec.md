@@ -177,7 +177,7 @@ debug ビルドで生成 mcfunction に埋める `# src/foo.mwl:42` の両方が
 
 ---
 
-## 3. 構文 — M5 の範囲まで確定
+## 3. 構文 — M6 の範囲まで確定
 
 M1 は `fn main() { raw!("say hi"); }` を全レイヤ貫通させることだけを目的とする
 （[`03-plan.md`](./03-plan.md) M1）。ここで確定させるのはその範囲に限る。
@@ -286,6 +286,25 @@ ctx_kind := "entity" | "position"
 `dimension` は `ctx_kind` に含めない。次元を切り替える手段（`in`）が
 まだインタプリタに無く、検査できない要求を宣言できるようにしても意味が無い。
 
+### 3.9 コマンド呼び出しとドメインリテラル — 確定（M6）
+
+```
+primary  += RESOURCE | pos_macro
+pos_macro:= "pos" "!" "(" coord coord coord ")"
+coord    := ["~" | "^"] [INT]
+```
+
+コマンドは**関数呼び出しの形**で書く。名前は toolchain が生成する（[§6.16](#616-コマンド呼び出し)）。
+
+```rust
+setblock(pos!(~ ~1 ~), minecraft:stone);
+```
+
+- `minecraft:stone` はリソースロケーションのリテラル（§2.8）。型は `ResourceLocation`
+- `pos!` は座標リテラル。3 つの座標の記法は揃っていなければならない
+  （絶対 / `~` 相対 / `^` ローカルの混在は不可）
+- ユーザ定義関数とコマンドは名前空間を共有する。同名の関数を定義するとコマンドを覆い隠す
+
 ### 3.5 未定
 
 以降のタスクが、実装の直前に確定させる。
@@ -298,7 +317,7 @@ ctx_kind := "entity" | "position"
 
 ---
 
-## 4. 意味論 — M5 の範囲まで確定
+## 4. 意味論 — M6 の範囲まで確定
 
 ### 4.1 名前解決
 
@@ -392,6 +411,21 @@ Rust では代入式は `()` を返すが、minewell に `()` 型は無い。値
   実行者なしで呼ばれるので、宣言した時点で実行時に黙って何もしないことが確定する。
   これはバニラでは決して検出できない
 
+### 4.7 コマンド
+
+型 `ResourceLocation` と `Pos` を追加する。`Selector` と同じく**コンパイル時にしか
+存在しない型**で、実行時の表現を持たない。
+
+コマンド呼び出しの引数は**すべてコンパイル時の値**でなければならない。
+
+> なぜ — コマンドは文字列であり、実行時の値を埋め込むにはマクロ関数への昇格が要る
+> （要件定義 §10.1）。その仕組みは M9 で入る。それまで、実行時の値を渡そうとしたら
+> 「マクロで包む必要がある、まだ実装されていない」と言って止まる。黙って動かないより
+> 止まるほうがいい。
+
+`RawArg` は、brigadier の引数型のうち minewell に対応物が無いものを受ける型。
+文字列リテラルだけを受け付け、中身は検査しない。
+
 ## 5. 型の表現 — M2 の範囲のみ確定
 
 | 型 | 置き場所 | 表現 |
@@ -404,7 +438,7 @@ Rust では代入式は `()` を返すが、minewell に `()` 型は無い。値
 
 `fix<S>` / storage 専用型 / `String` / `Vec<T>` / ドメイン型は M7・M8。
 
-## 6. lowering — M5 の範囲まで確定
+## 6. lowering — M6 の範囲まで確定
 
 各構文から mcfunction への写像。生成コマンド数は `tinymcf` の計測 API で検証する
 （[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §5）。
@@ -722,3 +756,47 @@ execute if score $<fn>.ctl <ns>.v matches 1.. run return 0
 
 `continue` が `break` と違う扱いになるのは `for` / `as` の中だけで、
 `while` / `loop` の中では §6.10 のまま。lowering は最も内側のループの種類を見て決める。
+
+
+### 6.16 コマンド呼び出し
+
+toolchain の `commands.json`（brigadier のコマンドツリー）から、実行可能な葉ごとに
+1 つの関数シグネチャを作る。
+
+**名前は literal 経路を `snake_case` で繋いだもの。**
+
+```
+/data get entity <target> <path>   →  data_get_entity(target, path)
+/setblock <pos> <block>            →  setblock(pos, block)
+```
+
+引数型は brigadier の parser 名から引く（要件定義 §1.4 の対応表）。**知らない parser
+型は `RawArg` にフォールバックして警告する** — エラーにするとスナップショットで
+引数型が 1 つ増えただけで toolchain 全体が生成できなくなる。
+
+`overrides.toml` で名前とシグネチャを上書きできる。対象は頻出コマンドだけで、
+生成物の 9 割以上は機械生成のまま。
+
+呼び出しは 1 コマンドになる。
+
+```rust
+setblock(pos!(~ ~1 ~), minecraft:stone)
+→  setblock ~ ~1 ~ minecraft:stone
+```
+
+### 6.17 toolchain
+
+`minewell.toml` の `toolchain = "1.21.4"` が `~/.minewell/toolchains/1.21.4/` を指す。
+
+```
+~/.minewell/toolchains/1.21.4/
+    toolchain.json     pack_format など
+    commands.json      brigadier のコマンドツリー
+    registries.json    ブロック ID・アイテム ID など
+```
+
+**`toolchain` を書かないこともできる。** その場合 `pack_format` は暫定値になり、
+コマンド呼び出しは「toolchain が設定されていない」というエラーになる。`raw!` は使える。
+
+toolchain 無しでも動くようにするのは、コンパイラにコマンド表を埋め込まないため。
+埋め込めば「版非依存のコンパイラ」（要件定義 §1.2）が嘘になる。
