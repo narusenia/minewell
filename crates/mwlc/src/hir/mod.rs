@@ -71,6 +71,36 @@ impl Type {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hir {
     pub functions: Vec<Function>,
+    /// Ids the program names but does not define. Checked once the datapack is known
+    /// (`driver`), because whether one resolves depends on files this stage cannot see.
+    pub references: Vec<Reference>,
+}
+
+/// A reference to something that has to exist somewhere in the pack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reference {
+    pub id: String,
+    pub kind: RefKind,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefKind {
+    Function,
+}
+
+impl RefKind {
+    pub fn directory(&self) -> &'static str {
+        match self {
+            RefKind::Function => "function",
+        }
+    }
+
+    pub fn extension(&self) -> &'static str {
+        match self {
+            RefKind::Function => "mcfunction",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,6 +303,7 @@ pub fn lower(
     toolchain: Option<&Schema>,
 ) -> (Hir, Vec<SyntaxError>) {
     let mut errors = Vec::new();
+    let mut references = Vec::new();
     let mut signatures: HashMap<String, Signature> = HashMap::new();
     let mut items: Vec<(&ast::Item, &ast::FnItem)> = Vec::new();
 
@@ -325,6 +356,7 @@ pub fn lower(
             ret: signature.ret,
             signatures: &signatures,
             toolchain,
+            references: &mut references,
             errors: &mut errors,
         };
         let attrs = cx.attrs(&item.attrs);
@@ -373,7 +405,13 @@ pub fn lower(
             span: item.span,
         });
     }
-    (Hir { functions }, errors)
+    (
+        Hir {
+            functions,
+            references,
+        },
+        errors,
+    )
 }
 
 /// The `#[ctx(..)]` kinds on an item, ignoring anything malformed — the body pass
@@ -438,6 +476,7 @@ struct FnLowering<'a> {
     signatures: &'a HashMap<String, Signature>,
     /// The command surface of the configured Minecraft version, if there is one.
     toolchain: Option<&'a Schema>,
+    references: &'a mut Vec<Reference>,
     /// Innermost scope last. A `let` shadows an outer binding of the same name.
     scopes: Vec<HashMap<String, LocalId>>,
     /// Bindings that stand for a selector rather than a value.
@@ -1010,7 +1049,17 @@ impl FnLowering<'_> {
         }
         let mut parts = signature.literals.clone();
         for (arg, param) in call.args.iter().zip(&signature.params) {
-            parts.push(self.command_arg(arg, param.ty)?);
+            let rendered = self.command_arg(arg, param.ty)?;
+            // A command naming a function that does not exist is the archetypal silent
+            // failure: vanilla runs it and nothing happens.
+            if param.parser == "minecraft:function" {
+                self.references.push(Reference {
+                    id: rendered.clone(),
+                    kind: RefKind::Function,
+                    span: arg.span(),
+                });
+            }
+            parts.push(rendered);
         }
         Some(Expr {
             kind: ExprKind::Command(parts.join(" ")),

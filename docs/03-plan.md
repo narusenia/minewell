@@ -375,9 +375,12 @@ JDK は M6（`toolchain build-from-jar`）で必要になった時点で `[tools
   - `build-from-jar` の代わりに `add <version> <commands.json> --pack-format <n>`。
     data generator の実行はコンパイラの外に置く — データパック作者の多くはサーバ運営者ではなく、
     コンパイルに JVM を要求するのは筋が悪い。usage に生成コマンドを書いてある
-- [ ] **M6-8** `data/` パススルーと ID 存在検査（§13）
-  - 手書き JSON のコピー、`.mwl` から参照した ID の存在確認
-  - 先に書くテスト: 存在しない predicate を参照するとコンパイルエラーになること
+- [x] **M6-8** `data/` パススルーと ID 存在検査（§13）
+  - `data/` を丸ごとコピー。生成物と衝突したら**エラー**（黙ってどちらかを選ばない）
+  - **存在しない関数を参照するとコンパイルエラー。** バニラはこれを実行して何も起きず、
+    どこにもメッセージが出ない
+  - 検査対象は今のところ `minecraft:function` 引数だけ。predicate や loot table の
+    parser 名は版で揺れるので、実物の `commands.json` を見てから足す
 
 ---
 

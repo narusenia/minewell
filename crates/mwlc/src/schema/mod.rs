@@ -48,6 +48,9 @@ pub struct Signature {
 pub struct Param {
     pub name: String,
     pub ty: ArgType,
+    /// The brigadier parser this came from. Kept because the type alone cannot say
+    /// whether a resource location names a function, a predicate or a block.
+    pub parser: String,
 }
 
 /// What a command argument accepts, in minewell's terms.
@@ -181,6 +184,7 @@ fn walk(
                 params.push(Param {
                     name: name.clone(),
                     ty,
+                    parser: parser.to_owned(),
                 });
                 walk(child, literals, params, out, unknown);
                 params.pop();
