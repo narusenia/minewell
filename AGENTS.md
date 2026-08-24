@@ -115,7 +115,9 @@ A task is complete when:
 
 - The task's "test to write first" passes
 - `mise run ci` exits 0. **Check the exit status, not the output** — the tasks run in
-  parallel, so a green `test` line can sit above a failed `lint`
+  parallel, so a green `test` line can sit above a failed `lint`. Chain the commit
+  behind it (`mise run ci && git commit ...`) rather than running them side by side,
+  or a failed check will not stop the commit
 - Snapshots are updated if output changed (`mise run snap`)
 - The checkbox and the summary table in `docs/03-plan.md` are both updated
 
