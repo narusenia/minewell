@@ -302,6 +302,14 @@ fn command(inst: &Inst, ns: &str) -> String {
         Inst::Guarded { cond, inst } => {
             format!("execute {} run {}", condition(cond, ns), command(inst, ns))
         }
+        Inst::Otherwise { path, tags, inst } => {
+            let clauses = tags
+                .iter()
+                .map(|tag| format!("unless data storage {ns}:mw {path}{{tag:\"{tag}\"}}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("execute {clauses} run {}", command(inst, ns))
+        }
         Inst::Context { clause, inst } => {
             let clause = match clause {
                 ExecuteAs::As(selector) => format!("as {selector}"),
@@ -342,6 +350,14 @@ fn condition(cond: &Cond, ns: &str) -> String {
             let keyword = if *negated { "unless" } else { "if" };
             let (s, sobj) = (&src.holder, objective(ns, src));
             format!("{keyword} score {s} {sobj} matches {}", range(*min, *max))
+        }
+        Cond::Data {
+            path,
+            filter,
+            negated,
+        } => {
+            let keyword = if *negated { "unless" } else { "if" };
+            format!("{keyword} data storage {ns}:mw {path}{filter}")
         }
     }
 }

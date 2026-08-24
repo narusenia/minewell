@@ -129,7 +129,9 @@ MC バージョンごとの差分は **toolchain** として配布する（rustu
 - 内部フェイクプレイヤー: `$` プレフィクス（バニラのプレイヤー名として不正なため、実プレイヤーと衝突しない）
 - objective: **`<namespace>.t`**（テンポラリ） / **`<namespace>.v`**（ユーザ変数）の 2 本のみ
 - storage: **`<namespace>:mw`** の 1 本のみ。用途はルート直下のパスで分ける
-  （`mw.vars` / `mw.stack` / `mw.args` / `mw.iter`）
+  （`mw.vars` / `mw.stack` / `mw.args` / `mw.iter` / `mw.tmp`）
+  - `mw.tmp` は M7 で追加。`match` は評価対象の compound を先に控えてから腕を判定する
+    （仕様 §6.20）。score のテンポラリ（`$t<n>`）に相当するものが storage 側にも要る
 - `namespace` は `minewell.toml` で指定。他人が作った minewell 製データパックを
   同一ワールドに入れても衝突しない。長すぎる場合は警告
 - objective 登録は `#[load]` 関数に自動生成する

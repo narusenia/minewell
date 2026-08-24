@@ -277,6 +277,16 @@ impl Parser {
             Some(TokenKind::Keyword(Keyword::As | Keyword::At | Keyword::For)) => {
                 self.context_stmt(attrs).map(Stmt::Context)
             }
+            Some(TokenKind::Keyword(Keyword::Match)) => {
+                if let Some(attr) = attrs.first() {
+                    self.errors.push(SyntaxError::new(
+                        attr.span,
+                        "attributes here only apply to 'if', 'while' and 'loop'",
+                    ));
+                    return None;
+                }
+                self.match_stmt().map(Stmt::Match)
+            }
             _ => {
                 if let Some(attr) = attrs.first() {
                     self.errors.push(SyntaxError::new(
@@ -339,6 +349,73 @@ impl Parser {
             cond,
             then,
             otherwise,
+            span: Span { start, end },
+        })
+    }
+
+    /// `match s { State::Idle => { .. } _ => { .. } }`.
+    fn match_stmt(&mut self) -> Option<MatchStmt> {
+        let start = self.span().start;
+        self.bump();
+        let scrutinee = self.head_expr()?;
+        self.expect(Punct::LBrace, "{")?;
+        let mut arms = Vec::new();
+        while self.peek() != Some(&TokenKind::Punct(Punct::RBrace)) {
+            arms.push(self.match_arm()?);
+            // A comma between arms is allowed but not required, as in Rust.
+            self.eat_punct(Punct::Comma);
+        }
+        self.expect(Punct::RBrace, "}")?;
+        let end = self.previous_end();
+        Some(MatchStmt {
+            scrutinee,
+            arms,
+            span: Span { start, end },
+        })
+    }
+
+    fn match_arm(&mut self) -> Option<MatchArm> {
+        let start = self.span().start;
+        let pattern = self.pattern()?;
+        self.expect(Punct::FatArrow, "=>")?;
+        let body = self.block()?;
+        let end = self.previous_end();
+        Some(MatchArm {
+            pattern,
+            body,
+            span: Span { start, end },
+        })
+    }
+
+    fn pattern(&mut self) -> Option<Pattern> {
+        let start = self.span().start;
+        if self.eat_punct(Punct::Underscore) {
+            return Some(Pattern::Wildcard(Span {
+                start,
+                end: self.previous_end(),
+            }));
+        }
+        let ty = self.ident()?;
+        if !self.eat_punct(Punct::ColonColon) {
+            self.error("expected a variant, as in 'State::Idle'");
+            return None;
+        }
+        let variant = self.ident()?;
+        let mut binds = Vec::new();
+        if self.eat_punct(Punct::LBrace) {
+            while self.peek() != Some(&TokenKind::Punct(Punct::RBrace)) {
+                binds.push(self.ident()?);
+                if !self.eat_punct(Punct::Comma) {
+                    break;
+                }
+            }
+            self.expect(Punct::RBrace, "}")?;
+        }
+        let end = self.previous_end();
+        Some(Pattern::Variant {
+            ty,
+            variant,
+            binds,
             span: Span { start, end },
         })
     }

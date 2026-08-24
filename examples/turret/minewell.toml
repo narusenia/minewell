@@ -1,0 +1,4 @@
+[package]
+name = "turret"
+namespace = "turret"
+description = "A state machine of enum and match"

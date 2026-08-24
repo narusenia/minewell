@@ -352,6 +352,12 @@ pub enum Stmt {
         args: Vec<Expr>,
         span: Span,
     },
+    /// `match`: one arm per variant, each its own guarded block.
+    Match {
+        scrutinee: Place,
+        arms: Vec<Arm>,
+        span: Span,
+    },
     /// `as` / `at` / `for`. The body runs once per entity the selector finds.
     Context {
         kind: ContextKind,
@@ -378,6 +384,26 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
+}
+
+/// One arm of a `match`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arm {
+    /// Which variant this arm is for; `None` for `_`.
+    pub variant: Option<u32>,
+    /// The name this arm is generated under, already safe as a datapack path.
+    pub path: String,
+    pub bindings: Vec<Binding>,
+    pub body: Vec<Stmt>,
+}
+
+/// A payload field bound by a pattern, copied out of the compound on arm entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Binding {
+    pub local: LocalId,
+    /// The key to read, under the scrutinee's path.
+    pub nbt: String,
+    pub ty: Type,
 }
 
 /// A `raw!` command. Interpolation arrives in M9; today the text is literal.
@@ -704,6 +730,25 @@ fn collect_types(file: &SourceFile, errors: &mut Vec<SyntaxError>) -> Types {
                 }
             })
             .collect();
+        // Arms become functions named after their variant, and a datapack path is
+        // lowercase only (spec section 6.20), so two variants that differ in case
+        // would land on one file.
+        for (index, variant) in declared.variants.iter().enumerate() {
+            let lowered = variant.name.name.to_lowercase();
+            if let Some(other) = declared.variants[..index]
+                .iter()
+                .find(|earlier| earlier.name.name.to_lowercase() == lowered)
+            {
+                let (a, b) = (&other.name.name, &variant.name.name);
+                errors.push(SyntaxError::new(
+                    variant.name.span,
+                    format!(
+                        "'{a}' and '{b}' differ only in case, and the functions their \
+                         match arms generate would collide"
+                    ),
+                ));
+            }
+        }
         types.enums.push(EnumDef {
             id: EnumId(types.enums.len() as u32),
             name: declared.name.name.clone(),
@@ -936,6 +981,8 @@ fn always_returns(stmts: &[Stmt]) -> bool {
             otherwise: Some(otherwise),
             ..
         } => always_returns(then) && always_returns(otherwise),
+        // Exhaustive by construction, so if every arm returns, so does the match.
+        Stmt::Match { arms, .. } => arms.iter().all(|arm| always_returns(&arm.body)),
         _ => false,
     })
 }
@@ -1074,6 +1121,7 @@ impl FnLowering<'_> {
             ast::Stmt::If(if_stmt) => self.if_stmt(if_stmt),
             ast::Stmt::Loop(loop_stmt) => self.loop_stmt(loop_stmt),
             ast::Stmt::Context(ctx_stmt) => self.context_stmt(ctx_stmt),
+            ast::Stmt::Match(match_stmt) => self.match_stmt(match_stmt),
             ast::Stmt::Break(span) => self.jump(*span, "break").map(|()| Stmt::Break(*span)),
             ast::Stmt::Continue(span) => {
                 self.jump(*span, "continue").map(|()| Stmt::Continue(*span))
@@ -1141,6 +1189,152 @@ impl FnLowering<'_> {
             inline,
             span: stmt.span,
         })
+    }
+
+    /// `match`, checked for exhaustiveness (spec section 4.10).
+    ///
+    /// A missing variant is the silent failure this language exists to remove: the
+    /// generated guards would simply all fail and the block would do nothing.
+    fn match_stmt(&mut self, stmt: &ast::MatchStmt) -> Option<Stmt> {
+        let scrutinee = self.place(&stmt.scrutinee)?;
+        let Type::Enum(id) = scrutinee.ty else {
+            let found = self.ty(scrutinee.ty);
+            self.error(
+                stmt.scrutinee.span(),
+                format!("only an enum can be matched on, found {found}"),
+            );
+            return None;
+        };
+        let def = self.types.enum_def(id).clone();
+        let mut arms: Vec<Arm> = Vec::new();
+        let mut wildcard = false;
+        for arm in &stmt.arms {
+            if wildcard {
+                self.error(
+                    arm.span,
+                    "'_' has to be the last arm; nothing after it can run",
+                );
+                return None;
+            }
+            let arm = match &arm.pattern {
+                ast::Pattern::Wildcard(_) => {
+                    wildcard = true;
+                    self.arm(None, Vec::new(), "other".to_owned(), &arm.body)
+                }
+                ast::Pattern::Variant {
+                    ty,
+                    variant,
+                    binds,
+                    span,
+                } => {
+                    if ty.name != def.name {
+                        let (want, found) = (&def.name, &ty.name);
+                        self.error(
+                            ty.span,
+                            format!("expected a variant of '{want}', found '{found}'"),
+                        );
+                        return None;
+                    }
+                    let Some((index, declared)) = def.variant(&variant.name) else {
+                        let (name, wanted) = (&def.name, &variant.name);
+                        self.error(
+                            variant.span,
+                            format!("'{name}' has no variant named '{wanted}'"),
+                        );
+                        return None;
+                    };
+                    if arms.iter().any(|a| a.variant == Some(index)) {
+                        let name = &variant.name;
+                        self.error(
+                            *span,
+                            format!("'{name}' is already covered by an earlier arm"),
+                        );
+                        return None;
+                    }
+                    let declared = declared.clone();
+                    let mut bindings = Vec::new();
+                    for bind in binds {
+                        let Some(field) = declared.fields.iter().find(|f| f.name == bind.name)
+                        else {
+                            let (name, wanted) = (&variant.name, &bind.name);
+                            self.error(
+                                bind.span,
+                                format!("'{name}' has no field named '{wanted}'"),
+                            );
+                            return None;
+                        };
+                        bindings.push((bind.name.clone(), field.nbt.clone(), field.ty));
+                    }
+                    self.arm(
+                        Some(index),
+                        bindings,
+                        declared.name.to_lowercase(),
+                        &arm.body,
+                    )
+                }
+            };
+            arms.push(arm);
+        }
+        if !wildcard {
+            let missing: Vec<&str> = def
+                .variants
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !arms.iter().any(|a| a.variant == Some(*index as u32)))
+                .map(|(_, variant)| variant.name.as_str())
+                .collect();
+            if !missing.is_empty() {
+                let (name, list) = (&def.name, missing.join(", "));
+                self.error(
+                    stmt.span,
+                    format!("this match does not cover every variant of '{name}': {list}"),
+                );
+                return None;
+            }
+        } else if arms.len() > def.variants.len() {
+            // Every variant was listed before the wildcard, so it can never run.
+            self.error(
+                stmt.arms.last().expect("a wildcard arm").span,
+                "this arm cannot be reached: every variant is already covered",
+            );
+            return None;
+        }
+        Some(Stmt::Match {
+            scrutinee,
+            arms,
+            span: stmt.span,
+        })
+    }
+
+    /// Lowers one arm's body, with its payload bindings in scope.
+    fn arm(
+        &mut self,
+        variant: Option<u32>,
+        bindings: Vec<(String, String, Type)>,
+        path: String,
+        body: &ast::Block,
+    ) -> Arm {
+        self.scopes.push(HashMap::new());
+        let bindings = bindings
+            .into_iter()
+            .map(|(name, nbt, ty)| Binding {
+                local: self.declare(&name, ty, false),
+                nbt,
+                ty,
+            })
+            .collect();
+        let body = body
+            .stmts
+            .iter()
+            .filter_map(|stmt| self.stmt(stmt))
+            .collect();
+        self.scopes.pop();
+        Arm {
+            variant,
+            path,
+            bindings,
+            body,
+        }
     }
 
     fn context_stmt(&mut self, stmt: &ast::ContextStmt) -> Option<Stmt> {
@@ -2801,6 +2995,96 @@ mod tests {
         fn an_enum_cannot_contain_itself_through_a_struct() {
             let errors = lower_err("enum List { Cons { rest: Wrap } } struct Wrap { l: List }");
             assert!(errors[0].message.contains("contains itself"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_match_that_misses_a_variant_is_reported() {
+            let errors = lower_err(
+                "enum State { Idle, Waking } \
+                 fn main() { let s = State::Idle; match s { State::Idle => { } } }",
+            );
+            assert!(errors[0].message.contains("Waking"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_variant_covered_twice_is_reported() {
+            let errors = lower_err(
+                "enum State { Idle } \
+                 fn main() { let s = State::Idle; \
+                             match s { State::Idle => { } State::Idle => { } } }",
+            );
+            assert!(errors[0].message.contains("already covered"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_wildcard_has_to_come_last() {
+            let errors = lower_err(
+                "enum State { Idle, Waking } \
+                 fn main() { let s = State::Idle; \
+                             match s { _ => { } State::Idle => { } } }",
+            );
+            assert!(errors[0].message.contains("last arm"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_wildcard_that_cannot_run_is_reported() {
+            let errors = lower_err(
+                "enum State { Idle } \
+                 fn main() { let s = State::Idle; \
+                             match s { State::Idle => { } _ => { } } }",
+            );
+            assert!(
+                errors[0].message.contains("cannot be reached"),
+                "{errors:?}"
+            );
+        }
+
+        #[test]
+        fn a_pattern_from_another_enum_is_reported() {
+            let errors = lower_err(
+                "enum State { Idle } enum Mood { Angry } \
+                 fn main() { let s = State::Idle; match s { Mood::Angry => { } } }",
+            );
+            assert!(
+                errors[0].message.contains("variant of 'State'"),
+                "{errors:?}"
+            );
+        }
+
+        #[test]
+        fn binding_a_field_the_variant_does_not_have_is_reported() {
+            let errors = lower_err(
+                "enum State { Chasing { target: i32 } } \
+                 fn main() { let s = State::Chasing { target: 1 }; \
+                             match s { State::Chasing { speed } => { } } }",
+            );
+            assert!(errors[0].message.contains("speed"), "{errors:?}");
+        }
+
+        #[test]
+        fn only_an_enum_can_be_matched() {
+            let errors = lower_err("fn main() { let n = 1; match n { _ => { } } }");
+            assert!(errors[0].message.contains("only an enum"), "{errors:?}");
+        }
+
+        #[test]
+        fn variants_that_differ_only_in_case_are_reported() {
+            let errors = lower_err("enum State { Idle, IDLE }");
+            assert!(
+                errors[0].message.contains("differ only in case"),
+                "{errors:?}"
+            );
+        }
+
+        #[test]
+        fn a_binding_is_only_in_scope_inside_its_arm() {
+            let errors = lower_err(
+                "enum State { Chasing { target: i32 } } \
+                 fn main() { let s = State::Chasing { target: 1 }; \
+                             match s { State::Chasing { target } => { } } \
+                             let x = target; }",
+            );
+            assert!(errors[0].message.contains("not defined"), "{errors:?}");
         }
 
         #[test]

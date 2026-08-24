@@ -340,6 +340,10 @@ fn print_generated_commands() {
          fn take(o: Outer) -> i32 { return o.inner.a; }
          fn main() { let n = 2; let mut o = Outer { inner: Inner { a: n }, b: true };
                      o.inner.a += 1; let x = take(o); }",
+        "enum State { Idle, Chasing { target: i32 } }
+         fn main() { let mut s = State::Chasing { target: 3 }; let mut x = 0;
+                     match s { State::Idle => { x = 1; }
+                               State::Chasing { target } => { x = target; } } }",
         "struct Acc { total: i32 }
          fn walk(n: i32) -> i32 { let acc = Acc { total: n }; if n <= 0 { return 0; }
                                   let rest = walk(n - 1); return acc.total + rest; }
@@ -979,5 +983,161 @@ mod enums {
                 compound(&[("tag", NbtValue::String("Idle".into()))])
             )]))
         );
+    }
+}
+
+/// `match`. Spec sections 3.12, 4.10 and 6.20: one guard per arm, and the tag decides.
+mod matching {
+    use super::harness::{cost, local, run};
+
+    #[test]
+    fn the_arm_for_the_current_variant_runs() {
+        let src = "enum State { Idle, Chasing { target: i32 } } \
+                   fn main() { \
+                       let s = State::Idle; \
+                       let mut x = 0; \
+                       match s { \
+                           State::Idle => { x = 1; } \
+                           State::Chasing { target } => { x = 2; } \
+                       } \
+                   }";
+        assert_eq!(local(&run(src), "main", "x"), Some(1));
+    }
+
+    #[test]
+    fn a_payload_is_bound_inside_its_arm() {
+        let src = "enum State { Idle, Chasing { target: i32 } } \
+                   fn main() { \
+                       let n = 6; \
+                       let s = State::Chasing { target: n * 7 }; \
+                       let mut x = 0; \
+                       match s { \
+                           State::Idle => { x = 1; } \
+                           State::Chasing { target } => { x = target; } \
+                       } \
+                   }";
+        assert_eq!(local(&run(src), "main", "x"), Some(42));
+    }
+
+    #[test]
+    fn a_wildcard_arm_runs_when_no_tag_matched() {
+        let src = "enum State { Idle, Waking, Chasing { target: i32 } } \
+                   fn main() { \
+                       let s = State::Waking; \
+                       let mut x = 0; \
+                       match s { \
+                           State::Idle => { x = 1; } \
+                           _ => { x = 9; } \
+                       } \
+                   }";
+        assert_eq!(local(&run(src), "main", "x"), Some(9));
+    }
+
+    #[test]
+    fn only_one_arm_runs() {
+        // The tags are exclusive, so no arm needs to stop the others.
+        let src = "enum State { Idle, Waking } \
+                   fn main() { \
+                       let s = State::Idle; \
+                       let mut x = 0; \
+                       match s { \
+                           State::Idle => { x += 1; } \
+                           State::Waking => { x += 10; } \
+                       } \
+                   }";
+        assert_eq!(local(&run(src), "main", "x"), Some(1));
+    }
+
+    #[test]
+    fn an_arm_can_return_from_the_function() {
+        let src = "enum State { Idle, Waking } \
+                   fn pick(s: State) -> i32 { \
+                       match s { \
+                           State::Idle => { return 1; } \
+                           State::Waking => { return 2; } \
+                       } \
+                       return 0; \
+                   } \
+                   fn main() { let s = State::Waking; let x = pick(s); }";
+        assert_eq!(local(&run(src), "main", "x"), Some(2));
+    }
+
+    #[test]
+    fn an_arm_can_break_out_of_a_loop() {
+        let src = "enum State { Idle, Waking } \
+                   fn main() { \
+                       let s = State::Waking; \
+                       let mut x = 0; \
+                       while x < 10 { \
+                           x += 1; \
+                           match s { \
+                               State::Idle => { } \
+                               State::Waking => { break; } \
+                           } \
+                       } \
+                   }";
+        assert_eq!(local(&run(src), "main", "x"), Some(1));
+    }
+
+    #[test]
+    fn a_match_over_a_field_reads_the_nested_path() {
+        let src = "enum State { Idle, Chasing { target: i32 } } \
+                   struct Mob { state: State } \
+                   fn main() { \
+                       let m = Mob { state: State::Chasing { target: 5 } }; \
+                       let mut x = 0; \
+                       match m.state { \
+                           State::Idle => { x = 1; } \
+                           State::Chasing { target } => { x = target; } \
+                       } \
+                   }";
+        assert_eq!(local(&run(src), "main", "x"), Some(5));
+    }
+
+    /// The milestone's completion criterion: a state machine of `struct` and `enum`
+    /// running on the interpreter.
+    ///
+    /// An arm that moves the machine on rewrites the value being matched, so the
+    /// guards have to test what it was on the way in — otherwise the arm after it
+    /// sees the new variant and runs too.
+    #[test]
+    fn a_state_machine_steps_one_arm_at_a_time() {
+        let src = "enum State { Idle, Waking, Chasing { target: i32 } } \
+                   fn main() { \
+                       let mut s = State::Idle; \
+                       let mut steps = 0; \
+                       let mut caught = 0; \
+                       while steps < 3 { \
+                           steps += 1; \
+                           match s { \
+                               State::Idle => { s = State::Waking; } \
+                               State::Waking => { s = State::Chasing { target: steps }; } \
+                               State::Chasing { target } => { caught = target; } \
+                           } \
+                       } \
+                   }";
+        let mc = run(src);
+        assert_eq!(
+            local(&mc, "main", "caught"),
+            Some(2),
+            "reached Chasing on step 2"
+        );
+    }
+
+    /// What a two-arm match costs, counted from the output rather than guessed.
+    #[test]
+    fn a_guard_that_fails_costs_only_itself() {
+        let src = "enum State { Idle, Waking } \
+                   fn main() { \
+                       let s = State::Idle; \
+                       match s { \
+                           State::Idle => { } \
+                           State::Waking => { } \
+                       } \
+                   }";
+        let mc = run(src);
+        // Build the value (1), copy it aside (1), the guard that fails (1), and the
+        // guard that matches, which is an execute plus the function it runs (2).
+        assert_eq!(cost(&mc), 5);
     }
 }

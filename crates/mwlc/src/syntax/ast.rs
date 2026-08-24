@@ -89,12 +89,40 @@ pub enum Stmt {
     Loop(LoopStmt),
     /// `as <sel> { }`, `at <sel> { }` and `for e in <sel> { }`.
     Context(ContextStmt),
+    Match(MatchStmt),
     Break(Span),
     Continue(Span),
     Return {
         value: Option<Expr>,
         span: Span,
     },
+}
+
+/// `match s { State::Idle => { .. } _ => { .. } }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchStmt {
+    pub scrutinee: Expr,
+    pub arms: Vec<MatchArm>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pattern {
+    /// `State::Chasing { target }`: the variant, and the payload fields to bind.
+    Variant {
+        ty: Ident,
+        variant: Ident,
+        binds: Vec<Ident>,
+        span: Span,
+    },
+    Wildcard(Span),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

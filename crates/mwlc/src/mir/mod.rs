@@ -125,6 +125,13 @@ pub enum Inst {
     },
     /// `execute <cond> run <inst>`. Still one command, so still one instruction.
     Guarded { cond: Cond, inst: Box<Inst> },
+    /// A `match`'s `_` arm: run when none of `tags` is the one in `path`. Several
+    /// `unless` clauses, but still one command.
+    Otherwise {
+        path: String,
+        tags: Vec<String>,
+        inst: Box<Inst>,
+    },
     /// `execute as|at <selector> run <inst>`.
     Context { clause: ExecuteAs, inst: Box<Inst> },
 }
@@ -152,6 +159,13 @@ pub enum Cond {
         max: Option<i32>,
         negated: bool,
     },
+    /// `if|unless data storage <ns>:mw <path><filter>`
+    Data {
+        path: String,
+        /// An SNBT compound, appended to the path: `{tag:"Idle"}`.
+        filter: String,
+        negated: bool,
+    },
 }
 
 impl Cond {
@@ -177,6 +191,15 @@ impl Cond {
                 src,
                 min,
                 max,
+                negated: !negated,
+            },
+            Cond::Data {
+                path,
+                filter,
+                negated,
+            } => Cond::Data {
+                path,
+                filter,
                 negated: !negated,
             },
         }
@@ -229,6 +252,9 @@ fn escapes(stmts: &[hir::Stmt]) -> Escapes {
                 returns: escapes(body).returns,
                 ..Escapes::default()
             },
+            hir::Stmt::Match { arms, .. } => arms
+                .iter()
+                .fold(Escapes::default(), |acc, arm| acc.union(escapes(&arm.body))),
             // A context block consumes its own `continue`: returning from the body is
             // what going to the next entity means. `break` and `return` get out.
             hir::Stmt::Context { body, .. } => Escapes {
@@ -298,12 +324,14 @@ pub fn lower(hir: &Hir) -> Mir {
         components,
         temps: Temps::default(),
         used: Vec::new(),
+        used_data: Vec::new(),
         used_ctl: false,
         initialised: Vec::new(),
     };
     let mut functions = Vec::new();
     for f in &hir.functions {
         program.used.clear();
+        program.used_data.clear();
         program.used_ctl = false;
         // Parameters arrive with values already in them, written by the caller.
         program.initialised.clear();
@@ -358,16 +386,26 @@ pub fn lower(hir: &Hir) -> Mir {
 /// the same name and correctness needs no liveness analysis. Shrinking this is M9-7's
 /// job; until then the naive version is the one that is obviously right.
 #[derive(Debug, Default)]
-struct Temps(u32);
+struct Temps {
+    scores: u32,
+    data: u32,
+}
 
 impl Temps {
     fn next(&mut self) -> Reg {
         let reg = Reg {
-            holder: format!("$t{}", self.0),
+            holder: format!("$t{}", self.scores),
             kind: RegKind::Temp,
         };
-        self.0 += 1;
+        self.scores += 1;
         reg
+    }
+
+    /// A temporary in storage, for a composite that has no register to sit in.
+    fn next_data(&mut self) -> String {
+        let path = format!("mw.tmp.m{}", self.data);
+        self.data += 1;
+        path
     }
 }
 
@@ -381,6 +419,8 @@ struct Program<'a> {
     temps: Temps,
     /// Temporaries handed out in the function being lowered, in order.
     used: Vec<Reg>,
+    /// The same, for temporaries that live in storage.
+    used_data: Vec<String>,
     /// Whether the function being lowered touched the control register at all.
     used_ctl: bool,
     /// Locals that have been given a value at this point in the lowering. A local
@@ -511,6 +551,11 @@ fn collect_calls(stmts: &[hir::Stmt], out: &mut Vec<usize>) {
                 }
                 collect_calls(body, out);
             }
+            hir::Stmt::Match { arms, .. } => {
+                for arm in arms {
+                    collect_calls(&arm.body, out);
+                }
+            }
             _ => {}
         }
     }
@@ -624,6 +669,9 @@ impl<'p> Lowering<'_, 'p> {
                 ..
             } => self.if_stmt(cond, then, otherwise.as_deref(), *inline),
             hir::Stmt::Loop { cond, body, .. } => self.loop_stmt(cond.as_ref(), body),
+            hir::Stmt::Match {
+                scrutinee, arms, ..
+            } => self.match_stmt(scrutinee, arms),
             hir::Stmt::Raw(raw) => self.insts.push(Inst::Raw {
                 text: raw.text.clone(),
                 span: raw.span,
@@ -997,6 +1045,86 @@ impl<'p> Lowering<'_, 'p> {
         }
     }
 
+    /// One guard per arm. The tags are exclusive, so nothing has to stop the others.
+    fn match_stmt(&mut self, scrutinee: &hir::Place, arms: &[hir::Arm]) {
+        let escaping = arms
+            .iter()
+            .fold(Escapes::default(), |acc, arm| acc.union(escapes(&arm.body)));
+        let path = place_path(self.function, scrutinee);
+        // Guards run in order, and an arm is free to rewrite what is being matched —
+        // a state machine does exactly that. Testing a copy taken on the way in is
+        // what keeps exactly one arm running (spec section 6.20).
+        let tested = self.data_temp();
+        self.insts.push(Inst::CopyData {
+            dst: tested.clone(),
+            src: path.clone(),
+        });
+        let base = format!("match_{}", self.counter);
+        self.counter += 1;
+
+        let mut covered = Vec::new();
+        for arm in arms {
+            let arm_path = format!("{}/{base}/{}", self.prefix, arm.path);
+            let mut inner = self.child(arm_path.clone());
+            // The payload is copied into registers on the way in: the arm reads a
+            // binding, not a path, and the compound is not written back.
+            for binding in &arm.bindings {
+                let dst = local_reg(inner.function, binding.local);
+                let field = format!("{path}.{}", binding.nbt);
+                if binding.ty.is_storage() {
+                    let dst = local_path(inner.function, binding.local);
+                    inner.insts.push(Inst::CopyData { dst, src: field });
+                } else {
+                    inner.insts.push(Inst::StoreResult {
+                        dst,
+                        inst: Box::new(Inst::GetData { path: field }),
+                    });
+                }
+            }
+            for stmt in &arm.body {
+                inner.stmt(stmt);
+            }
+            let (insts, generated) = inner.finish();
+            self.record(arm_path.clone(), insts, generated);
+
+            let call = Inst::Call { path: arm_path };
+            match arm.variant {
+                Some(variant) => {
+                    let tag = self.tag_of_variant(scrutinee, variant);
+                    covered.push(tag.clone());
+                    self.insts.push(Inst::Guarded {
+                        cond: Cond::Data {
+                            path: tested.clone(),
+                            filter: tag_filter(&tag),
+                            negated: false,
+                        },
+                        inst: Box::new(call),
+                    });
+                }
+                None => self.insts.push(Inst::Otherwise {
+                    path: tested.clone(),
+                    tags: covered.clone(),
+                    inst: Box::new(call),
+                }),
+            }
+        }
+        // Every arm is a function of its own, so a `break` or `return` inside one gets
+        // out the same way it does from an `if` (spec section 6.10).
+        if escaping.any() {
+            self.propagate();
+        }
+    }
+
+    /// The tag string a variant of the matched enum is stored under.
+    fn tag_of_variant(&self, scrutinee: &hir::Place, variant: u32) -> String {
+        let hir::Type::Enum(id) = scrutinee.ty else {
+            unreachable!("only an enum is matched on")
+        };
+        self.program.types.enum_def(id).variants[variant as usize]
+            .name
+            .clone()
+    }
+
     /// `as` / `at` / `for`: the body becomes a function, run once per entity.
     fn context_stmt(
         &mut self,
@@ -1298,9 +1426,9 @@ impl<'p> Lowering<'_, 'p> {
                 Slot::Score(local_reg(self.function, *local))
             }
         });
-        // Temporaries are always registers: a composite never lands in one.
         let temps = self.program.used.iter().cloned().map(Slot::Score);
-        locals.chain(temps).collect()
+        let data = self.program.used_data.iter().cloned().map(Slot::Data);
+        locals.chain(temps).chain(data).collect()
     }
 
     fn cond(&mut self, expr: &hir::Expr) -> Cond {
@@ -1559,6 +1687,12 @@ impl<'p> Lowering<'_, 'p> {
         reg
     }
 
+    fn data_temp(&mut self) -> String {
+        let path = self.program.temps.next_data();
+        self.program.used_data.push(path.clone());
+        path
+    }
+
     /// A lowering context for a block split out of this one.
     fn child(&mut self, prefix: String) -> Lowering<'_, 'p> {
         Lowering {
@@ -1591,6 +1725,11 @@ impl<'p> Lowering<'_, 'p> {
         });
         self.generated.extend(generated);
     }
+}
+
+/// `{tag:"Idle"}`, the filter that picks one variant out of a compound.
+fn tag_filter(tag: &str) -> String {
+    format!("{{{TAG_KEY}:\"{tag}\"}}")
 }
 
 fn is_comparison(op: BinaryOp) -> bool {

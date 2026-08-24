@@ -346,14 +346,33 @@ variant_lit := IDENT "::" IDENT ["{" [field_inits] "}"]
   compound のキーは名前であって位置ではなく、`_0` のような綴りを発明しても読めるものにならない
 - 構築は `State::Idle` と `State::Chasing { target: 3 }`。フィールドの規則は `struct` と同じ
 
+### 3.12 `match` — 確定（M7）
+
+```
+stmt        += match_stmt
+match_stmt  := "match" expr "{" {match_arm} "}"
+match_arm   := pattern "=>" block [","]
+pattern     := IDENT "::" IDENT ["{" [binds] "}"] | "_"
+binds       := IDENT {"," IDENT} [","]
+```
+
+- 腕の本体は**ブロックのみ**。式の腕は無い
+- ペイロードの束縛はフィールド名そのまま（`State::Chasing { target }`）。名前の付け替えは無い
+- **網羅していなければエラー。** `_` は最後にだけ置ける。全バリアントを挙げた後の `_` も
+  エラー（到達しない腕を黙って受け取らない）
+
+**`match` も `if` も式にしない。決定（M7）。** 合流点で値を作るには宛先駆動の lowering
+（積み残し、M9-10）が要る。それが入るまでの間、`let mut x = 0;` と各腕での代入が
+同じ意味を同じコマンド数で書ける。値を返す構文を先に入れると、テンポラリ経由の
+コピーが 1 つ増えたまま固定されてしまう。
+
 ### 3.5 未定
 
 以降のタスクが、実装の直前に確定させる。
 
 | 節 | 内容 | タスク |
 |---|---|---|
-| 3.7 | `if` 式 | M7（`match` と一緒に） |
-| 3.13 | `match` / ジェネリクス / `impl` | M7 |
+| 3.13 | ジェネリクス / `impl` | M7 |
 | 3.12 | `mod` / `use` / `pub` / `extern fn` | 完全版は M7 |
 
 ---
@@ -516,6 +535,14 @@ Rust では代入式は `()` を返すが、minewell に `()` 型は無い。値
   実行時にしか分からず、`s.target` が存在するかどうかを静的に言えない
 - 比較・戻り値・算術は `struct` と同じ扱い（[§4.8](#48-struct--確定m7)）。
   引数渡しと複製は 1 コマンドでできる
+
+### 4.10 `match` — 確定（M7）
+
+- 対象は `enum` の**束縛かそのフィールド**。式の結果は `match` できない —
+  compound を置く場所（storage 上のテンポラリ）を持っていないため
+- 束縛（`State::Chasing { target }` の `target`）はその腕の中だけで有効。
+  値はコピーで、書き換えても元の compound には戻らない
+- 腕が同じバリアントを 2 度挙げたらエラー
 
 ## 5. 型の表現 — M6 と `struct` の範囲まで確定
 
@@ -977,3 +1004,35 @@ let s = State::Chasing { target: n };
 
 **バリアントを変えるときも 1 コマンドで書き換わる。** `set value` は compound を丸ごと
 置き換えるので、前のバリアントのフィールドが残ることはない。
+
+---
+
+### 6.20 `match` — 確定（M7）
+
+腕は**それぞれ独立したガード**になる。ただし判定するのは**評価対象の控え**で、元の値ではない。
+
+```
+match s {
+    State::Idle => { .. }
+    State::Chasing { target } => { .. }
+}
+→  data modify storage <ns>:mw mw.tmp.m0 set from storage <ns>:mw mw.vars.main.s
+   execute if data storage <ns>:mw mw.tmp.m0{tag:"Idle"} run function <親>/match_0/idle
+   execute if data storage <ns>:mw mw.tmp.m0{tag:"Chasing"} run function <親>/match_0/chasing
+
+<親>/match_0/chasing:
+   execute store result score $main.target <ns>.v \
+       run data get storage <ns>:mw mw.vars.main.s.target
+   ...
+```
+
+- **控えを取るのは 1 コマンド、そして削れない。** ガードは順に評価されるので、腕が
+  評価対象を書き換えると（状態機械はまさにそれをする）後続の腕が新しいタグに一致して
+  もう一度走ってしまう。控えを見ていれば、走る腕はつねに 1 つ
+- ペイロードの束縛は**元のパス**から読む。走る腕は 1 つなので、その時点の値は入ってきた値
+- 生成関数は `<親>/match_<n>/<バリアント名を小文字にしたもの>`。データパックのパスは
+  小文字しか受け付けないため。小文字にすると衝突するバリアントの組はエラーにする
+- `_` の腕は `<親>/match_<n>/other`。ガードは挙がっているタグを全部 `unless` で並べた
+  **1 コマンド**
+- 腕から `break` / `continue` / `return` が出るときは `if` と同じ伝播ガードが付く
+  （[§6.10](#610-break--continue--return)）

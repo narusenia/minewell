@@ -1,0 +1,57 @@
+// A state machine, which is what `enum` and `match` are for.
+//
+// The phase is a tagged compound in storage: `{tag:"Warmup",ticks:2}`. Each arm of the
+// match becomes its own function under `turret:main/match_0/`, guarded by one
+// `execute if data ... {tag:"..."}`. Only the arm whose tag matches runs, and the
+// commands the other arms would have cost are never executed.
+//
+// Notice that the arms rewrite the very value being matched. The compiler copies the
+// phase aside before the first guard, so moving to the next phase cannot make the arm
+// below run in the same step — the bug you would write by hand, and never see, because
+// mcfunction does not complain about anything.
+
+enum Phase {
+    Idle,
+    Warmup { ticks: i32 },
+    Firing { power: i32 },
+}
+
+struct Turret {
+    phase: Phase,
+    #[nbt(short)]
+    shots: i32,
+}
+
+#[load]
+fn main() {
+    let mut turret = Turret {
+        phase: Phase::Idle,
+        shots: 0,
+    };
+
+    let mut tick = 0;
+    while tick < 6 {
+        tick += 1;
+
+        match turret.phase {
+            Phase::Idle => {
+                turret.phase = Phase::Warmup { ticks: 2 };
+            }
+            Phase::Warmup { ticks } => {
+                if ticks <= 1 {
+                    turret.phase = Phase::Firing { power: 4 };
+                } else {
+                    turret.phase = Phase::Warmup { ticks: ticks - 1 };
+                }
+            }
+            Phase::Firing { power } => {
+                turret.shots += power;
+                turret.phase = Phase::Idle;
+            }
+        }
+    }
+
+    if turret.shots > 0 {
+        raw!("say the turret fired");
+    }
+}
