@@ -366,6 +366,9 @@ JDK は M6（`toolchain build-from-jar`）で必要になった時点で `[tools
     コマンド表を人間の管理下に戻すことになり、生成した意味が消える
   - 該当コマンドが無いリネームは**エラーにしない**。1 つのファイルが複数版をまたぐため
 - [x] **M6-5** `ResourceLocation` / `Pos` リテラル
+  - **後から直した 2 点**（どちらも大きい例を書いて初めて出た）:
+    ID のパスに `.` と `-` を含められること（`minecraft:block.note_block.pling` は 1 つの ID）、
+    引数の後ろに来るリテラルを正しい位置に書くこと（`playsound <sound> master <targets>`）
   - `minecraft:stone` と `pos!(~ ~1 ~)`。どちらも `Selector` と同じくコンパイル時のみの型
   - 座標の記法混在（`~ ^ ~`）はエラー。registries による ID 検証は M6-6 の toolchain 側
 - [x] **M6-6** toolchain の管理

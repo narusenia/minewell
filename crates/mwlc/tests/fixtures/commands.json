@@ -1,7 +1,10 @@
 {
   "type": "root",
   "children": {
-    "reload": { "type": "literal", "executable": true },
+    "reload": {
+      "type": "literal",
+      "executable": true
+    },
     "setblock": {
       "type": "literal",
       "children": {
@@ -72,6 +75,27 @@
           "type": "literal",
           "executable": true,
           "redirect": []
+        }
+      }
+    },
+    "playsound": {
+      "type": "literal",
+      "children": {
+        "sound": {
+          "type": "argument",
+          "parser": "minecraft:resource_location",
+          "children": {
+            "master": {
+              "type": "literal",
+              "children": {
+                "targets": {
+                  "type": "argument",
+                  "parser": "minecraft:entity",
+                  "executable": true
+                }
+              }
+            }
+          }
         }
       }
     }

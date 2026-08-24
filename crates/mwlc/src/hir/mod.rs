@@ -16,7 +16,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use crate::schema::{ArgType, Schema};
+use crate::schema::{ArgType, Part, Schema};
 use crate::syntax::SyntaxError;
 use crate::syntax::ast::{self, BinaryOp, Expr as AstExpr, ItemKind, SourceFile, UnaryOp};
 use crate::syntax::lexer::{Punct, Span, TokenKind};
@@ -2753,7 +2753,9 @@ impl FnLowering<'_> {
             );
             return None;
         }
-        let mut parts = signature.literals.clone();
+        // Words and arguments interleave: a literal can follow an argument, as in
+        // `playsound <sound> master <targets>`.
+        let mut rendered_args = Vec::new();
         for (arg, param) in call.args.iter().zip(&signature.params) {
             let rendered = self.command_arg(arg, param.ty)?;
             // A command naming a function that does not exist is the archetypal silent
@@ -2765,8 +2767,16 @@ impl FnLowering<'_> {
                     span: arg.span(),
                 });
             }
-            parts.push(rendered);
+            rendered_args.push(rendered);
         }
+        let parts: Vec<String> = signature
+            .parts
+            .iter()
+            .map(|part| match part {
+                Part::Literal(word) => word.clone(),
+                Part::Arg(index) => rendered_args[*index].clone(),
+            })
+            .collect();
         Some(Expr {
             kind: ExprKind::Command(parts.join(" ")),
             ty: Type::I32,
@@ -3460,6 +3470,16 @@ mod tests {
             "setblock ~ ~1 ~ minecraft:stone"
         );
         assert_eq!(command_text("fn main() { reload(); }"), "reload");
+    }
+
+    /// A literal can follow an argument. Vanilla rejects the words in any other
+    /// order, and it took a bigger example to notice.
+    #[test]
+    fn a_literal_after_an_argument_keeps_its_place() {
+        assert_eq!(
+            command_text("fn main() { playsound_master(minecraft:block.note_block.pling, @a); }"),
+            "playsound minecraft:block.note_block.pling master @a"
+        );
     }
 
     #[test]

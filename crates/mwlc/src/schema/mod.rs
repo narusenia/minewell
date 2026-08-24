@@ -39,9 +39,21 @@ enum NodeKind {
 pub struct Signature {
     /// The generated name: the literal path joined with underscores.
     pub name: String,
-    /// The literal words that begin the command, in order.
+    /// The literal words the command is made of, in order.
     pub literals: Vec<String>,
     pub params: Vec<Param>,
+    /// The command as it has to be written: words and arguments interleaved. A literal
+    /// can follow an argument (`playsound <sound> master <targets>`), so the order
+    /// cannot be recovered from the two lists above.
+    pub parts: Vec<Part>,
+}
+
+/// One piece of a command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Part {
+    Literal(String),
+    /// An argument, by its index in `params`.
+    Arg(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +143,7 @@ impl Schema {
             &root,
             &mut Vec::new(),
             &mut Vec::new(),
+            &mut Vec::new(),
             &mut schema,
             &mut unknown,
         );
@@ -178,6 +191,7 @@ fn walk(
     node: &Node,
     literals: &mut Vec<String>,
     params: &mut Vec<Param>,
+    parts: &mut Vec<Part>,
     out: &mut Schema,
     unknown: &mut std::collections::BTreeSet<String>,
 ) {
@@ -189,6 +203,7 @@ fn walk(
             name,
             literals: literals.clone(),
             params: params.clone(),
+            parts: parts.clone(),
         });
     }
     // A redirect points back into the tree; following it would not terminate.
@@ -200,7 +215,9 @@ fn walk(
             NodeKind::Root => {}
             NodeKind::Literal => {
                 literals.push(name.clone());
-                walk(child, literals, params, out, unknown);
+                parts.push(Part::Literal(name.clone()));
+                walk(child, literals, params, parts, out, unknown);
+                parts.pop();
                 literals.pop();
             }
             NodeKind::Argument => {
@@ -217,7 +234,9 @@ fn walk(
                     ty,
                     parser: parser.to_owned(),
                 });
-                walk(child, literals, params, out, unknown);
+                parts.push(Part::Arg(params.len() - 1));
+                walk(child, literals, params, parts, out, unknown);
+                parts.pop();
                 params.pop();
             }
         }
