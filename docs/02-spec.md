@@ -177,7 +177,7 @@ debug ビルドで生成 mcfunction に埋める `# src/foo.mwl:42` の両方が
 
 ---
 
-## 3. 構文 — M2 の範囲まで確定
+## 3. 構文 — M3 の範囲まで確定
 
 M1 は `fn main() { raw!("say hi"); }` を全レイヤ貫通させることだけを目的とする
 （[`03-plan.md`](./03-plan.md) M1）。ここで確定させるのはその範囲に限る。
@@ -227,21 +227,37 @@ primary     := INT | BOOL | IDENT | macro_call | "(" expr ")"
 - 単項 `-` は `i32`、`!` は `bool`。
 - `mut` の無い束縛への代入はエラー。
 
-### 3.3 未定
+### 3.4 制御フロー — 確定（M3）
+
+```
+stmt        := let_stmt | expr_stmt | if_stmt | while_stmt | loop_stmt
+             | "break" ";" | "continue" ";" | "return" ";"
+if_stmt     := "if" expr block ["else" (block | if_stmt)]
+while_stmt  := "while" expr block
+loop_stmt   := "loop" block
+```
+
+- 条件は `bool` でなければならない。**`i32` の 0 / 非 0 を条件にできない。**
+- `if` は**文**であって式ではない。値を持つ `if` は合流点で値を作る必要があり、
+  それは M4 で関数の戻り値を入れるときに一緒に考える。
+- `break` / `continue` はループの外で使うとエラー。
+- `return` は M3 では値を取らない。関数がまだ値を返さないため。
+- `else if` は `else` の後に `if_stmt` を置く形なので、追加の規則は要らない。
+
+### 3.5 未定
 
 以降のタスクが、実装の直前に確定させる。
 
 | 節 | 内容 | タスク |
 |---|---|---|
-| 3.4 | `if` / `else` / `while` / `loop` / `break` / `continue` / `return` | M3 |
-| 3.5 | 関数の引数・戻り値・呼び出し | M4 |
-| 3.6 | `as` / `at` / `for`、`#[ctx]` | M5 |
-| 3.7 | `struct` / `enum` / `match` / ジェネリクス / `impl` | M7 |
-| 3.8 | `mod` / `use` / `pub` / `extern fn` | 最小限を M4 まで、完全版は M7 |
+| 3.6 | 関数の引数・戻り値・呼び出し、`if` 式 | M4 |
+| 3.7 | `as` / `at` / `for`、`#[ctx]` | M5 |
+| 3.8 | `struct` / `enum` / `match` / ジェネリクス / `impl` | M7 |
+| 3.9 | `mod` / `use` / `pub` / `extern fn` | 最小限を M4 まで、完全版は M7 |
 
 ---
 
-## 4. 意味論 — M2 の範囲のみ確定
+## 4. 意味論 — M3 の範囲まで確定
 
 ### 4.1 名前解決
 
@@ -284,6 +300,14 @@ M2 が持つ型は 2 つだけ。
 Rust では代入式は `()` を返すが、minewell に `()` 型は無い。値を返さない構文を
 式の位置に置けないようにするほうが、無い型を 1 つ導入するより小さい。
 
+### 4.4 制御フロー
+
+- `if` / `while` の条件は `bool`。
+- `break` / `continue` は最も内側のループに作用する。ループの外ではエラー。
+- ブロックはスコープを作る。ループ本体の `let` は反復ごとに新しい束縛……ではなく、
+  **同じフェイクプレイヤーを再利用する**。反復間で値が残るが、`let` が必ず初期化するので
+  観測できない。ここを分けるとループごとに未使用のレジスタが増えるだけで、得るものが無い。
+
 ## 5. 型の表現 — M2 の範囲のみ確定
 
 | 型 | 置き場所 | 表現 |
@@ -296,7 +320,7 @@ Rust では代入式は `()` を返すが、minewell に `()` 型は無い。値
 
 `fix<S>` / storage 専用型 / `String` / `Vec<T>` / ドメイン型は M7・M8。
 
-## 6. lowering — M2 の範囲のみ確定
+## 6. lowering — M3 の範囲まで確定
 
 各構文から mcfunction への写像。生成コマンド数は `tinymcf` の計測 API で検証する
 （[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §5）。
@@ -372,3 +396,117 @@ Rust に合わせるには符号を見て補正するコマンドを毎回吐く
 コンパイラのバグと区別がつかない形で全部が動かなくなるので、これは選択肢ではない。
 
 `#[tick]` / `#[load]` を付けた関数もそれぞれのタグに載る。
+
+---
+
+### 6.6 制御フローの表現
+
+**MIR にジャンプ命令は無い。** ターゲットにジャンプが無いため、基本ブロックを辺で
+繋いだ CFG を持つ意味が無い。制御フローは 2 つだけで表す:
+
+- **生成関数** — 切り出したブロックは 1 つの mcfunction になる
+- **ガード付き命令** — `execute <条件> run <コマンド>`
+
+「1 命令 = 1 コマンド」は保たれる。ガード付き命令も 1 行だから。
+
+### 6.7 条件
+
+条件式は可能なら `execute if` に**直接埋め込む**。
+
+| 条件式 | 生成 |
+|---|---|
+| `a < b`（両方レジスタ） | `execute if score $a ... < $b ... run ...` |
+| `a < 5` | `execute if score $a ... matches ..4 run ...` |
+| `!c` | `execute if score $c ... matches 0 run ...` |
+| `flag`（`bool` の束縛） | `execute if score $flag ... matches 1 run ...` |
+| それ以外 | レジスタに評価してから `matches 1` |
+
+比較をいったんレジスタに書いてから `matches 1` で読み直すと 2 コマンドかかる。
+`execute if score` が比較を直接書けるので、1 コマンドで済む。
+
+### 6.8 `if` / `else`
+
+**単文で、制御フローを含まないブロックはインライン展開する。**
+
+```
+if x > 0 { raw!("say hi"); }
+→  execute if score $x ... matches 1.. run say hi        (1 コマンド)
+```
+
+そうでない場合は関数に切り出す:
+
+```
+if c { A } else { B }
+→  execute if <cond> run function <親>/if_0
+   execute unless <cond> run function <親>/else_0
+```
+
+`else` を `unless` で書けるのは、条件が同じ式だから。条件が
+レジスタ経由のときはそのレジスタを 2 回読む。
+
+`#[inline]` / `#[no_inline]` を文に付けると判定を上書きできる。
+
+### 6.9 ループ
+
+`while c { B }` は**自己末尾再帰する 1 つの関数**になる。
+
+```
+→  function <親>/while_0
+
+<親>/while_0:
+   execute unless <cond> run return 0
+   <B をインライン展開>
+   function <親>/while_0
+```
+
+`loop { B }` は条件ガードが無いだけで同じ。
+
+### 6.10 `break` / `continue` / `return`
+
+生成関数から抜ける手段は `return` しか無く、`return` は呼び出し元まで**伝播しない**。
+そこで**制御レジスタ** `$<fn>.ctl` を 1 本使う。
+
+| 値 | 意味 |
+|---|---|
+| 0 | 通常 |
+| 1 | `break` |
+| 2 | `continue` |
+| 3 | `return` |
+
+```
+break     →  scoreboard players set $<fn>.ctl <ns>.v 1
+             return 0
+continue  →  ... 2 / return 0
+return    →  ... 3 / return 0
+```
+
+抜けうるブロックを呼んだ直後には、伝播のガードが 1 つ付く:
+
+```
+execute if score $<fn>.ctl <ns>.v matches 1.. run return 0
+```
+
+ループがそれを消費する:
+
+- **`continue` を含む本体は別関数に切り出す。** 本体をインラインにしたままだと
+  `continue` の `return` がループ関数ごと終わらせてしまい、次の反復に行けない。
+  切り出したうえで、呼び出し直後に `matches 2` を 0 に戻す
+- ループの呼び出し元は、戻った直後に `matches 1`（`break`）を 0 に戻す
+- `matches 3`（`return`）はどこでも消費されず、関数の先頭まで伝播する
+
+**この仕組みは必要なときにしか出てこない。** ブロックから制御が抜けないなら
+`$ctl` は 1 度も現れない。抜けうるかどうかはブロックごとに静的に分かる。
+
+### 6.11 生成関数の命名
+
+親のサブディレクトリに置く（要件定義 §12.2）。
+
+| 構文 | 名前 |
+|---|---|
+| `if` の then | `<親>/if_<n>` |
+| `else` | `<親>/else_<n>` |
+| `while` / `loop` | `<親>/while_<n>` / `<親>/loop_<n>` |
+| `continue` を含むループ本体 | `<親>/while_<n>/body` |
+
+`<n>` は親の中で 0 から数える。`__gen/` に平置きしないのは、生成物を目で追えることが
+要件（要件定義 §12.2）だから。
