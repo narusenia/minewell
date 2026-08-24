@@ -63,6 +63,7 @@ impl Parser {
         match self.peek() {
             Some(TokenKind::Keyword(Keyword::Fn)) => {}
             Some(TokenKind::Keyword(Keyword::Struct)) => return self.struct_item(attrs, start),
+            Some(TokenKind::Keyword(Keyword::Enum)) => return self.enum_item(attrs, start),
             Some(TokenKind::Reserved(word)) => {
                 let word = word.clone();
                 self.error(format!(
@@ -126,6 +127,54 @@ impl Parser {
         Some(Item {
             attrs,
             kind: ItemKind::Struct(StructItem { name, fields }),
+            span: Span { start, end },
+        })
+    }
+
+    /// `enum State { Idle, Chasing { target: i32 } }`.
+    fn enum_item(&mut self, attrs: Vec<Attribute>, start: usize) -> Option<Item> {
+        self.bump();
+        let name = self.ident()?;
+        self.expect(Punct::LBrace, "{")?;
+        let mut variants = Vec::new();
+        while self.peek() != Some(&TokenKind::Punct(Punct::RBrace)) {
+            variants.push(self.variant_def()?);
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        self.expect(Punct::RBrace, "}")?;
+        let end = self.previous_end();
+        Some(Item {
+            attrs,
+            kind: ItemKind::Enum(EnumItem { name, variants }),
+            span: Span { start, end },
+        })
+    }
+
+    fn variant_def(&mut self) -> Option<VariantDef> {
+        let start = self.span().start;
+        let name = self.ident()?;
+        // A tuple variant would need invented keys; say so rather than guess (spec
+        // section 3.11).
+        if self.peek() == Some(&TokenKind::Punct(Punct::LParen)) {
+            self.error("a variant names its fields: write 'V { field: i32 }'");
+            return None;
+        }
+        let mut fields = Vec::new();
+        if self.eat_punct(Punct::LBrace) {
+            while self.peek() != Some(&TokenKind::Punct(Punct::RBrace)) {
+                fields.push(self.field_def()?);
+                if !self.eat_punct(Punct::Comma) {
+                    break;
+                }
+            }
+            self.expect(Punct::RBrace, "}")?;
+        }
+        let end = self.previous_end();
+        Some(VariantDef {
+            name,
+            fields,
             span: Span { start, end },
         })
     }
@@ -596,7 +645,27 @@ impl Parser {
                     Some(TokenKind::Punct(Punct::Bang)) => self.macro_call(name),
                     Some(TokenKind::Punct(Punct::LParen)) => self.call(name),
                     Some(TokenKind::Punct(Punct::LBrace)) if !self.no_struct_lit => {
-                        self.struct_lit(name)
+                        self.struct_lit(name, None)
+                    }
+                    // `State::Idle`, with or without a payload.
+                    Some(TokenKind::Punct(Punct::ColonColon)) => {
+                        self.bump();
+                        let variant = self.ident()?;
+                        if self.peek() == Some(&TokenKind::Punct(Punct::LBrace))
+                            && !self.no_struct_lit
+                        {
+                            return self.struct_lit(name, Some(variant));
+                        }
+                        let span = Span {
+                            start: name.span.start,
+                            end: variant.span.end,
+                        };
+                        Some(Expr::Struct(StructLit {
+                            name,
+                            variant: Some(variant),
+                            fields: Vec::new(),
+                            span,
+                        }))
                     }
                     _ => Some(Expr::Path(name)),
                 }
@@ -628,7 +697,7 @@ impl Parser {
     }
 
     /// `Point { x: 1, y: 2 }`.
-    fn struct_lit(&mut self, name: Ident) -> Option<Expr> {
+    fn struct_lit(&mut self, name: Ident, variant: Option<Ident>) -> Option<Expr> {
         let start = name.span.start;
         self.bump();
         let mut fields = Vec::new();
@@ -656,6 +725,7 @@ impl Parser {
         let end = self.previous_end();
         Some(Expr::Struct(StructLit {
             name,
+            variant,
             fields,
             span: Span { start, end },
         }))

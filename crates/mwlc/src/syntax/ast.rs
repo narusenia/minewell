@@ -25,6 +25,22 @@ pub struct Item {
 pub enum ItemKind {
     Fn(FnItem),
     Struct(StructItem),
+    Enum(EnumItem),
+}
+
+/// `enum State { Idle, Chasing { target: i32 } }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumItem {
+    pub name: Ident,
+    pub variants: Vec<VariantDef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VariantDef {
+    pub name: Ident,
+    /// Empty for a unit variant. Variants name their fields; there is no tuple form.
+    pub fields: Vec<FieldDef>,
+    pub span: Span,
 }
 
 /// `struct Point { x: i32, y: i32 }`.
@@ -165,10 +181,12 @@ pub struct FieldExpr {
     pub span: Span,
 }
 
-/// `Point { x: 1, y: 2 }`.
+/// `Point { x: 1, y: 2 }`, and `State::Chasing { target: 3 }` with a variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructLit {
     pub name: Ident,
+    /// The variant, for an `enum`. `None` means the type itself.
+    pub variant: Option<Ident>,
     pub fields: Vec<FieldInit>,
     pub span: Span,
 }

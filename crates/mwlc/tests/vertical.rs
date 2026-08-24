@@ -920,3 +920,64 @@ mod structs {
         );
     }
 }
+
+/// Tagged unions. Spec sections 3.11, 4.9 and 6.19: an `enum` is a compound with a
+/// `tag`, and its payload sits alongside it.
+mod enums {
+    use super::harness::{cost, run, stored};
+    use tinymcf::nbt::NbtValue;
+
+    fn compound(fields: &[(&str, NbtValue)]) -> NbtValue {
+        NbtValue::compound(fields.iter().map(|(k, v)| (*k, v.clone())))
+    }
+
+    #[test]
+    fn a_unit_variant_is_a_tag_on_its_own() {
+        let mc = run("enum State { Idle, Chasing { target: i32 } } \
+             fn main() { let s = State::Idle; }");
+        assert_eq!(
+            stored(&mc, "main", "s"),
+            Some(compound(&[("tag", NbtValue::String("Idle".into()))]))
+        );
+        assert_eq!(cost(&mc), 1);
+    }
+
+    #[test]
+    fn a_payload_sits_next_to_the_tag() {
+        let mc = run("enum State { Idle, Chasing { target: i32 } } \
+             fn main() { let n = 4; let s = State::Chasing { target: n * 2 }; }");
+        assert_eq!(
+            stored(&mc, "main", "s"),
+            Some(compound(&[
+                ("tag", NbtValue::String("Chasing".into())),
+                ("target", NbtValue::Int(8)),
+            ]))
+        );
+    }
+
+    /// A new variant replaces the compound, so nothing of the old one is left behind
+    /// to be read as if it belonged to the new one.
+    #[test]
+    fn changing_variant_leaves_no_stale_payload() {
+        let mc = run("enum State { Idle, Chasing { target: i32 } } \
+             fn main() { let mut s = State::Chasing { target: 3 }; s = State::Idle; }");
+        assert_eq!(
+            stored(&mc, "main", "s"),
+            Some(compound(&[("tag", NbtValue::String("Idle".into()))]))
+        );
+    }
+
+    #[test]
+    fn an_enum_can_be_a_field_and_an_argument() {
+        let mc = run("enum State { Idle } struct Mob { state: State } \
+             fn take(m: Mob) {} \
+             fn main() { let m = Mob { state: State::Idle }; take(m); }");
+        assert_eq!(
+            stored(&mc, "take", "m"),
+            Some(compound(&[(
+                "state",
+                compound(&[("tag", NbtValue::String("Idle".into()))])
+            )]))
+        );
+    }
+}

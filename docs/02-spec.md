@@ -330,6 +330,22 @@ place       := IDENT {"." IDENT}
   `if p { .. }` の `{` がブロックなのかリテラルなのか決まらないため。Rust と同じ制限で、
   括弧の中でなら書ける
 
+### 3.11 `enum` — 確定（M7）
+
+```
+item        += enum_item
+enum_item   := "enum" IDENT "{" [variants] "}"
+variants    := variant {"," variant} [","]
+variant     := IDENT ["{" [field_defs] "}"]
+
+primary     += variant_lit
+variant_lit := IDENT "::" IDENT ["{" [field_inits] "}"]
+```
+
+- **バリアントのフィールドには名前を付ける。** タプル型バリアント（`Chasing(i32)`）は無い —
+  compound のキーは名前であって位置ではなく、`_0` のような綴りを発明しても読めるものにならない
+- 構築は `State::Idle` と `State::Chasing { target: 3 }`。フィールドの規則は `struct` と同じ
+
 ### 3.5 未定
 
 以降のタスクが、実装の直前に確定させる。
@@ -337,7 +353,7 @@ place       := IDENT {"." IDENT}
 | 節 | 内容 | タスク |
 |---|---|---|
 | 3.7 | `if` 式 | M7（`match` と一緒に） |
-| 3.11 | `enum` / `match` / ジェネリクス / `impl` | M7 |
+| 3.13 | `match` / ジェネリクス / `impl` | M7 |
 | 3.12 | `mod` / `use` / `pub` / `extern fn` | 完全版は M7 |
 
 ---
@@ -486,6 +502,21 @@ Rust では代入式は `()` を返すが、minewell に `()` 型は無い。値
 - **戻り値にできない。** バニラの関数の戻り値は整数 1 つで、compound を返す場所が無い
 - 引数にはできる。呼び出し側の storage から呼び出し先の storage への 1 コマンドの複製
 
+### 4.9 `enum` — 確定（M7）
+
+`enum` は storage 上の**タグ付き union**。要件定義 §4.2 のとおり `{tag:"Idle"}` の形で、
+バリアントのフィールドは同じ compound に並ぶ（`{tag:"Chasing",target:3}`）。
+
+| 式 | 要求 | 結果 |
+|---|---|---|
+| `E::V` / `E::V { f: e }` | `E` は `enum`、`V` はそのバリアント、フィールドが過不足なく同型 | `E` |
+
+- `tag` という名前のフィールドは書けない。タグの置き場所と衝突する
+- **中身を読むには `match`。** フィールドアクセスはできない — どのバリアントかは
+  実行時にしか分からず、`s.target` が存在するかどうかを静的に言えない
+- 比較・戻り値・算術は `struct` と同じ扱い（[§4.8](#48-struct--確定m7)）。
+  引数渡しと複製は 1 コマンドでできる
+
 ## 5. 型の表現 — M6 と `struct` の範囲まで確定
 
 | 型 | 置き場所 | 表現 |
@@ -493,6 +524,7 @@ Rust では代入式は `()` を返すが、minewell に `()` 型は無い。値
 | `i32` | scoreboard | そのまま |
 | `bool` | scoreboard | `0` または `1` |
 | `struct` | storage | NBT compound（[§6.18](#618-struct-の配置と構築--確定m7)） |
+| `enum` | storage | `tag` を持つ NBT compound |
 | `Selector` / `ResourceLocation` / `Pos` | どこにも置かない | コンパイル時のみ |
 
 置き場所は **score / storage / コンパイル時のみ** の 3 分類になる。2 分類（実行時か否か）
@@ -925,3 +957,23 @@ storage の値に対する算術がバニラに無いため、これは削れな
 
 読み出し先が束縛やフィールドなら**テンポラリを経由しない** — `execute store result` は
 書き込み先を自分で持っているため（[§6.4](#64-代入) と同じ理由）。
+
+---
+
+### 6.19 `enum` の構築 — 確定（M7）
+
+置き場所は `struct` と同じ（[§6.18](#618-struct-の配置と構築--確定m7)）。構築も同じく、
+分かっている部分を 1 コマンドで置く。
+
+```
+let s = State::Idle;
+→  data modify storage <ns>:mw mw.vars.main.s set value {tag:"Idle"}
+
+let s = State::Chasing { target: n };
+→  data modify storage <ns>:mw mw.vars.main.s set value {tag:"Chasing",target:0}
+   execute store result storage <ns>:mw mw.vars.main.s.target int 1 \
+       run scoreboard players get $main.n <ns>.v
+```
+
+**バリアントを変えるときも 1 コマンドで書き換わる。** `set value` は compound を丸ごと
+置き換えるので、前のバリアントのフィールドが残ることはない。

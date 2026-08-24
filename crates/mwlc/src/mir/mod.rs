@@ -13,7 +13,7 @@
 //!
 //! Today every function is one block. Control flow arrives in M3.
 
-use crate::hir::{self, FnId, Hir, LocalId, NbtTag, StructDef, Type};
+use crate::hir::{self, FnId, Hir, LocalId, NbtTag, TAG_KEY, Type, Types};
 use crate::syntax::ast::{BinaryOp, UnaryOp};
 use crate::syntax::lexer::Span;
 
@@ -294,7 +294,7 @@ pub fn lower(hir: &Hir) -> Mir {
     let components = strongly_connected(hir);
     let mut program = Program {
         functions: &hir.functions,
-        structs: &hir.structs,
+        types: &hir.types,
         components,
         temps: Temps::default(),
         used: Vec::new(),
@@ -374,7 +374,7 @@ impl Temps {
 /// State shared by every block of one program.
 struct Program<'a> {
     functions: &'a [hir::Function],
-    structs: &'a [StructDef],
+    types: &'a Types,
     /// Which strongly connected component each function belongs to. Two functions in
     /// the same one can reach each other, so a call between them is recursive.
     components: Vec<u32>,
@@ -711,7 +711,7 @@ impl<'p> Lowering<'_, 'p> {
     /// that are not get a command of their own (spec section 6.18).
     fn store_struct(&mut self, path: &str, value: &hir::Expr) {
         match &value.kind {
-            hir::ExprKind::Struct { .. } => {
+            hir::ExprKind::Struct { .. } | hir::ExprKind::Enum { .. } => {
                 let snbt = self.snbt(value, None);
                 self.insts.push(Inst::SetValue {
                     path: path.to_owned(),
@@ -748,15 +748,21 @@ impl<'p> Lowering<'_, 'p> {
             hir::ExprKind::Int(n) => format!("{n}{suffix}"),
             hir::ExprKind::Bool(b) => format!("{}{suffix}", i32::from(*b)),
             hir::ExprKind::Struct { id, fields } => {
-                let def = &self.program.structs[id.0 as usize];
-                let body = def
-                    .fields
-                    .iter()
-                    .zip(fields)
-                    .map(|(field, value)| format!("{}:{}", field.nbt, self.snbt(value, field.tag)))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                format!("{{{body}}}")
+                let def = self.program.types.struct_def(*id);
+                format!(
+                    "{{{}}}",
+                    self.compound_body(&def.fields, fields, Vec::new())
+                )
+            }
+            hir::ExprKind::Enum {
+                id,
+                variant,
+                fields,
+            } => {
+                let variant = &self.program.types.enum_def(*id).variants[*variant as usize];
+                // The tag comes first, as vanilla's own compounds read.
+                let tag = vec![format!("{TAG_KEY}:\"{}\"", variant.name)];
+                format!("{{{}}}", self.compound_body(&variant.fields, fields, tag))
             }
             // Not known now: leave room for the write that follows.
             _ => match value.ty {
@@ -766,13 +772,44 @@ impl<'p> Lowering<'_, 'p> {
         }
     }
 
+    /// The inside of a compound: `first` entries, then one per field.
+    fn compound_body(
+        &self,
+        declared: &[hir::Field],
+        values: &[hir::Expr],
+        first: Vec<String>,
+    ) -> String {
+        first
+            .into_iter()
+            .chain(
+                declared
+                    .iter()
+                    .zip(values)
+                    .map(|(field, value)| format!("{}:{}", field.nbt, self.snbt(value, field.tag))),
+            )
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
     /// Writes the fields `snbt` could only leave a placeholder for.
     fn write_runtime_fields(&mut self, path: &str, value: &hir::Expr) {
-        let hir::ExprKind::Struct { id, fields } = &value.kind else {
-            return;
+        let (declared, values) = match &value.kind {
+            hir::ExprKind::Struct { id, fields } => {
+                (self.program.types.struct_def(*id).fields.clone(), fields)
+            }
+            hir::ExprKind::Enum {
+                id,
+                variant,
+                fields,
+            } => (
+                self.program.types.enum_def(*id).variants[*variant as usize]
+                    .fields
+                    .clone(),
+                fields,
+            ),
+            _ => return,
         };
-        let def = self.program.structs[id.0 as usize].clone();
-        for (field, value) in def.fields.iter().zip(fields) {
+        for (field, value) in declared.iter().zip(values) {
             let path = format!("{path}.{}", field.nbt);
             match &value.kind {
                 hir::ExprKind::Int(_) | hir::ExprKind::Bool(_) => {}
@@ -1340,7 +1377,9 @@ impl<'p> Lowering<'_, 'p> {
             hir::ExprKind::Str(_) => unreachable!("strings have no runtime value until M8"),
             // Composite values live in storage; every path that produces one goes
             // through `store_struct`, which never asks for a register.
-            hir::ExprKind::Struct { .. } => unreachable!("a struct is not a register value"),
+            hir::ExprKind::Struct { .. } | hir::ExprKind::Enum { .. } => {
+                unreachable!("a composite value is not a register value")
+            }
             // Reading a scalar out of storage: one command, straight into a register.
             hir::ExprKind::Field(place) => {
                 let dst = self.temps_next();

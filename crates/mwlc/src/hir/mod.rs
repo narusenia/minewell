@@ -31,6 +31,13 @@ pub struct LocalId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StructId(pub u32);
 
+/// Identifies an `enum` definition within the program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StructOrEnum;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EnumId(pub u32);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
     I32,
@@ -45,6 +52,8 @@ pub enum Type {
     /// A composite value. It lives in storage rather than in a register, which is a
     /// third category: neither a score nor compile-time only (spec section 5).
     Struct(StructId),
+    /// A tagged union, also in storage (spec section 4.9).
+    Enum(EnumId),
 }
 
 impl Type {
@@ -66,7 +75,7 @@ impl Type {
 
     /// Whether values of this type live in storage rather than on the scoreboard.
     pub fn is_storage(&self) -> bool {
-        matches!(self, Type::Struct(_))
+        matches!(self, Type::Struct(_) | Type::Enum(_))
     }
 
     pub fn name(&self) -> &'static str {
@@ -76,18 +85,56 @@ impl Type {
             Type::Selector => "selector",
             Type::Resource => "ResourceLocation",
             Type::Pos => "Pos",
-            // Only reachable where the struct table is out of reach; every diagnostic
-            // that can name the struct goes through `type_name` instead.
+            // Only reachable where the type table is out of reach; every diagnostic
+            // that can name the type goes through `Types::name_of` instead.
             Type::Struct(_) => "struct",
+            Type::Enum(_) => "enum",
         }
     }
 }
 
-/// A type as a diagnostic should spell it, which for a `struct` is its own name.
-fn type_name(ty: Type, structs: &[StructDef]) -> String {
-    match ty {
-        Type::Struct(id) => structs[id.0 as usize].name.clone(),
-        other => other.name().to_owned(),
+/// Every type the program defines, and the names they answer to.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Types {
+    pub structs: Vec<StructDef>,
+    pub enums: Vec<EnumDef>,
+    by_name: HashMap<String, Type>,
+}
+
+impl Types {
+    pub fn get(&self, name: &str) -> Option<Type> {
+        self.by_name.get(name).copied()
+    }
+
+    pub fn struct_def(&self, id: StructId) -> &StructDef {
+        &self.structs[id.0 as usize]
+    }
+
+    pub fn enum_def(&self, id: EnumId) -> &EnumDef {
+        &self.enums[id.0 as usize]
+    }
+
+    /// A type as a diagnostic should spell it, which for a user type is its own name.
+    pub fn name_of(&self, ty: Type) -> String {
+        match ty {
+            Type::Struct(id) => self.struct_def(id).name.clone(),
+            Type::Enum(id) => self.enum_def(id).name.clone(),
+            other => other.name().to_owned(),
+        }
+    }
+
+    /// The fields a composite type holds, across every variant of an `enum`.
+    fn fields(&self, ty: Type) -> Vec<&Field> {
+        match ty {
+            Type::Struct(id) => self.struct_def(id).fields.iter().collect(),
+            Type::Enum(id) => self
+                .enum_def(id)
+                .variants
+                .iter()
+                .flat_map(|variant| variant.fields.iter())
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -186,10 +233,37 @@ impl StructDef {
     }
 }
 
+/// An `enum` definition: a compound whose `tag` says which variant it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumDef {
+    pub id: EnumId,
+    pub name: String,
+    pub variants: Vec<Variant>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Variant {
+    pub name: String,
+    pub fields: Vec<Field>,
+}
+
+impl EnumDef {
+    pub fn variant(&self, name: &str) -> Option<(u32, &Variant)> {
+        self.variants
+            .iter()
+            .position(|v| v.name == name)
+            .map(|index| (index as u32, &self.variants[index]))
+    }
+}
+
+/// The key a variant's name is stored under (requirements section 4.2).
+pub const TAG_KEY: &str = "tag";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hir {
     pub functions: Vec<Function>,
-    pub structs: Vec<StructDef>,
+    pub types: Types,
     /// Ids the program names but does not define. Checked once the datapack is known
     /// (`driver`), because whether one resolves depends on files this stage cannot see.
     pub references: Vec<Reference>,
@@ -359,6 +433,12 @@ pub enum ExprKind {
     },
     /// Reading a binding's field.
     Field(Place),
+    /// A tagged union value: which variant, and that variant's fields in order.
+    Enum {
+        id: EnumId,
+        variant: u32,
+        fields: Vec<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -430,7 +510,7 @@ pub fn lower(
 ) -> (Hir, Vec<SyntaxError>) {
     let mut errors = Vec::new();
     let mut references = Vec::new();
-    let (structs, struct_ids) = collect_structs(file, &mut errors);
+    let types = collect_types(file, &mut errors);
     let mut signatures: HashMap<String, Signature> = HashMap::new();
     let mut items: Vec<(&ast::Item, &ast::FnItem)> = Vec::new();
 
@@ -451,19 +531,22 @@ pub fn lower(
         let params = f
             .params
             .iter()
-            .map(|param| resolve_type(&param.ty, &struct_ids, &mut errors).unwrap_or(Type::I32))
+            .map(|param| resolve_type(&param.ty, &types, &mut errors).unwrap_or(Type::I32))
             .collect();
         let ret = f
             .ret
             .as_ref()
-            .and_then(|written| resolve_type(written, &struct_ids, &mut errors));
+            .and_then(|written| resolve_type(written, &types, &mut errors));
         // Vanilla's function return is a single integer, so there is nowhere for a
         // compound to come back in.
-        if let (Some(Type::Struct(_)), Some(written)) = (ret, f.ret.as_ref()) {
+        if let (Some(ty), Some(written)) = (ret, f.ret.as_ref())
+            && ty.is_storage()
+        {
             errors.push(SyntaxError::new(
                 written.span,
-                "returning a struct is not implemented yet: a function's return value \
-                 is a single number, so a compound has nowhere to come back in",
+                "returning a composite value is not implemented yet: a function's \
+                 return value is a single number, so a compound has nowhere to come \
+                 back in",
             ));
         }
         // Read from the attribute directly: signatures are needed before any body is
@@ -486,8 +569,7 @@ pub fn lower(
         let signature = signatures[&f.name.name].clone();
         let mut cx = FnLowering {
             locals: Vec::new(),
-            structs: &structs,
-            struct_ids: &struct_ids,
+            types: &types,
             scopes: vec![HashMap::new()],
             selector_aliases: HashMap::new(),
             provided: Vec::new(),
@@ -548,95 +630,160 @@ pub fn lower(
     (
         Hir {
             functions,
-            structs,
+            types,
             references,
         },
         errors,
     )
 }
 
-/// The program's `struct` definitions, resolved in two passes so that a field can name
-/// a struct declared further down the file.
-fn collect_structs(
-    file: &SourceFile,
-    errors: &mut Vec<SyntaxError>,
-) -> (Vec<StructDef>, HashMap<String, StructId>) {
-    let mut ids: HashMap<String, StructId> = HashMap::new();
-    let mut items = Vec::new();
+/// The program's `struct` and `enum` definitions.
+///
+/// Two passes: the names first, so a field can refer to a type declared further down
+/// the file, then the fields.
+fn collect_types(file: &SourceFile, errors: &mut Vec<SyntaxError>) -> Types {
+    let mut types = Types::default();
+    let mut structs = Vec::new();
+    let mut enums = Vec::new();
     for item in &file.items {
-        let ItemKind::Struct(declared) = &item.kind else {
-            continue;
+        let (name, ty) = match &item.kind {
+            ItemKind::Struct(declared) => {
+                let ty = Type::Struct(StructId(structs.len() as u32));
+                structs.push((item, declared));
+                (&declared.name, ty)
+            }
+            ItemKind::Enum(declared) => {
+                let ty = Type::Enum(EnumId(enums.len() as u32));
+                enums.push((item, declared));
+                (&declared.name, ty)
+            }
+            ItemKind::Fn(_) => continue,
         };
-        if ids.contains_key(&declared.name.name) {
-            let name = &declared.name.name;
+        if types.by_name.contains_key(&name.name) {
+            let text = &name.name;
             errors.push(SyntaxError::new(
-                declared.name.span,
-                format!("a type named '{name}' is already defined"),
+                name.span,
+                format!("a type named '{text}' is already defined"),
             ));
             continue;
         }
-        ids.insert(declared.name.name.clone(), StructId(items.len() as u32));
-        items.push((item, declared));
+        types.by_name.insert(name.name.clone(), ty);
     }
 
-    let mut structs = Vec::new();
-    for (item, declared) in items {
-        for attr in &item.attrs {
-            errors.push(SyntaxError::new(
-                attr.span,
-                "attributes on a struct are not implemented yet",
-            ));
-        }
-        let mut fields: Vec<Field> = Vec::new();
-        for field in &declared.fields {
-            let Some(ty) = resolve_type(&field.ty, &ids, errors) else {
-                continue;
-            };
-            if fields.iter().any(|f| f.name == field.name.name) {
-                let name = &field.name.name;
-                errors.push(SyntaxError::new(
-                    field.name.span,
-                    format!("the field '{name}' is declared twice"),
-                ));
-                continue;
-            }
-            let (tag, rename) = nbt_attrs(field, ty, errors);
-            let nbt = rename.unwrap_or_else(|| field.name.name.clone());
-            // Two fields writing one key is one field, silently: the second write
-            // would overwrite the first and nothing would say so.
-            if let Some(other) = fields.iter().find(|f| f.nbt == nbt) {
-                let other = other.name.clone();
-                errors.push(SyntaxError::new(
-                    field.name.span,
-                    format!("this field and '{other}' would both be stored as '{nbt}'"),
-                ));
-                continue;
-            }
-            fields.push(Field {
-                name: field.name.name.clone(),
-                nbt,
-                ty,
-                tag,
-            });
-        }
-        structs.push(StructDef {
-            id: StructId(structs.len() as u32),
+    for (item, declared) in structs {
+        reject_item_attrs(item, "a struct", errors);
+        let fields = collect_fields(&declared.fields, &types, errors);
+        types.structs.push(StructDef {
+            id: StructId(types.structs.len() as u32),
             name: declared.name.name.clone(),
             fields,
             span: declared.name.span,
         });
     }
-
-    for def in &structs {
-        if contains_itself(&structs, def.id) {
-            let name = &def.name;
-            errors.push(SyntaxError::new(
-                def.span,
-                format!("'{name}' contains itself, so it has no value a compound could hold"),
-            ));
-        }
+    for (item, declared) in enums {
+        reject_item_attrs(item, "an enum", errors);
+        let variants = declared
+            .variants
+            .iter()
+            .map(|variant| {
+                let fields = collect_fields(&variant.fields, &types, errors);
+                // The tag shares the compound with the payload, so no field can be
+                // stored under its key.
+                if let Some(clash) = fields.iter().find(|f| f.nbt == TAG_KEY) {
+                    let name = &clash.name;
+                    errors.push(SyntaxError::new(
+                        variant.span,
+                        format!(
+                            "'{name}' collides with the '{TAG_KEY}' the variant is stored under"
+                        ),
+                    ));
+                }
+                Variant {
+                    name: variant.name.name.clone(),
+                    fields,
+                }
+            })
+            .collect();
+        types.enums.push(EnumDef {
+            id: EnumId(types.enums.len() as u32),
+            name: declared.name.name.clone(),
+            variants,
+            span: declared.name.span,
+        });
     }
-    (structs, ids)
+
+    let composites: Vec<Type> = types
+        .structs
+        .iter()
+        .map(|def| Type::Struct(def.id))
+        .chain(types.enums.iter().map(|def| Type::Enum(def.id)))
+        .collect();
+    for ty in composites {
+        if !contains_itself(&types, ty) {
+            continue;
+        }
+        let name = types.name_of(ty);
+        let span = match ty {
+            Type::Struct(id) => types.struct_def(id).span,
+            Type::Enum(id) => types.enum_def(id).span,
+            _ => unreachable!("only composites are checked"),
+        };
+        errors.push(SyntaxError::new(
+            span,
+            format!("'{name}' contains itself, so it has no value a compound could hold"),
+        ));
+    }
+    types
+}
+
+fn reject_item_attrs(item: &ast::Item, what: &str, errors: &mut Vec<SyntaxError>) {
+    for attr in &item.attrs {
+        errors.push(SyntaxError::new(
+            attr.span,
+            format!("attributes on {what} are not implemented yet"),
+        ));
+    }
+}
+
+/// The fields of a struct, or of one variant, with their NBT keys and tags settled.
+fn collect_fields(
+    declared: &[ast::FieldDef],
+    types: &Types,
+    errors: &mut Vec<SyntaxError>,
+) -> Vec<Field> {
+    let mut fields: Vec<Field> = Vec::new();
+    for field in declared {
+        let Some(ty) = resolve_type(&field.ty, types, errors) else {
+            continue;
+        };
+        if fields.iter().any(|f| f.name == field.name.name) {
+            let name = &field.name.name;
+            errors.push(SyntaxError::new(
+                field.name.span,
+                format!("the field '{name}' is declared twice"),
+            ));
+            continue;
+        }
+        let (tag, rename) = nbt_attrs(field, ty, errors);
+        let nbt = rename.unwrap_or_else(|| field.name.name.clone());
+        // Two fields writing one key is one field, silently: the second write would
+        // overwrite the first and nothing would say so.
+        if let Some(other) = fields.iter().find(|f| f.nbt == nbt) {
+            let other = other.name.clone();
+            errors.push(SyntaxError::new(
+                field.name.span,
+                format!("this field and '{other}' would both be stored as '{nbt}'"),
+            ));
+            continue;
+        }
+        fields.push(Field {
+            name: field.name.name.clone(),
+            nbt,
+            ty,
+            tag,
+        });
+    }
+    fields
 }
 
 /// The `#[nbt(..)]` options on a field: which tag, and which key.
@@ -711,21 +858,21 @@ fn nbt_attrs(
     (tag, rename)
 }
 
-/// Whether a struct can reach itself through its fields, directly or through others.
-fn contains_itself(structs: &[StructDef], start: StructId) -> bool {
+/// Whether a composite type can reach itself through its fields.
+fn contains_itself(types: &Types, start: Type) -> bool {
     let mut stack = vec![start];
-    let mut seen: Vec<StructId> = Vec::new();
-    while let Some(id) = stack.pop() {
-        for field in &structs[id.0 as usize].fields {
-            let Type::Struct(next) = field.ty else {
+    let mut seen: Vec<Type> = Vec::new();
+    while let Some(ty) = stack.pop() {
+        for field in types.fields(ty) {
+            if !field.ty.is_storage() {
                 continue;
-            };
-            if next == start {
+            }
+            if field.ty == start {
                 return true;
             }
-            if !seen.contains(&next) {
-                seen.push(next);
-                stack.push(next);
+            if !seen.contains(&field.ty) {
+                seen.push(field.ty);
+                stack.push(field.ty);
             }
         }
     }
@@ -758,14 +905,14 @@ fn declared_ctx(attrs: &[ast::Attribute]) -> Vec<Ctx> {
 
 fn resolve_type(
     written: &ast::TypeName,
-    structs: &HashMap<String, StructId>,
+    types: &Types,
     errors: &mut Vec<SyntaxError>,
 ) -> Option<Type> {
     if let Some(ty) = Type::parse(&written.name) {
         return Some(ty);
     }
-    if let Some(id) = structs.get(&written.name) {
-        return Some(Type::Struct(*id));
+    if let Some(ty) = types.get(&written.name) {
+        return Some(ty);
     }
     let name = &written.name;
     errors.push(SyntaxError::new(
@@ -795,8 +942,7 @@ fn always_returns(stmts: &[Stmt]) -> bool {
 
 struct FnLowering<'a> {
     locals: Vec<Local>,
-    structs: &'a [StructDef],
-    struct_ids: &'a HashMap<String, StructId>,
+    types: &'a Types,
     ret: Option<Type>,
     signatures: &'a HashMap<String, Signature>,
     /// The command surface of the configured Minecraft version, if there is one.
@@ -1218,6 +1364,17 @@ impl FnLowering<'_> {
             }
             AstExpr::Field(access) => {
                 let base = self.place(&access.base)?;
+                if let Type::Enum(_) = base.ty {
+                    let found = self.ty(base.ty);
+                    self.error(
+                        access.base.span(),
+                        format!(
+                            "'{found}' is an enum, so which fields it has depends on its \
+                             variant; read it with 'match'"
+                        ),
+                    );
+                    return None;
+                }
                 let Type::Struct(id) = base.ty else {
                     let found = self.ty(base.ty);
                     self.error(
@@ -1226,7 +1383,7 @@ impl FnLowering<'_> {
                     );
                     return None;
                 };
-                let def = &self.structs[id.0 as usize];
+                let def = self.types.struct_def(id);
                 let Some(field) = def.field(&access.name.name) else {
                     let (ty, name) = (def.name.clone(), &access.name.name);
                     self.error(
@@ -1351,7 +1508,7 @@ impl FnLowering<'_> {
                 self.error(span, format!("'{name}!' does not produce a value"));
                 None
             }
-            AstExpr::Struct(lit) => self.struct_lit(lit),
+            AstExpr::Struct(lit) => self.composite_lit(lit),
             AstExpr::Field(_) => {
                 let place = self.place(expr)?;
                 Some(Expr {
@@ -1671,38 +1828,101 @@ impl FnLowering<'_> {
 
     /// A type as a diagnostic should spell it.
     fn ty(&self, ty: Type) -> String {
-        type_name(ty, self.structs)
+        self.types.name_of(ty)
     }
 
     fn resolve(&mut self, written: &ast::TypeName) -> Option<Type> {
-        resolve_type(written, self.struct_ids, self.errors)
+        resolve_type(written, self.types, self.errors)
     }
 
-    /// `Point { x: 1, y: 2 }`: every field, exactly once, at its declared type.
-    ///
-    /// Omission is not allowed. A compound missing a key is not an error in NBT —
-    /// vanilla reads it as absent and carries on — so a partial construction would
-    /// only show up as a value that is quietly never there.
-    fn struct_lit(&mut self, lit: &ast::StructLit) -> Option<Expr> {
-        let Some(id) = self.struct_ids.get(&lit.name.name).copied() else {
+    /// `Point { x: 1, y: 2 }` and `State::Chasing { target: 3 }`.
+    fn composite_lit(&mut self, lit: &ast::StructLit) -> Option<Expr> {
+        let Some(ty) = self.types.get(&lit.name.name) else {
             let name = &lit.name.name;
             self.error(lit.name.span, format!("unknown type '{name}'"));
             return None;
         };
-        let def = self.structs[id.0 as usize].clone();
-        let mut values: Vec<Option<Expr>> = vec![None; def.fields.len()];
+        match (ty, &lit.variant) {
+            (Type::Struct(id), None) => {
+                let def = self.types.struct_def(id).clone();
+                let fields = self.init_fields(&def.fields, lit, &def.name)?;
+                Some(Expr {
+                    kind: ExprKind::Struct { id, fields },
+                    ty,
+                    span: lit.span,
+                })
+            }
+            (Type::Struct(id), Some(variant)) => {
+                let (name, wanted) = (self.types.struct_def(id).name.clone(), &variant.name);
+                self.error(
+                    variant.span,
+                    format!("'{name}' is a struct, so it has no variant '{wanted}'"),
+                );
+                None
+            }
+            (Type::Enum(id), Some(written)) => {
+                let def = self.types.enum_def(id).clone();
+                let Some((variant, declared)) = def.variant(&written.name) else {
+                    let (name, wanted) = (&def.name, &written.name);
+                    self.error(
+                        written.span,
+                        format!("'{name}' has no variant named '{wanted}'"),
+                    );
+                    return None;
+                };
+                let what = format!("{}::{}", def.name, declared.name);
+                let fields = self.init_fields(&declared.fields.clone(), lit, &what)?;
+                Some(Expr {
+                    kind: ExprKind::Enum {
+                        id,
+                        variant,
+                        fields,
+                    },
+                    ty,
+                    span: lit.span,
+                })
+            }
+            (Type::Enum(id), None) => {
+                let name = self.types.enum_def(id).name.clone();
+                self.error(
+                    lit.span,
+                    format!("'{name}' is an enum; name the variant, as in '{name}::Idle'"),
+                );
+                None
+            }
+            (other, _) => {
+                let name = self.ty(other);
+                self.error(lit.span, format!("'{name}' is not a composite type"));
+                None
+            }
+        }
+    }
+
+    /// Checks an initialiser list against a declaration: every field, exactly once, at
+    /// its declared type.
+    ///
+    /// Omission is not allowed. A compound missing a key is not an error in NBT —
+    /// vanilla reads it as absent and carries on — so a partial construction would
+    /// only show up as a value that is quietly never there.
+    fn init_fields(
+        &mut self,
+        declared: &[Field],
+        lit: &ast::StructLit,
+        what: &str,
+    ) -> Option<Vec<Expr>> {
+        let mut values: Vec<Option<Expr>> = vec![None; declared.len()];
         for init in &lit.fields {
-            let Some(index) = def.fields.iter().position(|f| f.name == init.name.name) else {
-                let (name, ty) = (&init.name.name, &def.name);
+            let Some(index) = declared.iter().position(|f| f.name == init.name.name) else {
+                let name = &init.name.name;
                 self.error(
                     init.name.span,
-                    format!("'{ty}' has no field named '{name}'"),
+                    format!("'{what}' has no field named '{name}'"),
                 );
                 return None;
             };
             let value = self.expr(&init.value)?;
-            if value.ty != def.fields[index].ty {
-                let (want, found) = (self.ty(def.fields[index].ty), self.ty(value.ty));
+            if value.ty != declared[index].ty {
+                let (want, found) = (self.ty(declared[index].ty), self.ty(value.ty));
                 self.error(value.span, format!("expected {want}, found {found}"));
                 return None;
             }
@@ -1713,26 +1933,18 @@ impl FnLowering<'_> {
             }
             values[index] = Some(value);
         }
-        let missing: Vec<String> = def
-            .fields
+        let missing: Vec<String> = declared
             .iter()
             .zip(&values)
             .filter(|(_, value)| value.is_none())
             .map(|(field, _)| format!("'{}'", field.name))
             .collect();
         if !missing.is_empty() {
-            let (ty, list) = (&def.name, missing.join(", "));
-            self.error(lit.span, format!("'{ty}' is missing a value for {list}"));
+            let list = missing.join(", ");
+            self.error(lit.span, format!("'{what}' is missing a value for {list}"));
             return None;
         }
-        Some(Expr {
-            kind: ExprKind::Struct {
-                id,
-                fields: values.into_iter().flatten().collect(),
-            },
-            ty: Type::Struct(id),
-            span: lit.span,
-        })
+        Some(values.into_iter().flatten().collect())
     }
 
     fn declare(&mut self, name: &str, ty: Type, mutable: bool) -> LocalId {
@@ -2538,14 +2750,68 @@ mod tests {
         }
 
         #[test]
+        fn a_variant_that_does_not_exist_is_reported() {
+            let errors = lower_err("enum State { Idle } fn main() { let s = State::Running; }");
+            assert!(errors[0].message.contains("no variant"), "{errors:?}");
+        }
+
+        #[test]
+        fn an_enum_needs_a_variant() {
+            let errors = lower_err("enum State { Idle } fn main() { let s = State { }; }");
+            assert!(errors[0].message.contains("State::Idle"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_struct_has_no_variants() {
+            let errors = lower_err("struct Point { x: i32 } fn main() { let p = Point::Origin; }");
+            assert!(errors[0].message.contains("no variant"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_variant_payload_is_checked_like_a_struct() {
+            let errors = lower_err(
+                "enum State { Chasing { target: i32 } } \
+                 fn main() { let s = State::Chasing { }; }",
+            );
+            assert!(errors[0].message.contains("'target'"), "{errors:?}");
+        }
+
+        #[test]
+        fn an_enum_field_cannot_be_read_without_match() {
+            let errors = lower_err(
+                "enum State { Chasing { target: i32 } } \
+                 fn main() { let s = State::Chasing { target: 1 }; let t = s.target; }",
+            );
+            assert!(errors[0].message.contains("match"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_variant_field_cannot_take_the_tag_key() {
+            let errors = lower_err("enum State { Chasing { tag: i32 } }");
+            assert!(errors[0].message.contains("tag"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_tuple_variant_says_to_name_its_fields() {
+            let (_, errors) = parse("enum State { Chasing(i32) }");
+            assert!(errors[0].message.contains("names its fields"), "{errors:?}");
+        }
+
+        #[test]
+        fn an_enum_cannot_contain_itself_through_a_struct() {
+            let errors = lower_err("enum List { Cons { rest: Wrap } } struct Wrap { l: List }");
+            assert!(errors[0].message.contains("contains itself"), "{errors:?}");
+        }
+
+        #[test]
         fn a_struct_can_be_annotated_and_passed() {
             let hir = lower_ok(
                 "struct Point { x: i32 } \
                  fn take(p: Point) {} \
                  fn main() { let p: Point = Point { x: 1 }; take(p); }",
             );
-            assert_eq!(hir.structs.len(), 1);
-            assert_eq!(hir.structs[0].fields[0].name, "x");
+            assert_eq!(hir.types.structs.len(), 1);
+            assert_eq!(hir.types.structs[0].fields[0].name, "x");
         }
     }
 }
