@@ -322,10 +322,14 @@ else inserts its SNBT.
 
 `with entity` and `with block` parse and fail, like every other entity target (§4.2).
 
-### 4.6 Side-effecting commands — *pending (M0-10)*
+### 4.6 Side-effecting commands — **done**
 
-`say`, `tellraw`, `setblock`, `summon`, `kill` and the like are **not** simulated.
-Each is recorded as `(name, arguments)` in an ordered log the test can assert on.
+`say`, `tellraw`, `setblock`, `summon`, `kill` and the like are **not** simulated. Each
+is appended to an ordered log as `(name, arguments)`, with the arguments exactly as
+written, and reports success.
+
+Only commands that actually run are logged, so the log doubles as a trace: a command
+skipped by a false `execute if` leaves nothing behind.
 
 Unrecognised commands are retained verbatim rather than rejected, so that a compiler
 emitting something outside this subset still produces a runnable trace.

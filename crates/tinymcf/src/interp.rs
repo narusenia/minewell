@@ -186,6 +186,13 @@ impl Outcome {
 /// Vanilla's default `maxCommandChainLength`.
 pub const DEFAULT_BUDGET: u64 = 65536;
 
+/// A command outside the modelled subset, recorded rather than simulated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Effect {
+    pub name: String,
+    pub args: String,
+}
+
 /// One line of a loaded function.
 #[derive(Debug)]
 enum Line {
@@ -215,6 +222,8 @@ pub struct Interpreter {
     /// `maxCommandChainLength`. Also what stops a runaway recursion from hanging a test.
     pub budget: u64,
     pub commands_run: u64,
+    /// Commands outside the modelled subset, in the order they ran.
+    pub effects: Vec<Effect>,
     functions: BTreeMap<String, Rc<Vec<Line>>>,
     /// 0 at the top level. `return` outside a function is an error.
     depth: usize,
@@ -228,6 +237,7 @@ impl Default for Interpreter {
             diagnostics: Vec::new(),
             budget: DEFAULT_BUDGET,
             commands_run: 0,
+            effects: Vec::new(),
             functions: BTreeMap::new(),
             depth: 0,
             over_budget: false,
@@ -351,8 +361,13 @@ impl Interpreter {
             },
             Command::Return(kind) => self.ret(kind),
             Command::Execute(cmd) => self.execute(cmd),
-            // Unmodelled commands are assumed to have worked; M0-10 records them.
-            Command::Unknown { .. } => Flow::Next(Outcome::ok(1)),
+            Command::Unknown { name, args } => {
+                self.effects.push(Effect {
+                    name: name.clone(),
+                    args: args.clone(),
+                });
+                Flow::Next(Outcome::ok(1))
+            }
         }
     }
 
@@ -1502,5 +1517,46 @@ mod macro_tests {
         let mut it = setup(&[("ns:f", "$scoreboard players set $a obj 2")]);
         it.run_line("function ns:f {}");
         assert_eq!(score(&it, "$a"), Some(2));
+    }
+}
+
+#[cfg(test)]
+mod effect_tests {
+    use super::*;
+
+    #[test]
+    fn unmodelled_commands_are_logged_in_order() {
+        let mut it = Interpreter::default();
+        it.run_line("say hello  world");
+        it.run_line("setblock ~ ~1 ~ minecraft:stone");
+        assert_eq!(
+            it.effects,
+            vec![
+                Effect {
+                    name: "say".into(),
+                    args: "hello  world".into()
+                },
+                Effect {
+                    name: "setblock".into(),
+                    args: "~ ~1 ~ minecraft:stone".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_command_that_did_not_run_leaves_nothing_behind() {
+        let mut it = Interpreter::default();
+        it.run_line("scoreboard objectives add obj dummy");
+        it.run_line("execute if score $a obj matches 1 run say never");
+        assert!(it.effects.is_empty());
+    }
+
+    #[test]
+    fn modelled_commands_are_not_effects() {
+        let mut it = Interpreter::default();
+        it.run_line("scoreboard objectives add obj dummy");
+        it.run_line("data modify storage ns:mw v set value 1");
+        assert!(it.effects.is_empty());
     }
 }
