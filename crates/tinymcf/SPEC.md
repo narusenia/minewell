@@ -20,19 +20,29 @@ Explicit non-goals:
 - Command coverage for its own sake. Only what a compiler needs to prove its output.
 - Byte-compatible NBT serialisation. The in-memory model and SNBT are the interface.
 
-## 2. Failure model
+## 2. Outcome model
 
-Two distinct outcomes, which vanilla also distinguishes and which callers must not
-conflate:
+Every command produces an outcome:
 
-| Outcome | Vanilla | Here |
-|---|---|---|
-| Command rejected outright (red text, does not run) | e.g. unknown objective | `Err(Error)` |
-| Command ran and did nothing | e.g. no entity matched | `Ok` with success count 0 |
+```
+Outcome { success: u32, result: i32 }
+```
 
-`execute store success` observes the second, never the first. Modelling a rejected
-command as "did nothing" would hide exactly the class of compiler bug this interpreter
-exists to catch — for instance a missing `scoreboard objectives add`.
+`success` is the count `execute store success` observes; `result` is what
+`execute store result` observes. A `success` of 0 means the command failed.
+
+**A failed command does not abort anything.** Execution continues with the next line,
+exactly as in vanilla — only `return` ends a function early. A command that vanilla
+would reject with red text (an unknown objective, a score that is not set) is a
+failure, not an abort, and `execute store success` writes 0 for it. Modelling such a
+command as an early exit would make generated code look correct that vanilla runs
+straight past.
+
+Failures also append a message to the run's diagnostic log, so a test can assert *why*
+something did nothing. This is the interpreter's answer to mcfunction failing silently:
+nothing is silent here.
+
+`Err` is reserved for what cannot be attempted at all — a line that does not parse.
 
 ## 3. Data model
 
@@ -147,15 +157,33 @@ unless it sits inside brackets, braces or quotes. That makes selectors
 arguments without each command needing to know. A trailing greedy argument (`say hi
 there`) takes the rest of the line.
 
-### 4.1 `scoreboard` — *pending (M0-5)*
+### 4.1 `scoreboard` — **done**
 
-`objectives add|remove`, `players get|set|add|remove|reset|operation`.
+```
+scoreboard objectives add <name> <criteria> [<display name>]
+scoreboard objectives remove <name>
+scoreboard players get <target> <objective>
+scoreboard players set|add|remove <target> <objective> <int>
+scoreboard players reset <target> [<objective>]
+scoreboard players operation <target> <objective> <op> <source> <objective>
+```
 
-All `operation` operators: `=` `+=` `-=` `*=` `/=` `%=` `<` `>` `><`.
+Operators: `=` `+=` `-=` `*=` `/=` `%=` `<` (min) `>` (max) `><` (swap).
 
-Integer division and modulo follow vanilla, which uses floored (Euclidean-style)
-semantics rather than Rust's truncating `/` and `%`. Division by zero fails the
-command rather than trapping.
+- Arithmetic is Java `int`: it **wraps** on overflow rather than panicking.
+- `/=` and `%=` are **floored**, not truncating: `-7 /= 2` is `-4` and `-7 %= 2` is `1`.
+  Rust's `/` and `%` would give `-3` and `-1`, so both are written out explicitly.
+- Division or modulo by zero fails and leaves the target untouched.
+- `set`, `add`, `remove` and `operation` create a missing score as 0 before acting —
+  including the *source* of an operation. `get` does not: reading a score that is not
+  set is a failure.
+- Adding an objective that already exists is a failure, as in vanilla. A `#[load]`
+  function that runs twice will log two of these; that is what vanilla does too.
+- The criteria and display name are parsed and discarded. Only `dummy` is meaningful
+  to a compiler, and nothing here observes the others.
+
+`result` is the score after the command for `get`, `set`, `add`, `remove` and
+`operation`, and 1 for the objective commands.
 
 ### 4.2 `data` — *pending (M0-6)*
 

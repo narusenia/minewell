@@ -8,7 +8,7 @@
 
 | # | マイルストーン | 状態 | 進捗 |
 |---|---|---|---|
-| M0 | `tinymcf`（インタプリタ） | 進行中 | 5 / 13 |
+| M0 | `tinymcf`（インタプリタ） | 進行中 | 6 / 13 |
 | M1 | Hello World 縦断 | 未着手 | 0 / 9 |
 | M2 | 値と式 | 未着手 | 0 / 7 |
 | M3 | 制御フロー | 未着手 | 0 / 7 |
@@ -19,7 +19,7 @@
 | M8 | 数値拡張 | 未着手 | 0 / 7 |
 | M9 | 仕上げ | 未着手 | 0 / 9 |
 | — | 横断（CI・文書） | 進行中 | 2 / 6 |
-| | **合計** | | **7 / 88** |
+| | **合計** | | **8 / 88** |
 
 状態は `未着手` / `進行中` / `完了` / `保留`。
 タスクを閉じたらチェックボックスと上表の両方を更新する。
@@ -109,11 +109,12 @@ JDK は M6（`toolchain build-from-jar`）で必要になった時点で `[tools
     検証できず、計画が警告している golden file 化そのものになるため
   - `args.rs` の balanced scanner 1 本で、セレクタ・SNBT・引用文字列を 1 語として扱う
   - `command.rs` は現状 `Unknown` のみ。各コマンド族は実行側のタスクで足す
-- [ ] **M0-5** `scoreboard` コマンドの実行
+- [x] **M0-5** `scoreboard` コマンドの実行
   - `objectives add/remove`、`players set/get/add/remove/operation/reset`
   - `operation` の全演算子（`=` `+=` `-=` `*=` `/=` `%=` `<` `>` `><`）
-  - 構文と実行を同時に実装する（M0-4 参照）
-  - 先に書くテスト: `/=` の負数における切り捨て方向がバニラと一致すること
+  - `interp.rs` に `Outcome`（success / result）と `Interpreter`。**失敗は中断しない**
+  - `/=` `%=` は floor 除算（`-7/2 = -4`、`-7%2 = 1`）。Rust の `/` `%` とは違う
+  - 書き込み系は欠損スコアを 0 で作る。`get` は作らず失敗する
 - [ ] **M0-6** `data` コマンドの実行
   - `get`（数値はスケール倍、文字列は長さ、list/compound は要素数）
   - `modify ... set value / set from / set string <src> <start> <end> / append / prepend / insert / merge`

@@ -6,6 +6,7 @@
 
 pub mod args;
 pub mod command;
+pub mod interp;
 pub mod nbt;
 pub mod path;
 pub mod snbt;

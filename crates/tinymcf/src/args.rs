@@ -16,7 +16,7 @@ pub struct ParseError {
 }
 
 impl ParseError {
-    fn new(at: usize, message: impl Into<String>) -> Self {
+    pub fn new(at: usize, message: impl Into<String>) -> Self {
         ParseError {
             at,
             message: message.into(),

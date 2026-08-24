@@ -68,6 +68,13 @@ impl Scoreboard {
         Ok(())
     }
 
+    /// Reads a score, creating it as 0 if absent. This is what every writing command
+    /// does in vanilla — including the *source* side of `players operation`.
+    pub fn get_or_create(&mut self, objective: &str, holder: &str) -> Result<i32, Error> {
+        self.check(objective)?;
+        Ok(*self.scores.entry(key(objective, holder)).or_insert(0))
+    }
+
     pub fn reset(&mut self, objective: &str, holder: &str) {
         self.scores.remove(&key(objective, holder));
     }
