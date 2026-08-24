@@ -8,7 +8,7 @@
 
 | # | マイルストーン | 状態 | 進捗 |
 |---|---|---|---|
-| M0 | `tinymcf`（インタプリタ） | 進行中 | 7 / 13 |
+| M0 | `tinymcf`（インタプリタ） | 進行中 | 8 / 13 |
 | M1 | Hello World 縦断 | 未着手 | 0 / 9 |
 | M2 | 値と式 | 未着手 | 0 / 7 |
 | M3 | 制御フロー | 未着手 | 0 / 7 |
@@ -19,7 +19,7 @@
 | M8 | 数値拡張 | 未着手 | 0 / 7 |
 | M9 | 仕上げ | 未着手 | 0 / 9 |
 | — | 横断（CI・文書） | 進行中 | 2 / 6 |
-| | **合計** | | **9 / 88** |
+| | **合計** | | **10 / 88** |
 
 状態は `未着手` / `進行中` / `完了` / `保留`。
 タスクを閉じたらチェックボックスと上表の両方を更新する。
@@ -121,9 +121,11 @@ JDK は M6（`toolchain build-from-jar`）で必要になった時点で `[tools
   - `remove`、`merge`
   - **storage 対象のみ実行。** entity / block は構文解析はするが「モデル化していない」と診断して失敗
   - `data get` は文字列に長さを返す（要件定義 §4.4 の「`String::len()` は無料」の前提を実証）
-- [ ] **M0-7** `function` 呼び出しと `return`
-  - 呼び出しスタック、`return <value>` / `return run <cmd>` / `return fail`
-  - 先に書くテスト: `return` 以降のコマンドが実行されないこと
+- [x] **M0-7** `function` 呼び出しと `return`
+  - 関数は**ロード時にパース**。空行と `#` コメントを落とす
+  - `return` は呼び出し元に伝播しない。末尾まで落ちた場合の result は実行コマンド数
+  - `maxCommandChainLength`（既定 65536）を実装。暴走再帰がテストを止めない担保でもある
+  - 再帰の停止条件テストは `execute if` が要るので M0-8 に置いた
 - [ ] **M0-8** `execute` の実行
   - `if` / `unless`（`score` / `data` / `entity` / `block` / `predicate`）
   - `store result` / `store success`（`score` / `storage` へ、スケール付き）

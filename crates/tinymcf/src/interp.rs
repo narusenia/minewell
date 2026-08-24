@@ -6,7 +6,11 @@
 //! to the next line and the failure is recorded, because that is what vanilla does and
 //! because the whole point of this interpreter is that nothing fails silently.
 
-use crate::command::{Command, Data, ModifyKind, Op, Scoreboard, Source, Target};
+use std::collections::BTreeMap;
+use std::rc::Rc;
+
+use crate::args::ParseError;
+use crate::command::{Command, Data, ModifyKind, Op, Return, Scoreboard, Source, Target};
 use crate::nbt::{Compound, NbtValue};
 use crate::path::NbtPath;
 use crate::world::World;
@@ -136,15 +140,112 @@ impl Outcome {
     }
 }
 
-#[derive(Debug, Default)]
+/// Vanilla's default `maxCommandChainLength`.
+pub const DEFAULT_BUDGET: u64 = 65536;
+
+/// How a command left the enclosing function.
+enum Flow {
+    /// Carry on with the next line.
+    Next(Outcome),
+    /// `return`: the function ends here with this outcome.
+    Return(Outcome),
+    /// The command budget ran out. Nothing else runs.
+    Halt,
+}
+
+#[derive(Debug)]
 pub struct Interpreter {
     pub world: World,
     /// The red text vanilla would print. Recorded so a test can assert *why* a command
     /// did nothing.
     pub diagnostics: Vec<String>,
+    /// `maxCommandChainLength`. Also what stops a runaway recursion from hanging a test.
+    pub budget: u64,
+    pub commands_run: u64,
+    functions: BTreeMap<String, Rc<Vec<Command>>>,
+    /// 0 at the top level. `return` outside a function is an error.
+    depth: usize,
+    over_budget: bool,
+}
+
+impl Default for Interpreter {
+    fn default() -> Self {
+        Interpreter {
+            world: World::default(),
+            diagnostics: Vec::new(),
+            budget: DEFAULT_BUDGET,
+            commands_run: 0,
+            functions: BTreeMap::new(),
+            depth: 0,
+            over_budget: false,
+        }
+    }
 }
 
 impl Interpreter {
+    /// Parses a function body and registers it. Blank lines and `#` comments are
+    /// dropped; everything else is parsed now, so syntax errors surface at load time.
+    pub fn load(&mut self, id: &str, source: &str) -> Result<(), ParseError> {
+        let mut commands = Vec::new();
+        for line in source.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            commands.push(Command::parse(line)?);
+        }
+        self.functions.insert(id.to_owned(), Rc::new(commands));
+        Ok(())
+    }
+
+    /// Runs a loaded function, as the `function` command does.
+    pub fn call(&mut self, id: &str) -> Outcome {
+        match self.call_inner(id) {
+            Flow::Next(outcome) | Flow::Return(outcome) => outcome,
+            Flow::Halt => Outcome::FAILED,
+        }
+    }
+
+    fn call_inner(&mut self, id: &str) -> Flow {
+        let Some(body) = self.functions.get(id).cloned() else {
+            return Flow::Next(self.fail(format!("unknown function '{id}'")));
+        };
+        self.depth += 1;
+        let mut ran = 0i32;
+        let mut outcome = None;
+        for command in body.iter() {
+            match self.step(command) {
+                Flow::Next(_) => ran = ran.saturating_add(1),
+                Flow::Return(o) => {
+                    outcome = Some(o);
+                    break;
+                }
+                Flow::Halt => {
+                    self.depth -= 1;
+                    return Flow::Halt;
+                }
+            }
+        }
+        self.depth -= 1;
+        // Falling off the end reports how many commands the body ran.
+        Flow::Next(outcome.unwrap_or(Outcome::ok(ran)))
+    }
+
+    /// Charges one command against the budget, then runs it.
+    fn step(&mut self, command: &Command) -> Flow {
+        if self.commands_run >= self.budget {
+            if !self.over_budget {
+                self.over_budget = true;
+                let budget = self.budget;
+                self.fail(format!(
+                    "maxCommandChainLength of {budget} reached; the rest of the chain did not run"
+                ));
+            }
+            return Flow::Halt;
+        }
+        self.commands_run += 1;
+        self.exec(command)
+    }
     /// Parses and runs one line. A line that does not parse is a failure like any
     /// other, so a bad line in the middle of a function does not hide the rest of it.
     pub fn run_line(&mut self, line: &str) -> Outcome {
@@ -155,11 +256,34 @@ impl Interpreter {
     }
 
     pub fn run(&mut self, command: &Command) -> Outcome {
+        match self.step(command) {
+            Flow::Next(outcome) | Flow::Return(outcome) => outcome,
+            Flow::Halt => Outcome::FAILED,
+        }
+    }
+
+    fn exec(&mut self, command: &Command) -> Flow {
         match command {
-            Command::Scoreboard(cmd) => self.scoreboard(cmd),
-            Command::Data(cmd) => self.data(cmd),
+            Command::Scoreboard(cmd) => Flow::Next(self.scoreboard(cmd)),
+            Command::Data(cmd) => Flow::Next(self.data(cmd)),
+            Command::Function(id) => self.call_inner(id),
+            Command::Return(kind) => self.ret(kind),
             // Unmodelled commands are assumed to have worked; M0-10 records them.
-            Command::Unknown { .. } => Outcome::ok(1),
+            Command::Unknown { .. } => Flow::Next(Outcome::ok(1)),
+        }
+    }
+
+    fn ret(&mut self, kind: &Return) -> Flow {
+        if self.depth == 0 {
+            return Flow::Next(self.fail("'return' can only be used inside a function"));
+        }
+        match kind {
+            Return::Value(value) => Flow::Return(Outcome::ok(*value)),
+            Return::Fail => Flow::Return(Outcome::FAILED),
+            Return::Run(command) => match self.step(command) {
+                Flow::Next(outcome) | Flow::Return(outcome) => Flow::Return(outcome),
+                Flow::Halt => Flow::Halt,
+            },
         }
     }
 
@@ -744,5 +868,113 @@ mod data_tests {
         let (it, out) = run(&["data get block 0 0 0 Items"]);
         assert_eq!(out, Outcome::FAILED);
         assert!(it.diagnostics[0].contains("not modelled"));
+    }
+}
+
+#[cfg(test)]
+mod function_tests {
+    use super::*;
+
+    fn pack(functions: &[(&str, &str)]) -> Interpreter {
+        let mut it = Interpreter::default();
+        for (id, source) in functions {
+            it.load(id, source).unwrap();
+        }
+        it
+    }
+
+    const SETUP: &str = "scoreboard objectives add obj dummy";
+
+    #[test]
+    fn a_call_runs_the_body() {
+        let mut it = pack(&[("ns:f", "scoreboard players set $a obj 3")]);
+        it.run_line(SETUP);
+        it.run_line("function ns:f");
+        assert_eq!(it.world.scoreboard.get("obj", "$a"), Ok(Some(3)));
+    }
+
+    #[test]
+    fn blank_lines_and_comments_are_dropped() {
+        let mut it = pack(&[(
+            "ns:f",
+            "# a comment\n\n   \n   # indented comment\nscoreboard players set $a obj 1\n",
+        )]);
+        it.run_line(SETUP);
+        assert_eq!(it.run_line("function ns:f"), Outcome::ok(1));
+    }
+
+    #[test]
+    fn a_syntax_error_is_reported_when_the_pack_loads() {
+        let mut it = Interpreter::default();
+        assert!(
+            it.load("ns:f", "scoreboard players set $a obj notanumber")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn return_ends_the_function_and_supplies_its_value() {
+        let mut it = pack(&[("ns:f", "return 7\nscoreboard players set $a obj 99")]);
+        it.run_line(SETUP);
+        assert_eq!(it.run_line("function ns:f"), Outcome::ok(7));
+        // The line after `return` never ran.
+        assert_eq!(it.world.scoreboard.get("obj", "$a"), Ok(None));
+    }
+
+    #[test]
+    fn return_fail_reports_failure() {
+        let mut it = pack(&[("ns:f", "return fail")]);
+        assert_eq!(it.run_line("function ns:f"), Outcome::FAILED);
+    }
+
+    #[test]
+    fn return_run_passes_the_commands_outcome_through() {
+        let mut it = pack(&[("ns:f", "return run scoreboard players get $a obj")]);
+        it.run_line(SETUP);
+        it.run_line("scoreboard players set $a obj 4");
+        assert_eq!(it.run_line("function ns:f"), Outcome::ok(4));
+    }
+
+    #[test]
+    fn returning_does_not_propagate_to_the_caller() {
+        let mut it = pack(&[
+            (
+                "ns:outer",
+                "function ns:inner\nscoreboard players set $a obj 5",
+            ),
+            ("ns:inner", "return 1"),
+        ]);
+        it.run_line(SETUP);
+        it.run_line("function ns:outer");
+        assert_eq!(it.world.scoreboard.get("obj", "$a"), Ok(Some(5)));
+    }
+
+    #[test]
+    fn falling_off_the_end_reports_the_commands_run() {
+        let mut it = pack(&[("ns:f", "say a\nsay b\nsay c")]);
+        assert_eq!(it.run_line("function ns:f"), Outcome::ok(3));
+    }
+
+    #[test]
+    fn calling_an_unknown_function_fails() {
+        let mut it = Interpreter::default();
+        assert_eq!(it.run_line("function ns:nope"), Outcome::FAILED);
+        assert!(it.diagnostics[0].contains("ns:nope"));
+    }
+
+    #[test]
+    fn runaway_recursion_stops_at_the_command_budget() {
+        let mut it = pack(&[("ns:loop", "function ns:loop")]);
+        it.budget = 1000;
+        let out = it.run_line("function ns:loop");
+        assert_eq!(out, Outcome::FAILED);
+        assert!(
+            it.diagnostics
+                .iter()
+                .any(|d| d.contains("maxCommandChainLength")),
+            "{:?}",
+            it.diagnostics
+        );
+        assert_eq!(it.commands_run, 1000);
     }
 }

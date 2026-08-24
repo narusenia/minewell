@@ -232,12 +232,32 @@ empty list. This follows the same preferred-parent rule as §3.5.
 
 `data remove` reports how many values it detached as its success count.
 
-### 4.3 `function` and `return` — *pending (M0-7)*
+### 4.3 `function` and `return` — **done**
 
-`function <id>`, `function <id> with storage <id> <path>`, `return <value>`,
-`return run <command>`, `return fail`.
+```
+function <id>
+return <value>
+return run <command>
+return fail
+```
 
-`return` ends the current function immediately; later commands in it do not run.
+A function is loaded from text. Blank lines and lines whose first non-blank character
+is `#` are dropped; everything else is parsed **at load time**, so a syntax error
+surfaces when the pack is loaded rather than when the line happens to run.
+
+`return` ends the current function at once; the lines after it do not run. It does not
+propagate: the caller carries on with its next line.
+
+A function call's outcome is:
+
+| Case | success | result |
+|---|---|---|
+| `return <value>` | 1 | the value |
+| `return run <command>` | the command's | the command's |
+| `return fail` | 0 | 0 |
+| fell off the end | 1 | the number of commands the function ran |
+
+Calling an unknown function fails.
 
 ### 4.4 `execute` — *pending (M0-8)*
 
@@ -266,13 +286,17 @@ Each is recorded as `(name, arguments)` in an ordered log the test can assert on
 Unrecognised commands are retained verbatim rather than rejected, so that a compiler
 emitting something outside this subset still produces a runnable trace.
 
-## 5. Measurement — *pending (M0-11)*
+## 5. Limits and measurement — **partly done** (reporting is M0-11)
 
-Per run: total commands executed, a per-function breakdown, maximum call depth, and
-whether `maxCommandChainLength` (default 65536) would have been exceeded.
+A run has a command budget, `maxCommandChainLength`, default 65536. Executing more
+commands than that stops the run and records a diagnostic.
 
-These numbers are the evidence for optimisation work: a pass is justified when the
-count drops and the semantics tests still pass.
+This is not only fidelity to vanilla: it is what stops a runaway recursion in a test
+from hanging, so it is enforced from the moment functions can call each other.
+
+Still to come (M0-11): a per-function breakdown and maximum call depth. These numbers
+are the evidence for optimisation work — a pass is justified when the count drops and
+the semantics tests still pass.
 
 ## 6. Determinism
 

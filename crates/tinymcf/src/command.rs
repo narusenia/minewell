@@ -15,12 +15,22 @@ use crate::path::NbtPath;
 pub enum Command {
     Scoreboard(Scoreboard),
     Data(Data),
+    Function(String),
+    Return(Return),
     /// A command outside the modelled subset. Kept verbatim rather than rejected: a
     /// compiler emitting something unmodelled should still produce a usable trace.
     Unknown {
         name: String,
         args: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Return {
+    Value(i32),
+    Fail,
+    /// The function's outcome becomes the wrapped command's outcome.
+    Run(Box<Command>),
 }
 
 /// Where NBT lives. Only [`Target::Storage`] executes; see `SPEC.md` §4.2.
@@ -184,6 +194,21 @@ impl Command {
         match name.as_str() {
             "scoreboard" => Ok(Command::Scoreboard(scoreboard(&mut args)?)),
             "data" => Ok(Command::Data(data(&mut args)?)),
+            "function" => {
+                let id = args.word()?.to_owned();
+                args.end()?;
+                Ok(Command::Function(id))
+            }
+            "return" => Ok(Command::Return(if args.literal("fail") {
+                args.end()?;
+                Return::Fail
+            } else if args.literal("run") {
+                Return::Run(Box::new(Command::parse(args.rest())?))
+            } else {
+                let value = args.int()?;
+                args.end()?;
+                Return::Value(value)
+            })),
             _ => Ok(Command::Unknown {
                 name,
                 args: args.rest().to_owned(),
@@ -195,6 +220,8 @@ impl Command {
         match self {
             Command::Scoreboard(_) => "scoreboard",
             Command::Data(_) => "data",
+            Command::Function(_) => "function",
+            Command::Return(_) => "return",
             Command::Unknown { name, .. } => name,
         }
     }
