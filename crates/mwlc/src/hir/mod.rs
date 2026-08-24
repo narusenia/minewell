@@ -1,20 +1,53 @@
-//! The high-level intermediate representation: names resolved, macros identified.
+// SPDX-License-Identifier: MIT
+
+//! The high-level intermediate representation: names resolved, types checked.
 //!
-//! HIR is where "what did the author mean" is settled. Type checking and
-//! monomorphisation join it in M2 and M7; today it resolves function names to datapack
-//! paths, turns built-in macro calls into the thing they mean, and rejects names it
-//! does not know.
+//! HIR is where "what did the author mean" is settled — see `docs/02-spec.md` section
+//! 4. Every expression carries its type, so nothing downstream has to ask again.
 //!
-//! Rejecting unknown attributes matters more than it looks. A misspelled `#[tik]` that
-//! is quietly ignored is exactly the class of silent failure minewell exists to
-//! remove, and it would be indistinguishable from the feature not working.
+//! Two choices here are deliberate and worth knowing:
+//!
+//! - **There is no inference.** A `let` takes the type of its annotation, or of its
+//!   initialiser. Nothing propagates backwards. The language's types stay few and
+//!   concrete, so unification would cost a solver and return nothing.
+//! - **Unknown attributes are errors.** A misspelled `#[tik]` that is quietly ignored
+//!   is the class of silent failure minewell exists to remove.
+
+use std::collections::HashMap;
 
 use crate::syntax::SyntaxError;
-use crate::syntax::ast::{self, Expr, ItemKind, SourceFile};
+use crate::syntax::ast::{self, BinaryOp, Expr as AstExpr, ItemKind, SourceFile, UnaryOp};
 use crate::syntax::lexer::{Span, TokenKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FnId(pub u32);
+
+/// Identifies a binding within one function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LocalId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Type {
+    I32,
+    Bool,
+}
+
+impl Type {
+    fn parse(name: &str) -> Option<Type> {
+        match name {
+            "i32" => Some(Type::I32),
+            "bool" => Some(Type::Bool),
+            _ => None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Type::I32 => "i32",
+            Type::Bool => "bool",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hir {
@@ -28,13 +61,34 @@ pub struct Function {
     /// Where this lands in the datapack: `<namespace>:<path>`.
     pub path: String,
     pub attrs: Vec<Attr>,
+    pub locals: Vec<Local>,
     pub body: Vec<Stmt>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Local {
+    pub id: LocalId,
+    pub name: String,
+    pub ty: Type,
+    pub mutable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stmt {
     Raw(RawCommand),
+    Let {
+        local: LocalId,
+        value: Expr,
+        span: Span,
+    },
+    Assign {
+        local: LocalId,
+        /// `None` for `=`; otherwise the arithmetic to apply first.
+        op: Option<BinaryOp>,
+        value: Expr,
+        span: Span,
+    },
 }
 
 /// A `raw!` command. Interpolation arrives in M9; today the text is literal.
@@ -42,6 +96,22 @@ pub enum Stmt {
 pub struct RawCommand {
     pub text: String,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Expr {
+    pub kind: ExprKind,
+    pub ty: Type,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExprKind {
+    Int(i32),
+    Bool(bool),
+    Local(LocalId),
+    Unary(UnaryOp, Box<Expr>),
+    Binary(BinaryOp, Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,16 +134,12 @@ impl Attr {
     }
 }
 
-/// Attributes the language will have but does not act on yet. Named so that the
-/// diagnostic for one can say "not implemented" rather than "unknown", which is a
-/// different problem for the author.
+/// Attributes the language will have but does not act on yet. Named so the diagnostic
+/// can say "not implemented" rather than "unknown", which is a different problem.
 const PLANNED_ATTRS: &[&str] = &["ctx", "score", "storage", "nbt", "unroll", "derive"];
 
 pub fn lower(file: &SourceFile, namespace: &str) -> (Hir, Vec<SyntaxError>) {
-    let mut cx = Lowering {
-        namespace,
-        errors: Vec::new(),
-    };
+    let mut errors = Vec::new();
     let mut functions: Vec<Function> = Vec::new();
     for item in &file.items {
         let ItemKind::Fn(f) = &item.kind;
@@ -82,33 +148,42 @@ pub fn lower(file: &SourceFile, namespace: &str) -> (Hir, Vec<SyntaxError>) {
             .find(|existing| existing.name == f.name.name)
         {
             let name = &f.name.name;
-            let line = previous.span.start;
-            cx.error(
+            let at = previous.span.start;
+            errors.push(SyntaxError::new(
                 f.name.span,
-                format!("a function named '{name}' is already defined (at byte {line})"),
-            );
+                format!("a function named '{name}' is already defined (at byte {at})"),
+            ));
             continue;
         }
-        let id = FnId(functions.len() as u32);
+        let mut cx = FnLowering {
+            locals: Vec::new(),
+            scopes: vec![HashMap::new()],
+            errors: &mut errors,
+        };
+        let attrs = cx.attrs(&item.attrs);
+        let body = cx.block(&f.body);
+        let locals = cx.locals;
         functions.push(Function {
-            id,
+            id: FnId(functions.len() as u32),
             name: f.name.name.clone(),
             path: format!("{namespace}:{}", f.name.name),
-            attrs: cx.attrs(&item.attrs),
-            body: cx.body(&f.body),
+            attrs,
+            locals,
+            body,
             span: item.span,
         });
     }
-    (Hir { functions }, cx.errors)
+    (Hir { functions }, errors)
 }
 
-struct Lowering<'a> {
-    #[allow(dead_code, reason = "used once module paths exist, in M7")]
-    namespace: &'a str,
-    errors: Vec<SyntaxError>,
+struct FnLowering<'a> {
+    locals: Vec<Local>,
+    /// Innermost scope last. A `let` shadows an outer binding of the same name.
+    scopes: Vec<HashMap<String, LocalId>>,
+    errors: &'a mut Vec<SyntaxError>,
 }
 
-impl Lowering<'_> {
+impl FnLowering<'_> {
     fn attrs(&mut self, attrs: &[ast::Attribute]) -> Vec<Attr> {
         attrs
             .iter()
@@ -135,21 +210,202 @@ impl Lowering<'_> {
             .collect()
     }
 
-    fn body(&mut self, block: &ast::Block) -> Vec<Stmt> {
-        block
+    fn block(&mut self, block: &ast::Block) -> Vec<Stmt> {
+        self.scopes.push(HashMap::new());
+        let stmts = block
             .stmts
             .iter()
-            .filter_map(|stmt| {
-                let ast::Stmt::Expr(Expr::Macro(call)) = stmt;
-                match call.name.name.as_str() {
-                    "raw" => self.raw(call).map(Stmt::Raw),
-                    other => {
-                        self.error(call.span, format!("unknown macro '{other}!'"));
-                        None
-                    }
+            .filter_map(|stmt| self.stmt(stmt))
+            .collect();
+        self.scopes.pop();
+        stmts
+    }
+
+    fn stmt(&mut self, stmt: &ast::Stmt) -> Option<Stmt> {
+        match stmt {
+            ast::Stmt::Let(let_stmt) => self.let_stmt(let_stmt),
+            ast::Stmt::Expr(AstExpr::Macro(call)) => self.macro_call(call).map(Stmt::Raw),
+            ast::Stmt::Expr(AstExpr::Assign(assign)) => self.assign(assign),
+            // Every other expression in M2 is pure, so evaluating one for its effect
+            // is asking for nothing to happen. Say so rather than emit dead commands.
+            ast::Stmt::Expr(other) => {
+                self.error(other.span(), "this expression has no effect");
+                None
+            }
+        }
+    }
+
+    fn let_stmt(&mut self, stmt: &ast::LetStmt) -> Option<Stmt> {
+        let value = self.expr(&stmt.value)?;
+        let ty = match &stmt.ty {
+            None => value.ty,
+            Some(written) => {
+                let Some(ty) = Type::parse(&written.name) else {
+                    let name = &written.name;
+                    self.error(written.span, format!("unknown type '{name}'"));
+                    return None;
+                };
+                if ty != value.ty {
+                    self.error(
+                        stmt.value.span(),
+                        format!("expected {}, found {}", ty.name(), value.ty.name()),
+                    );
+                    return None;
                 }
-            })
-            .collect()
+                ty
+            }
+        };
+        let local = self.declare(&stmt.name.name, ty, stmt.mutable);
+        Some(Stmt::Let {
+            local,
+            value,
+            span: stmt.span,
+        })
+    }
+
+    fn assign(&mut self, assign: &ast::AssignExpr) -> Option<Stmt> {
+        let value = self.expr(&assign.value)?;
+        let local = self.lookup(&assign.target)?;
+        let declared = self.locals[local.0 as usize].clone();
+        if !declared.mutable {
+            let name = &declared.name;
+            self.error(
+                assign.span,
+                format!("'{name}' is not mutable; declare it with 'let mut'"),
+            );
+            return None;
+        }
+        // A compound assignment is the arithmetic, so it inherits arithmetic's rules.
+        if assign.op.is_some() && declared.ty != Type::I32 {
+            self.error(
+                assign.span,
+                format!(
+                    "compound assignment needs i32, found {}",
+                    declared.ty.name()
+                ),
+            );
+            return None;
+        }
+        if declared.ty != value.ty {
+            self.error(
+                assign.value.span(),
+                format!("expected {}, found {}", declared.ty.name(), value.ty.name()),
+            );
+            return None;
+        }
+        Some(Stmt::Assign {
+            local,
+            op: assign.op,
+            value,
+            span: assign.span,
+        })
+    }
+
+    fn expr(&mut self, expr: &AstExpr) -> Option<Expr> {
+        let span = expr.span();
+        match expr {
+            AstExpr::Int(lit) => Some(Expr {
+                kind: ExprKind::Int(lit.value),
+                ty: Type::I32,
+                span,
+            }),
+            AstExpr::Bool(lit) => Some(Expr {
+                kind: ExprKind::Bool(lit.value),
+                ty: Type::Bool,
+                span,
+            }),
+            AstExpr::Path(name) => {
+                let local = self.lookup(name)?;
+                Some(Expr {
+                    kind: ExprKind::Local(local),
+                    ty: self.locals[local.0 as usize].ty,
+                    span,
+                })
+            }
+            AstExpr::Unary(unary) => {
+                let operand = self.expr(&unary.operand)?;
+                let want = match unary.op {
+                    UnaryOp::Neg => Type::I32,
+                    UnaryOp::Not => Type::Bool,
+                };
+                if operand.ty != want {
+                    self.error(
+                        span,
+                        format!("expected {}, found {}", want.name(), operand.ty.name()),
+                    );
+                    return None;
+                }
+                Some(Expr {
+                    kind: ExprKind::Unary(unary.op, Box::new(operand)),
+                    ty: want,
+                    span,
+                })
+            }
+            AstExpr::Binary(binary) => {
+                let lhs = self.expr(&binary.lhs)?;
+                let rhs = self.expr(&binary.rhs)?;
+                let ty = self.binary_type(binary.op, &lhs, &rhs, span)?;
+                Some(Expr {
+                    kind: ExprKind::Binary(binary.op, Box::new(lhs), Box::new(rhs)),
+                    ty,
+                    span,
+                })
+            }
+            // Spec section 4.3: assignment is a statement. There is no `()` type for
+            // it to produce, and inventing one to make this legal buys nothing.
+            AstExpr::Assign(_) => {
+                self.error(span, "an assignment is a statement and produces no value");
+                None
+            }
+            AstExpr::Macro(call) => {
+                let name = &call.name.name;
+                self.error(span, format!("'{name}!' does not produce a value"));
+                None
+            }
+        }
+    }
+
+    fn binary_type(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr, span: Span) -> Option<Type> {
+        use BinaryOp::*;
+        let (want, result) = match op {
+            Add | Sub | Mul | Div | Rem => (Some(Type::I32), Type::I32),
+            Lt | Le | Gt | Ge => (Some(Type::I32), Type::Bool),
+            And | Or => (Some(Type::Bool), Type::Bool),
+            // Equality works on any type, as long as both sides agree.
+            Eq | Ne => (None, Type::Bool),
+        };
+        if let Some(want) = want
+            && (lhs.ty != want || rhs.ty != want)
+        {
+            let found = if lhs.ty != want { lhs.ty } else { rhs.ty };
+            self.error(
+                span,
+                format!(
+                    "this operator needs {}, found {}",
+                    want.name(),
+                    found.name()
+                ),
+            );
+            return None;
+        }
+        if lhs.ty != rhs.ty {
+            self.error(
+                span,
+                format!("cannot compare {} with {}", lhs.ty.name(), rhs.ty.name()),
+            );
+            return None;
+        }
+        Some(result)
+    }
+
+    fn macro_call(&mut self, call: &ast::MacroCall) -> Option<RawCommand> {
+        match call.name.name.as_str() {
+            "raw" => self.raw(call),
+            other => {
+                self.error(call.span, format!("unknown macro '{other}!'"));
+                None
+            }
+        }
     }
 
     fn raw(&mut self, call: &ast::MacroCall) -> Option<RawCommand> {
@@ -176,12 +432,39 @@ impl Lowering<'_> {
         }
     }
 
+    fn declare(&mut self, name: &str, ty: Type, mutable: bool) -> LocalId {
+        let id = LocalId(self.locals.len() as u32);
+        self.locals.push(Local {
+            id,
+            name: name.to_owned(),
+            ty,
+            mutable,
+        });
+        self.scopes
+            .last_mut()
+            .expect("a scope is always open")
+            .insert(name.to_owned(), id);
+        id
+    }
+
+    fn lookup(&mut self, name: &ast::Ident) -> Option<LocalId> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(id) = scope.get(&name.name) {
+                return Some(*id);
+            }
+        }
+        let text = &name.name;
+        self.errors.push(SyntaxError::new(
+            name.span,
+            format!("'{text}' is not defined"),
+        ));
+        None
+    }
+
     fn error(&mut self, span: Span, message: impl Into<String>) {
         self.errors.push(SyntaxError::new(span, message));
     }
 }
-
-// SPDX-License-Identifier: MIT
 
 #[cfg(test)]
 mod tests {
@@ -223,7 +506,9 @@ mod tests {
     #[test]
     fn raw_carries_the_command_text() {
         let hir = lower_ok(r#"fn main() { raw!("say hi"); }"#);
-        let Stmt::Raw(raw) = &hir.functions[0].body[0];
+        let Stmt::Raw(raw) = &hir.functions[0].body[0] else {
+            panic!("expected a raw command")
+        };
         assert_eq!(raw.text, "say hi");
     }
 
@@ -261,6 +546,157 @@ mod tests {
         let errors = lower_err("#[tik] fn main() {}");
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("tik"), "{errors:?}");
+    }
+
+    fn only_fn(hir: &Hir) -> &Function {
+        &hir.functions[0]
+    }
+
+    #[test]
+    fn a_let_takes_the_type_of_its_initialiser() {
+        let hir = lower_ok("fn main() { let x = 1; let b = true; }");
+        let locals = &only_fn(&hir).locals;
+        assert_eq!(locals[0].ty, Type::I32);
+        assert_eq!(locals[1].ty, Type::Bool);
+        assert!(!locals[0].mutable);
+    }
+
+    #[test]
+    fn an_annotation_must_agree_with_the_initialiser() {
+        assert!(
+            lower_err("fn main() { let x: i32 = true; }")[0]
+                .message
+                .contains("expected i32")
+        );
+        assert!(
+            lower_ok("fn main() { let x: bool = true; }").functions[0].locals[0]
+                .mutable
+                .eq(&false)
+        );
+    }
+
+    #[test]
+    fn an_unknown_type_is_reported() {
+        assert!(
+            lower_err("fn main() { let x: i64 = 1; }")[0]
+                .message
+                .contains("i64")
+        );
+    }
+
+    #[test]
+    fn a_binding_must_exist_before_it_is_used() {
+        assert!(
+            lower_err("fn main() { let x = y; }")[0]
+                .message
+                .contains("'y'")
+        );
+    }
+
+    #[test]
+    fn an_inner_let_shadows_an_outer_one() {
+        // Two distinct locals, the second hiding the first.
+        let hir = lower_ok("fn main() { let x = 1; let x = true; let y = x; }");
+        let f = only_fn(&hir);
+        assert_eq!(f.locals.len(), 3);
+        assert_eq!(f.locals[2].ty, Type::Bool);
+    }
+
+    #[test]
+    fn arithmetic_needs_integers() {
+        assert!(
+            lower_err("fn main() { let x = 1 + true; }")[0]
+                .message
+                .contains("i32")
+        );
+    }
+
+    #[test]
+    fn logic_needs_booleans() {
+        assert!(
+            lower_err("fn main() { let x = 1 && 2; }")[0]
+                .message
+                .contains("bool")
+        );
+    }
+
+    #[test]
+    fn comparison_yields_a_bool() {
+        let hir = lower_ok("fn main() { let x = 1 < 2; }");
+        assert_eq!(only_fn(&hir).locals[0].ty, Type::Bool);
+    }
+
+    #[test]
+    fn equality_works_on_either_type_but_not_across_them() {
+        assert!(
+            lower_ok("fn main() { let a = true == false; }")
+                .functions
+                .len()
+                .eq(&1)
+        );
+        assert!(
+            lower_err("fn main() { let a = 1 == true; }")[0]
+                .message
+                .contains("cannot compare")
+        );
+    }
+
+    #[test]
+    fn assigning_needs_mut() {
+        assert!(
+            lower_err("fn main() { let x = 1; x = 2; }")[0]
+                .message
+                .contains("not mutable")
+        );
+        assert!(
+            lower_ok("fn main() { let mut x = 1; x = 2; }")
+                .functions
+                .len()
+                == 1
+        );
+    }
+
+    #[test]
+    fn an_assignment_keeps_the_declared_type() {
+        assert!(
+            lower_err("fn main() { let mut x = 1; x = true; }")[0]
+                .message
+                .contains("expected i32")
+        );
+    }
+
+    #[test]
+    fn compound_assignment_is_arithmetic_and_wants_integers() {
+        assert!(
+            lower_ok("fn main() { let mut x = 1; x += 2; }")
+                .functions
+                .len()
+                == 1
+        );
+        assert!(
+            lower_err("fn main() { let mut b = true; b += 1; }")[0]
+                .message
+                .contains("i32")
+        );
+    }
+
+    #[test]
+    fn an_assignment_is_not_a_value() {
+        assert!(
+            lower_err("fn main() { let mut x = 1; let y = x = 2; }")[0]
+                .message
+                .contains("produces no value")
+        );
+    }
+
+    #[test]
+    fn an_expression_with_no_effect_is_reported() {
+        // M2 expressions are pure, so evaluating one for its effect achieves nothing.
+        assert!(
+            lower_err("fn main() { 1 + 1; }")[0]
+                .message
+                .contains("no effect")
+        );
     }
 
     #[test]

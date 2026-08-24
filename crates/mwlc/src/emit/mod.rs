@@ -10,7 +10,8 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
-use crate::mir::{Function, Inst, Mir};
+use crate::hir::Attr;
+use crate::mir::{Cmp, Function, Inst, Mir, Op, Reg, RegKind};
 use crate::syntax::lexer::Span;
 
 /// The datapack layout Minecraft 1.21+ expects. `function` is singular; it was
@@ -19,6 +20,10 @@ const FUNCTION_DIR: &str = "function";
 
 /// A placeholder until toolchains supply the real one (M6). 48 is 1.21 and 1.21.1.
 pub const PLACEHOLDER_PACK_FORMAT: u32 = 48;
+
+/// The generated function that creates the objectives everything else needs. It has no
+/// parent to sit under, so it takes a name no source function can produce.
+pub const INIT_FUNCTION: &str = "__init";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Profile {
@@ -76,14 +81,71 @@ impl Datapack {
 pub fn emit(mir: &Mir, options: &Options) -> Datapack {
     let mut files = BTreeMap::new();
     files.insert("pack.mcmeta".to_owned(), pack_mcmeta(options));
+
+    let mut namespace = "minecraft";
     for function in &mir.functions {
-        let (namespace, path) = split_id(&function.path);
+        let (ns, path) = split_id(&function.path);
+        namespace = ns;
         files.insert(
-            format!("data/{namespace}/{FUNCTION_DIR}/{path}.mcfunction"),
-            function_body(function, options),
+            format!("data/{ns}/{FUNCTION_DIR}/{path}.mcfunction"),
+            function_body(function, options, ns),
         );
     }
+
+    // Objectives have to exist before anything touches them; vanilla rejects the
+    // command outright otherwise, and the failure is easy to mistake for a compiler
+    // bug. Creating them is therefore not optional and not the author's job.
+    files.insert(
+        format!("data/{namespace}/{FUNCTION_DIR}/{INIT_FUNCTION}.mcfunction"),
+        init_body(namespace),
+    );
+
+    let load = std::iter::once(format!("{namespace}:{INIT_FUNCTION}"))
+        .chain(tagged(mir, &Attr::Load))
+        .collect::<Vec<_>>();
+    files.insert(
+        format!("data/minecraft/tags/{FUNCTION_DIR}/load.json"),
+        function_tag(&load),
+    );
+
+    let tick = tagged(mir, &Attr::Tick).collect::<Vec<_>>();
+    if !tick.is_empty() {
+        files.insert(
+            format!("data/minecraft/tags/{FUNCTION_DIR}/tick.json"),
+            function_tag(&tick),
+        );
+    }
+
     Datapack { files }
+}
+
+fn tagged<'a>(mir: &'a Mir, attr: &'a Attr) -> impl Iterator<Item = String> + 'a {
+    mir.functions
+        .iter()
+        .filter(move |f| f.attrs.contains(attr))
+        .map(|f| f.path.clone())
+}
+
+fn init_body(namespace: &str) -> String {
+    format!(
+        "scoreboard objectives add {namespace}.v dummy\nscoreboard objectives add {namespace}.t dummy\n"
+    )
+}
+
+fn function_tag(values: &[String]) -> String {
+    let entries = values
+        .iter()
+        .map(|value| format!("    \"{value}\""))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!("{{\n  \"values\": [\n{entries}\n  ]\n}}\n")
+}
+
+fn objective(namespace: &str, reg: &Reg) -> String {
+    match reg.kind {
+        RegKind::Var => format!("{namespace}.v"),
+        RegKind::Temp => format!("{namespace}.t"),
+    }
 }
 
 fn pack_mcmeta(options: &Options) -> String {
@@ -94,22 +156,107 @@ fn pack_mcmeta(options: &Options) -> String {
     )
 }
 
-fn function_body(function: &Function, options: &Options) -> String {
+fn function_body(function: &Function, options: &Options, namespace: &str) -> String {
     let mut out = String::new();
     for block in &function.blocks {
         for inst in &block.insts {
-            match inst {
-                Inst::Raw { text, span } => {
-                    if let Some(comment) = source_comment(options, *span) {
-                        out.push_str(&comment);
-                    }
-                    out.push_str(text);
-                    out.push('\n');
-                }
+            if let Inst::Raw { span, .. } = inst
+                && let Some(comment) = source_comment(options, *span)
+            {
+                out.push_str(&comment);
             }
+            out.push_str(&command(inst, namespace));
+            out.push('\n');
         }
     }
     out
+}
+
+/// One instruction, one command. This is what makes a function's cost countable
+/// before it is written out.
+fn command(inst: &Inst, ns: &str) -> String {
+    match inst {
+        Inst::Raw { text, .. } => text.clone(),
+        Inst::Const { dst, value } => {
+            let (holder, obj) = (&dst.holder, objective(ns, dst));
+            format!("scoreboard players set {holder} {obj} {value}")
+        }
+        Inst::AddConst { dst, value } => {
+            let (holder, obj) = (&dst.holder, objective(ns, dst));
+            // `remove` rather than `add` with a minus sign: vanilla has both, and
+            // `add -2147483648` would not round-trip.
+            match value.is_negative() {
+                true => format!(
+                    "scoreboard players remove {holder} {obj} {}",
+                    value.unsigned_abs()
+                ),
+                false => format!("scoreboard players add {holder} {obj} {value}"),
+            }
+        }
+        Inst::Op { dst, op, src } => {
+            let (d, dobj) = (&dst.holder, objective(ns, dst));
+            let (s, sobj) = (&src.holder, objective(ns, src));
+            let op = match op {
+                Op::Assign => "=",
+                Op::Add => "+=",
+                Op::Sub => "-=",
+                Op::Mul => "*=",
+                Op::Div => "/=",
+                Op::Rem => "%=",
+                Op::Min => "<",
+                Op::Max => ">",
+            };
+            format!("scoreboard players operation {d} {dobj} {op} {s} {sobj}")
+        }
+        Inst::Cmp {
+            dst,
+            cmp,
+            negated,
+            lhs,
+            rhs,
+        } => {
+            let (d, dobj) = (&dst.holder, objective(ns, dst));
+            let (l, lobj) = (&lhs.holder, objective(ns, lhs));
+            let (r, robj) = (&rhs.holder, objective(ns, rhs));
+            let keyword = if *negated { "unless" } else { "if" };
+            let cmp = match cmp {
+                Cmp::Lt => "<",
+                Cmp::Le => "<=",
+                Cmp::Eq => "=",
+                Cmp::Ge => ">=",
+                Cmp::Gt => ">",
+            };
+            format!(
+                "execute store success score {d} {dobj} {keyword} score {l} {lobj} {cmp} {r} {robj}"
+            )
+        }
+        Inst::Matches {
+            dst,
+            src,
+            min,
+            max,
+            negated,
+        } => {
+            let (d, dobj) = (&dst.holder, objective(ns, dst));
+            let (s, sobj) = (&src.holder, objective(ns, src));
+            let keyword = if *negated { "unless" } else { "if" };
+            format!(
+                "execute store success score {d} {dobj} {keyword} score {s} {sobj} matches {}",
+                range(*min, *max)
+            )
+        }
+    }
+}
+
+/// `5`, `1..`, `..5`, `1..5` — the form vanilla accepts.
+fn range(min: Option<i32>, max: Option<i32>) -> String {
+    match (min, max) {
+        (Some(a), Some(b)) if a == b => a.to_string(),
+        (Some(a), Some(b)) => format!("{a}..{b}"),
+        (Some(a), None) => format!("{a}.."),
+        (None, Some(b)) => format!("..{b}"),
+        (None, None) => "..".to_owned(),
+    }
 }
 
 /// `# src/main.mwl:12`, in debug builds only. Requirements section 15: the generated
@@ -166,7 +313,12 @@ mod tests {
         let pack = compile(r#"fn main() { raw!("say hi"); }"#, &release());
         assert_eq!(
             pack.files.keys().collect::<Vec<_>>(),
-            vec!["data/myns/function/main.mcfunction", "pack.mcmeta"]
+            vec![
+                "data/minecraft/tags/function/load.json",
+                "data/myns/function/__init.mcfunction",
+                "data/myns/function/main.mcfunction",
+                "pack.mcmeta",
+            ]
         );
     }
 
@@ -240,6 +392,43 @@ mod tests {
             "say hi\n"
         );
         assert!(dir.path().join("pack.mcmeta").exists());
+    }
+
+    #[test]
+    fn the_objectives_are_created_by_a_generated_load_function() {
+        // Nothing works if these do not exist, and vanilla rejects the command rather
+        // than failing quietly, so creating them cannot be left to the author.
+        let pack = compile("fn main() {}", &release());
+        let init = &pack.files["data/myns/function/__init.mcfunction"];
+        assert!(
+            init.contains("scoreboard objectives add myns.v dummy"),
+            "{init}"
+        );
+        assert!(
+            init.contains("scoreboard objectives add myns.t dummy"),
+            "{init}"
+        );
+        assert!(
+            pack.files["data/minecraft/tags/function/load.json"].contains("myns:__init"),
+            "the init function has to be in the load tag"
+        );
+    }
+
+    #[test]
+    fn tick_and_load_attributes_reach_the_function_tags() {
+        let pack = compile("#[tick] fn t() {} #[load] fn l() {}", &release());
+        assert!(pack.files["data/minecraft/tags/function/tick.json"].contains("myns:t"));
+        assert!(pack.files["data/minecraft/tags/function/load.json"].contains("myns:l"));
+    }
+
+    #[test]
+    fn there_is_no_tick_tag_when_nothing_wants_one() {
+        let pack = compile("fn main() {}", &release());
+        assert!(
+            !pack
+                .files
+                .contains_key("data/minecraft/tags/function/tick.json")
+        );
     }
 
     #[test]

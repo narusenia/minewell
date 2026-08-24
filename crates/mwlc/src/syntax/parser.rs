@@ -9,6 +9,19 @@ use super::SyntaxError;
 use super::ast::*;
 use super::lexer::{Keyword, Punct, Span, Token, TokenKind, lex};
 
+fn binary(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
+    let span = Span {
+        start: lhs.span().start,
+        end: rhs.span().end,
+    };
+    Expr::Binary(BinaryExpr {
+        op,
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
+        span,
+    })
+}
+
 pub fn parse(src: &str) -> (SourceFile, Vec<SyntaxError>) {
     let (tokens, errors) = lex(src);
     let mut parser = Parser {
@@ -119,15 +132,225 @@ impl Parser {
     }
 
     fn stmt(&mut self) -> Option<Stmt> {
+        if self.peek() == Some(&TokenKind::Keyword(Keyword::Let)) {
+            return self.let_stmt().map(Stmt::Let);
+        }
         let expr = self.expr()?;
         self.expect(Punct::Semi, ";")?;
         Some(Stmt::Expr(expr))
     }
 
-    fn expr(&mut self) -> Option<Expr> {
-        // M1 has exactly one expression form. M2 replaces this with the real grammar.
+    fn let_stmt(&mut self) -> Option<LetStmt> {
         let start = self.span().start;
-        let name = self.ident()?;
+        self.bump();
+        let mutable = self.eat_keyword(Keyword::Mut);
+        let name = self.binding_name()?;
+        let ty = if self.peek() == Some(&TokenKind::Punct(Punct::Colon)) {
+            self.bump();
+            let span = self.span();
+            let name = self.ident()?.name;
+            Some(TypeName { name, span })
+        } else {
+            None
+        };
+        self.expect(Punct::Eq, "=")?;
+        let value = self.expr()?;
+        self.expect(Punct::Semi, ";")?;
+        let end = self.previous_end();
+        Some(LetStmt {
+            mutable,
+            name,
+            ty,
+            value,
+            span: Span { start, end },
+        })
+    }
+
+    /// The name in a `let`, with the one lexical trap spelled out.
+    ///
+    /// `let x:i32` lexes as a single resource location token (spec section 2.8),
+    /// because `ident:ident` with no space is always one. Rather than let that surface
+    /// as "expected a name", say what to do about it.
+    fn binding_name(&mut self) -> Option<Ident> {
+        if let Some(TokenKind::Resource(text)) = self.peek() {
+            let text = text.clone();
+            if let Some((name, ty)) = text.split_once(':') {
+                self.error(format!(
+                    "a type annotation needs a space after the colon: write '{name}: {ty}'"
+                ));
+                self.bump();
+                return None;
+            }
+        }
+        self.ident()
+    }
+
+    fn expr(&mut self) -> Option<Expr> {
+        self.assign()
+    }
+
+    fn assign(&mut self) -> Option<Expr> {
+        let lhs = self.or()?;
+        let op = match self.peek() {
+            Some(TokenKind::Punct(Punct::Eq)) => None,
+            Some(TokenKind::Punct(Punct::PlusEq)) => Some(BinaryOp::Add),
+            Some(TokenKind::Punct(Punct::MinusEq)) => Some(BinaryOp::Sub),
+            Some(TokenKind::Punct(Punct::StarEq)) => Some(BinaryOp::Mul),
+            Some(TokenKind::Punct(Punct::SlashEq)) => Some(BinaryOp::Div),
+            Some(TokenKind::Punct(Punct::PercentEq)) => Some(BinaryOp::Rem),
+            _ => return Some(lhs),
+        };
+        let op_span = self.span();
+        self.bump();
+        // Right associative: `a = b = c` is `a = (b = c)`.
+        let value = self.assign()?;
+        let Expr::Path(target) = lhs else {
+            self.errors.push(SyntaxError::new(
+                op_span,
+                "the left side of an assignment must be a binding",
+            ));
+            return None;
+        };
+        let span = Span {
+            start: target.span.start,
+            end: value.span().end,
+        };
+        Some(Expr::Assign(AssignExpr {
+            op,
+            target,
+            value: Box::new(value),
+            span,
+        }))
+    }
+
+    fn or(&mut self) -> Option<Expr> {
+        let mut lhs = self.and()?;
+        while self.peek() == Some(&TokenKind::Punct(Punct::OrOr)) {
+            self.bump();
+            lhs = binary(BinaryOp::Or, lhs, self.and()?);
+        }
+        Some(lhs)
+    }
+
+    fn and(&mut self) -> Option<Expr> {
+        let mut lhs = self.compare()?;
+        while self.peek() == Some(&TokenKind::Punct(Punct::AndAnd)) {
+            self.bump();
+            lhs = binary(BinaryOp::And, lhs, self.compare()?);
+        }
+        Some(lhs)
+    }
+
+    /// Comparisons do not chain: `a < b < c` is an error, as in Rust.
+    fn compare(&mut self) -> Option<Expr> {
+        let lhs = self.sum()?;
+        let Some(op) = self.compare_op() else {
+            return Some(lhs);
+        };
+        self.bump();
+        let rhs = self.sum()?;
+        if let Some(second) = self.compare_op() {
+            let _ = second;
+            self.error("comparisons do not chain; parenthesise if that is what you meant");
+            return None;
+        }
+        Some(binary(op, lhs, rhs))
+    }
+
+    fn compare_op(&mut self) -> Option<BinaryOp> {
+        let TokenKind::Punct(punct) = self.peek()? else {
+            return None;
+        };
+        Some(match punct {
+            Punct::EqEq => BinaryOp::Eq,
+            Punct::Ne => BinaryOp::Ne,
+            Punct::Lt => BinaryOp::Lt,
+            Punct::Le => BinaryOp::Le,
+            Punct::Gt => BinaryOp::Gt,
+            Punct::Ge => BinaryOp::Ge,
+            _ => return None,
+        })
+    }
+
+    fn sum(&mut self) -> Option<Expr> {
+        let mut lhs = self.product()?;
+        loop {
+            let op = match self.peek() {
+                Some(TokenKind::Punct(Punct::Plus)) => BinaryOp::Add,
+                Some(TokenKind::Punct(Punct::Minus)) => BinaryOp::Sub,
+                _ => return Some(lhs),
+            };
+            self.bump();
+            lhs = binary(op, lhs, self.product()?);
+        }
+    }
+
+    fn product(&mut self) -> Option<Expr> {
+        let mut lhs = self.unary()?;
+        loop {
+            let op = match self.peek() {
+                Some(TokenKind::Punct(Punct::Star)) => BinaryOp::Mul,
+                Some(TokenKind::Punct(Punct::Slash)) => BinaryOp::Div,
+                Some(TokenKind::Punct(Punct::Percent)) => BinaryOp::Rem,
+                _ => return Some(lhs),
+            };
+            self.bump();
+            lhs = binary(op, lhs, self.unary()?);
+        }
+    }
+
+    fn unary(&mut self) -> Option<Expr> {
+        let start = self.span().start;
+        let op = match self.peek() {
+            Some(TokenKind::Punct(Punct::Minus)) => UnaryOp::Neg,
+            Some(TokenKind::Punct(Punct::Bang)) => UnaryOp::Not,
+            _ => return self.primary(),
+        };
+        self.bump();
+        let operand = self.unary()?;
+        let end = operand.span().end;
+        Some(Expr::Unary(UnaryExpr {
+            op,
+            operand: Box::new(operand),
+            span: Span { start, end },
+        }))
+    }
+
+    fn primary(&mut self) -> Option<Expr> {
+        let span = self.span();
+        match self.peek() {
+            Some(TokenKind::Int(value)) => {
+                let value = *value;
+                self.bump();
+                Some(Expr::Int(IntLit { value, span }))
+            }
+            Some(TokenKind::Keyword(k @ (Keyword::True | Keyword::False))) => {
+                let value = *k == Keyword::True;
+                self.bump();
+                Some(Expr::Bool(BoolLit { value, span }))
+            }
+            Some(TokenKind::Punct(Punct::LParen)) => {
+                self.bump();
+                let inner = self.expr()?;
+                self.expect(Punct::RParen, ")")?;
+                Some(inner)
+            }
+            Some(TokenKind::Ident(_)) => {
+                let name = self.ident()?;
+                if self.peek() == Some(&TokenKind::Punct(Punct::Bang)) {
+                    return self.macro_call(name);
+                }
+                Some(Expr::Path(name))
+            }
+            _ => {
+                self.error("expected an expression");
+                None
+            }
+        }
+    }
+
+    fn macro_call(&mut self, name: Ident) -> Option<Expr> {
+        let start = name.span.start;
         self.expect(Punct::Bang, "!")?;
         let open = match self.peek() {
             Some(TokenKind::Punct(p @ (Punct::LParen | Punct::LBracket | Punct::LBrace))) => *p,
@@ -143,6 +366,15 @@ impl Parser {
             tokens,
             span: Span { start, end },
         }))
+    }
+
+    fn eat_keyword(&mut self, keyword: Keyword) -> bool {
+        if self.peek() == Some(&TokenKind::Keyword(keyword)) {
+            self.bump();
+            true
+        } else {
+            false
+        }
     }
 
     /// Consumes a bracketed run of tokens and returns the ones inside it.
@@ -298,7 +530,9 @@ mod tests {
         let f = fn_item(&file, 0);
         assert_eq!(f.name.name, "main");
         assert_eq!(f.body.stmts.len(), 1);
-        let Stmt::Expr(Expr::Macro(call)) = &f.body.stmts[0];
+        let Stmt::Expr(Expr::Macro(call)) = &f.body.stmts[0] else {
+            panic!("expected a macro call")
+        };
         assert_eq!(call.name.name, "raw");
         assert_eq!(call.tokens.len(), 1);
         assert_eq!(call.tokens[0].kind, TokenKind::Str("say hi".to_owned()));
@@ -371,7 +605,7 @@ mod tests {
 
     #[test]
     fn a_bad_statement_does_not_swallow_the_rest_of_the_block() {
-        let (file, errors) = parse(r#"fn main() { 1; raw!("x"); }"#);
+        let (file, errors) = parse(r#"fn main() { let = 1; raw!("x"); }"#);
         assert_eq!(errors.len(), 1);
         assert_eq!(fn_item(&file, 0).body.stmts.len(), 1);
     }

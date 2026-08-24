@@ -37,7 +37,26 @@ pub fn load(src: &str) -> Interpreter {
                 .unwrap_or_else(|e| panic!("{id} does not parse as mcfunction: {e}\n{text}"));
         }
     }
+    // The pack's load tag runs this in a real world; here the harness stands in for it.
+    mc.call(&format!("{NS}:{}", mwlc::emit::INIT_FUNCTION));
+    assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
+    // Setup is not the program, so cost measurements start from zero here.
+    mc.commands_run = 0;
     mc
+}
+
+/// The value of a binding, by the name the author wrote.
+pub fn local(mc: &Interpreter, function: &str, name: &str) -> Option<i32> {
+    mc.world
+        .scoreboard
+        .get(&format!("{NS}.v"), &format!("${function}.{name}"))
+        .expect("the objective exists")
+}
+
+/// How many commands the last run cost. Generated command count is a requirement, not
+/// a detail, so tests are allowed to care.
+pub fn cost(mc: &Interpreter) -> u64 {
+    mc.commands_run
 }
 
 /// Compiles and calls `test:main`, returning the interpreter to assert against.
