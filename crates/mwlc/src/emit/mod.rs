@@ -246,6 +246,32 @@ fn command(inst: &Inst, ns: &str) -> String {
             )
         }
         Inst::Call { path } => format!("function {path}"),
+        Inst::StoreResult { dst, inst } => {
+            let (d, dobj) = (&dst.holder, objective(ns, dst));
+            format!(
+                "execute store result score {d} {dobj} run {}",
+                command(inst, ns)
+            )
+        }
+        Inst::Get { src } => {
+            let (s, sobj) = (&src.holder, objective(ns, src));
+            format!("scoreboard players get {s} {sobj}")
+        }
+        Inst::ReturnRun { inst } => format!("return run {}", command(inst, ns)),
+        Inst::PushFrame => format!("data modify storage {ns}:mw mw.stack append value {{}}"),
+        Inst::PopFrame => format!("data remove storage {ns}:mw mw.stack[-1]"),
+        Inst::Save { reg, slot } => {
+            let (r, robj) = (&reg.holder, objective(ns, reg));
+            format!(
+                "execute store result storage {ns}:mw mw.stack[-1].r{slot} int 1 run scoreboard players get {r} {robj}"
+            )
+        }
+        Inst::Restore { reg, slot } => {
+            let (r, robj) = (&reg.holder, objective(ns, reg));
+            format!(
+                "execute store result score {r} {robj} run data get storage {ns}:mw mw.stack[-1].r{slot}"
+            )
+        }
         Inst::Return { value } => format!("return {value}"),
         Inst::Guarded { cond, inst } => {
             format!("execute {} run {}", condition(cond, ns), command(inst, ns))

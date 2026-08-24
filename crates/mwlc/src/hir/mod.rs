@@ -61,6 +61,10 @@ pub struct Function {
     /// Where this lands in the datapack: `<namespace>:<path>`.
     pub path: String,
     pub attrs: Vec<Attr>,
+    /// Parameters are locals the caller writes before calling, so they are the first
+    /// entries in `locals`.
+    pub params: Vec<LocalId>,
+    pub ret: Option<Type>,
     pub locals: Vec<Local>,
     pub body: Vec<Stmt>,
     pub span: Span,
@@ -100,9 +104,18 @@ pub enum Stmt {
         inline: Inline,
         span: Span,
     },
+    /// A call written as a statement. Any value it returns is discarded.
+    CallFor {
+        callee: FnId,
+        args: Vec<Expr>,
+        span: Span,
+    },
     Break(Span),
     Continue(Span),
-    Return(Span),
+    Return {
+        value: Option<Expr>,
+        span: Span,
+    },
     Let {
         local: LocalId,
         value: Expr,
@@ -138,6 +151,7 @@ pub enum ExprKind {
     Local(LocalId),
     Unary(UnaryOp, Box<Expr>),
     Binary(BinaryOp, Box<Expr>, Box<Expr>),
+    Call { callee: FnId, args: Vec<Expr> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,37 +178,85 @@ impl Attr {
 /// can say "not implemented" rather than "unknown", which is a different problem.
 const PLANNED_ATTRS: &[&str] = &["ctx", "score", "storage", "nbt", "unroll", "derive"];
 
+/// A function's shape, known before any body is lowered so that a call can be checked
+/// no matter which order the two were written in.
+#[derive(Debug, Clone)]
+struct Signature {
+    id: FnId,
+    params: Vec<Type>,
+    ret: Option<Type>,
+}
+
 pub fn lower(file: &SourceFile, namespace: &str) -> (Hir, Vec<SyntaxError>) {
     let mut errors = Vec::new();
-    let mut functions: Vec<Function> = Vec::new();
+    let mut signatures: HashMap<String, Signature> = HashMap::new();
+    let mut items: Vec<(&ast::Item, &ast::FnItem)> = Vec::new();
+
+    // First pass: signatures only. Without it, calling a function defined further down
+    // the file would be an error — a rule about text order rather than about programs.
     for item in &file.items {
         let ItemKind::Fn(f) = &item.kind;
-        if let Some(previous) = functions
-            .iter()
-            .find(|existing| existing.name == f.name.name)
-        {
+        if signatures.contains_key(&f.name.name) {
             let name = &f.name.name;
-            let at = previous.span.start;
             errors.push(SyntaxError::new(
                 f.name.span,
-                format!("a function named '{name}' is already defined (at byte {at})"),
+                format!("a function named '{name}' is already defined"),
             ));
             continue;
         }
+        let params = f
+            .params
+            .iter()
+            .map(|param| named_type(&param.ty, &mut errors).unwrap_or(Type::I32))
+            .collect();
+        let ret = f
+            .ret
+            .as_ref()
+            .and_then(|written| named_type(written, &mut errors));
+        signatures.insert(
+            f.name.name.clone(),
+            Signature {
+                id: FnId(items.len() as u32),
+                params,
+                ret,
+            },
+        );
+        items.push((item, f));
+    }
+
+    let mut functions = Vec::new();
+    for (item, f) in items {
+        let signature = signatures[&f.name.name].clone();
         let mut cx = FnLowering {
             locals: Vec::new(),
             scopes: vec![HashMap::new()],
             loop_depth: 0,
+            ret: signature.ret,
+            signatures: &signatures,
             errors: &mut errors,
         };
         let attrs = cx.attrs(&item.attrs);
+        let params = f
+            .params
+            .iter()
+            .zip(&signature.params)
+            .map(|(param, ty)| cx.declare(&param.name.name, *ty, false))
+            .collect();
         let body = cx.block(&f.body);
         let locals = cx.locals;
+        if signature.ret.is_some() && !always_returns(&body) {
+            errors.push(SyntaxError::new(
+                f.name.span,
+                "this function can reach its end without returning a value",
+            ));
+        }
         functions.push(Function {
-            id: FnId(functions.len() as u32),
+            id: signature.id,
             name: f.name.name.clone(),
             path: format!("{namespace}:{}", f.name.name),
             attrs,
+            params,
+            ret: signature.ret,
             locals,
             body,
             span: item.span,
@@ -203,8 +265,42 @@ pub fn lower(file: &SourceFile, namespace: &str) -> (Hir, Vec<SyntaxError>) {
     (Hir { functions }, errors)
 }
 
+fn named_type(written: &ast::TypeName, errors: &mut Vec<SyntaxError>) -> Option<Type> {
+    match Type::parse(&written.name) {
+        Some(ty) => Some(ty),
+        None => {
+            let name = &written.name;
+            errors.push(SyntaxError::new(
+                written.span,
+                format!("unknown type '{name}'"),
+            ));
+            None
+        }
+    }
+}
+
+/// Whether control cannot reach the end of a statement list without returning.
+///
+/// Deliberately shallow: a top-level `return`, or an `if`/`else` where both sides
+/// return. A loop that never exits also never falls through, but proving that needs
+/// more than syntax, and guessing would turn a missing `return` into a runtime
+/// surprise instead of a compile error.
+fn always_returns(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        Stmt::Return { .. } => true,
+        Stmt::If {
+            then,
+            otherwise: Some(otherwise),
+            ..
+        } => always_returns(then) && always_returns(otherwise),
+        _ => false,
+    })
+}
+
 struct FnLowering<'a> {
     locals: Vec<Local>,
+    ret: Option<Type>,
+    signatures: &'a HashMap<String, Signature>,
     /// Innermost scope last. A `let` shadows an outer binding of the same name.
     scopes: Vec<HashMap<String, LocalId>>,
     /// How many loops enclose the statement being lowered. `break` outside one is an
@@ -256,6 +352,15 @@ impl FnLowering<'_> {
             ast::Stmt::Let(let_stmt) => self.let_stmt(let_stmt),
             ast::Stmt::Expr(AstExpr::Macro(call)) => self.macro_call(call).map(Stmt::Raw),
             ast::Stmt::Expr(AstExpr::Assign(assign)) => self.assign(assign),
+            ast::Stmt::Expr(AstExpr::Call(call)) => {
+                let (callee, _) = self.call_signature(call)?;
+                let args = self.call_args(call)?;
+                Some(Stmt::CallFor {
+                    callee,
+                    args,
+                    span: call.span,
+                })
+            }
             // Every other expression is pure, so evaluating one for its effect is
             // asking for nothing to happen. Say so rather than emit dead commands.
             ast::Stmt::Expr(other) => {
@@ -268,8 +373,34 @@ impl FnLowering<'_> {
             ast::Stmt::Continue(span) => {
                 self.jump(*span, "continue").map(|()| Stmt::Continue(*span))
             }
-            ast::Stmt::Return(span) => Some(Stmt::Return(*span)),
+            ast::Stmt::Return { value, span } => self.return_stmt(value.as_ref(), *span),
         }
+    }
+
+    fn return_stmt(&mut self, value: Option<&AstExpr>, span: Span) -> Option<Stmt> {
+        let value = match (value, self.ret) {
+            (None, None) => None,
+            (Some(expr), Some(want)) => {
+                let expr = self.expr(expr)?;
+                if expr.ty != want {
+                    self.error(
+                        expr.span,
+                        format!("expected {}, found {}", want.name(), expr.ty.name()),
+                    );
+                    return None;
+                }
+                Some(expr)
+            }
+            (Some(expr), None) => {
+                self.error(expr.span(), "this function does not return a value");
+                return None;
+            }
+            (None, Some(want)) => {
+                self.error(span, format!("expected a {} to return", want.name()));
+                return None;
+            }
+        };
+        Some(Stmt::Return { value, span })
     }
 
     fn jump(&mut self, span: Span, keyword: &str) -> Option<()> {
@@ -476,6 +607,20 @@ impl FnLowering<'_> {
                 self.error(span, "an assignment is a statement and produces no value");
                 None
             }
+            AstExpr::Call(call) => {
+                let (callee, ty) = self.call_signature(call)?;
+                let Some(ty) = ty else {
+                    let name = &call.callee.name;
+                    self.error(span, format!("'{name}' does not return a value"));
+                    return None;
+                };
+                let args = self.call_args(call)?;
+                Some(Expr {
+                    kind: ExprKind::Call { callee, args },
+                    ty,
+                    span,
+                })
+            }
             AstExpr::Macro(call) => {
                 let name = &call.name.name;
                 self.error(span, format!("'{name}!' does not produce a value"));
@@ -515,6 +660,43 @@ impl FnLowering<'_> {
             return None;
         }
         Some(result)
+    }
+
+    fn call_signature(&mut self, call: &ast::CallExpr) -> Option<(FnId, Option<Type>)> {
+        match self.signatures.get(&call.callee.name) {
+            Some(sig) => Some((sig.id, sig.ret)),
+            None => {
+                let name = &call.callee.name;
+                self.error(call.callee.span, format!("'{name}' is not defined"));
+                None
+            }
+        }
+    }
+
+    fn call_args(&mut self, call: &ast::CallExpr) -> Option<Vec<Expr>> {
+        let want = self.signatures[&call.callee.name].params.clone();
+        if call.args.len() != want.len() {
+            let name = &call.callee.name;
+            let (n, m) = (want.len(), call.args.len());
+            self.error(
+                call.span,
+                format!("'{name}' takes {n} argument(s), but {m} were given"),
+            );
+            return None;
+        }
+        let mut args = Vec::new();
+        for (arg, want) in call.args.iter().zip(want) {
+            let arg = self.expr(arg)?;
+            if arg.ty != want {
+                self.error(
+                    arg.span,
+                    format!("expected {}, found {}", want.name(), arg.ty.name()),
+                );
+                return None;
+            }
+            args.push(arg);
+        }
+        Some(args)
     }
 
     fn macro_call(&mut self, call: &ast::MacroCall) -> Option<RawCommand> {
@@ -871,6 +1053,92 @@ mod tests {
             lower_err("fn main() { #[inline] while true { } }")[0]
                 .message
                 .contains("always its own function")
+        );
+    }
+
+    #[test]
+    fn a_call_checks_arity_and_types() {
+        let prelude = "fn f(a: i32, b: bool) -> i32 { return 1; } ";
+        assert!(
+            lower_err(&format!("{prelude} fn main() {{ let x = f(1); }}"))[0]
+                .message
+                .contains("2 argument")
+        );
+        assert!(
+            lower_err(&format!("{prelude} fn main() {{ let x = f(1, 2); }}"))[0]
+                .message
+                .contains("expected bool")
+        );
+        assert!(
+            lower_ok(&format!("{prelude} fn main() {{ let x = f(1, true); }}"))
+                .functions
+                .len()
+                == 2
+        );
+    }
+
+    #[test]
+    fn calling_something_undefined_is_reported() {
+        assert!(
+            lower_err("fn main() { let x = nope(); }")[0]
+                .message
+                .contains("'nope'")
+        );
+    }
+
+    #[test]
+    fn a_function_may_be_called_before_it_is_defined() {
+        assert!(
+            lower_ok("fn main() { let x = later(); } fn later() -> i32 { return 1; }")
+                .functions
+                .len()
+                == 2
+        );
+    }
+
+    #[test]
+    fn a_void_function_has_no_value_to_use() {
+        assert!(
+            lower_err("fn v() {} fn main() { let x = v(); }")[0]
+                .message
+                .contains("does not return a value")
+        );
+        // As a statement it is fine.
+        assert!(lower_ok("fn v() {} fn main() { v(); }").functions.len() == 2);
+    }
+
+    #[test]
+    fn a_returning_function_must_actually_return() {
+        assert!(
+            lower_err("fn f() -> i32 { let x = 1; }")[0]
+                .message
+                .contains("without returning")
+        );
+        // Both sides of an if/else returning is enough.
+        assert!(
+            lower_ok("fn f() -> i32 { if true { return 1; } else { return 2; } }")
+                .functions
+                .len()
+                == 1
+        );
+    }
+
+    #[test]
+    fn returning_the_wrong_type_is_reported() {
+        assert!(
+            lower_err("fn f() -> i32 { return true; }")[0]
+                .message
+                .contains("expected i32")
+        );
+        assert!(
+            lower_err("fn f() { return 1; }")[0]
+                .message
+                .contains("does not return a value")
+        );
+        assert!(
+            lower_err("fn f() -> i32 { return; }")[0]
+                .message
+                .contains("expected a i32")
         );
     }
 

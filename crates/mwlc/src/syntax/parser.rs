@@ -74,7 +74,19 @@ impl Parser {
 
         let name = self.ident()?;
         self.expect(Punct::LParen, "(")?;
+        let mut params = Vec::new();
+        while self.peek() != Some(&TokenKind::Punct(Punct::RParen)) {
+            params.push(self.param()?);
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
         self.expect(Punct::RParen, ")")?;
+        let ret = if self.eat_punct(Punct::Arrow) {
+            Some(self.type_name()?)
+        } else {
+            None
+        };
         let body = self.block()?;
         let span = Span {
             start,
@@ -82,9 +94,42 @@ impl Parser {
         };
         Some(Item {
             attrs,
-            kind: ItemKind::Fn(FnItem { name, body }),
+            kind: ItemKind::Fn(FnItem {
+                name,
+                params,
+                ret,
+                body,
+            }),
             span,
         })
+    }
+
+    fn param(&mut self) -> Option<Param> {
+        let start = self.span().start;
+        let name = self.binding_name()?;
+        self.expect(Punct::Colon, ":")?;
+        let ty = self.type_name()?;
+        let end = self.previous_end();
+        Some(Param {
+            name,
+            ty,
+            span: Span { start, end },
+        })
+    }
+
+    fn type_name(&mut self) -> Option<TypeName> {
+        let span = self.span();
+        let name = self.ident()?.name;
+        Some(TypeName { name, span })
+    }
+
+    fn eat_punct(&mut self, punct: Punct) -> bool {
+        if self.peek() == Some(&TokenKind::Punct(punct)) {
+            self.bump();
+            true
+        } else {
+            false
+        }
     }
 
     fn attributes(&mut self) -> Vec<Attribute> {
@@ -161,8 +206,13 @@ impl Parser {
                     }
                     Some(TokenKind::Keyword(Keyword::Return)) => {
                         self.bump();
+                        let value = if self.peek() == Some(&TokenKind::Punct(Punct::Semi)) {
+                            None
+                        } else {
+                            Some(self.expr()?)
+                        };
                         self.expect(Punct::Semi, ";")?;
-                        Some(Stmt::Return(span))
+                        Some(Stmt::Return { value, span })
                     }
                     _ => {
                         let expr = self.expr()?;
@@ -224,11 +274,8 @@ impl Parser {
         self.bump();
         let mutable = self.eat_keyword(Keyword::Mut);
         let name = self.binding_name()?;
-        let ty = if self.peek() == Some(&TokenKind::Punct(Punct::Colon)) {
-            self.bump();
-            let span = self.span();
-            let name = self.ident()?.name;
-            Some(TypeName { name, span })
+        let ty = if self.eat_punct(Punct::Colon) {
+            Some(self.type_name()?)
         } else {
             None
         };
@@ -416,16 +463,36 @@ impl Parser {
             }
             Some(TokenKind::Ident(_)) => {
                 let name = self.ident()?;
-                if self.peek() == Some(&TokenKind::Punct(Punct::Bang)) {
-                    return self.macro_call(name);
+                match self.peek() {
+                    Some(TokenKind::Punct(Punct::Bang)) => self.macro_call(name),
+                    Some(TokenKind::Punct(Punct::LParen)) => self.call(name),
+                    _ => Some(Expr::Path(name)),
                 }
-                Some(Expr::Path(name))
             }
             _ => {
                 self.error("expected an expression");
                 None
             }
         }
+    }
+
+    fn call(&mut self, callee: Ident) -> Option<Expr> {
+        let start = callee.span.start;
+        self.bump();
+        let mut args = Vec::new();
+        while self.peek() != Some(&TokenKind::Punct(Punct::RParen)) {
+            args.push(self.expr()?);
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        self.expect(Punct::RParen, ")")?;
+        let end = self.previous_end();
+        Some(Expr::Call(CallExpr {
+            callee,
+            args,
+            span: Span { start, end },
+        }))
     }
 
     fn macro_call(&mut self, name: Ident) -> Option<Expr> {

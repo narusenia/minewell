@@ -332,9 +332,9 @@ mod control_flow {
 #[ignore = "prints rather than asserting"]
 fn print_generated_commands() {
     for src in [
-        r#"fn main() { let a = 1; if a == 1 { raw!("say hi"); } }"#,
-        r#"fn main() { let a = 1; #[no_inline] if a == 1 { raw!("say hi"); } }"#,
         "fn main() { let mut x = 0; while x < 3 { x += 1; } }",
+        "fn fact(n: i32) -> i32 { if n <= 1 { return 1; } return n * fact(n - 1); }
+         fn main() { let x = fact(3); }",
     ] {
         println!("=== {src}");
         let options = mwlc::emit::Options {
@@ -347,5 +347,161 @@ fn print_generated_commands() {
                 println!("--- {path}\n{text}");
             }
         }
+    }
+}
+
+/// Functions, calls and recursion. Spec sections 3.6, 6.12 and 6.13.
+mod functions {
+    use super::harness::{cost, load, local, run};
+
+    fn value(src: &str) -> i32 {
+        let mc = run(src);
+        local(&mc, "main", "x").expect("x is set")
+    }
+
+    #[test]
+    fn a_call_passes_arguments_and_returns_a_value() {
+        assert_eq!(
+            value(
+                "fn add(a: i32, b: i32) -> i32 { return a + b; } fn main() { let x = add(2, 3); }"
+            ),
+            5
+        );
+    }
+
+    #[test]
+    fn a_function_can_be_called_before_it_is_written() {
+        assert_eq!(
+            value("fn main() { let x = one(); } fn one() -> i32 { return 1; }"),
+            1
+        );
+    }
+
+    #[test]
+    fn calls_nest_inside_expressions() {
+        assert_eq!(
+            value(
+                "fn dbl(n: i32) -> i32 { return n * 2; }
+                 fn main() { let x = dbl(3) + dbl(4); }"
+            ),
+            14
+        );
+    }
+
+    #[test]
+    fn a_call_can_be_a_statement() {
+        let mc = run(r#"fn shout() { raw!("say hi"); } fn main() { shout(); }"#);
+        assert_eq!(mc.effects.len(), 1);
+    }
+
+    #[test]
+    fn arguments_are_evaluated_in_the_callers_frame() {
+        assert_eq!(
+            value(
+                "fn id(n: i32) -> i32 { return n; }
+                 fn main() { let a = 7; let x = id(a); }"
+            ),
+            7
+        );
+    }
+
+    #[test]
+    fn returning_early_from_a_branch() {
+        assert_eq!(
+            value(
+                "fn sign(n: i32) -> i32 { if n < 0 { return -1; } return 1; }
+                 fn main() { let x = sign(-5); }"
+            ),
+            -1
+        );
+    }
+
+    #[test]
+    fn factorial_by_recursion() {
+        // M4's completion criterion.
+        let src = "fn fact(n: i32) -> i32 {
+                       if n <= 1 { return 1; }
+                       return n * fact(n - 1);
+                   }
+                   fn main() { let x = fact(5); }";
+        assert_eq!(value(src), 120);
+    }
+
+    #[test]
+    fn recursion_restores_the_callers_locals() {
+        let src = "fn f(n: i32) -> i32 {
+                       if n == 0 { return 0; }
+                       let doubled = n * 2;
+                       let rest = f(n - 1);
+                       return doubled + rest;
+                   }
+                   fn main() { let x = f(4); }";
+        assert_eq!(value(src), 20, "2 + 4 + 6 + 8");
+    }
+
+    #[test]
+    fn mutual_recursion() {
+        let src = "fn even(n: i32) -> i32 { if n == 0 { return 1; } return odd(n - 1); }
+                   fn odd(n: i32) -> i32 { if n == 0 { return 0; } return even(n - 1); }
+                   fn main() { let x = even(7); }";
+        assert_eq!(value(src), 0);
+    }
+
+    #[test]
+    fn a_recursive_call_leaves_the_frame_stack_empty() {
+        let mc = run(
+            "fn fact(n: i32) -> i32 { if n <= 1 { return 1; } return n * fact(n - 1); }
+             fn main() { let x = fact(4); }",
+        );
+        let stack = tinymcf::path::NbtPath::parse("mw.stack")
+            .unwrap()
+            .resolve(mc.world.storage("test:mw"));
+        assert!(
+            stack.is_empty() || stack == vec![tinymcf::nbt::NbtValue::List(vec![])],
+            "frames were not popped: {stack:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_recursive_call_costs_nothing_but_the_call() {
+        // No frame, no save, no restore: an argument write and the call itself.
+        let mut mc = load("fn id(n: i32) -> i32 { return n; } fn main() { let x = id(1); }");
+        mc.call("test:main");
+        // Caller: write the argument, `execute store result` + `function`, copy the
+        // result out of its temporary. Callee: `return run` + the `get` it runs.
+        // The copy is a temporary the destination-driven lowering (M9-10) removes.
+        assert_eq!(cost(&mc), 6);
+    }
+
+    #[test]
+    fn a_short_circuit_with_a_pure_right_hand_side_stays_one_command() {
+        let mut mc = load("fn main() { let a = true; let b = false; let x = a && b; }");
+        mc.call("test:main");
+        // Two `set`s, a copy into a temporary, the `min`, and a copy back out. The two
+        // copies are what M9-10 removes; the point here is that there is no branch.
+        assert_eq!(cost(&mc), 5);
+    }
+
+    #[test]
+    fn a_call_on_the_right_of_and_is_not_run_when_the_left_is_false() {
+        // Spec section 6.14: with a call on the right, short-circuiting is observable,
+        // so it has to actually happen.
+        let mc = run(r#"fn noisy() -> i32 { raw!("say ran"); return 1; }
+               fn main() { let f = false; let x = f && noisy() == 1; }"#);
+        assert!(mc.effects.is_empty(), "the right side should not have run");
+    }
+
+    #[test]
+    fn a_call_on_the_right_of_and_does_run_when_the_left_is_true() {
+        let mc = run(r#"fn noisy() -> i32 { raw!("say ran"); return 1; }
+               fn main() { let t = true; let x = t && noisy() == 1; }"#);
+        assert_eq!(mc.effects.len(), 1);
+    }
+
+    #[test]
+    fn a_call_on_the_right_of_or_is_skipped_when_the_left_is_true() {
+        let mc = run(r#"fn noisy() -> i32 { raw!("say ran"); return 1; }
+               fn main() { let t = true; let x = t || noisy() == 1; }"#);
+        assert!(mc.effects.is_empty());
     }
 }

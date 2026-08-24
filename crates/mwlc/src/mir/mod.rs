@@ -91,6 +91,20 @@ pub enum Inst {
     },
     /// `function <path>`
     Call { path: String },
+    /// `execute store result score <dst> run <inst>`
+    StoreResult { dst: Reg, inst: Box<Inst> },
+    /// `scoreboard players get <src>`, whose result is the score.
+    Get { src: Reg },
+    /// `return run <inst>`
+    ReturnRun { inst: Box<Inst> },
+    /// `data modify storage <ns>:mw mw.stack append value {}`
+    PushFrame,
+    /// `data remove storage <ns>:mw mw.stack[-1]`
+    PopFrame,
+    /// Saves a register into the top frame under `slot`.
+    Save { reg: Reg, slot: u32 },
+    /// Reads a register back out of the top frame.
+    Restore { reg: Reg, slot: u32 },
     /// `return <value>`
     Return { value: i32 },
     /// `execute <cond> run <inst>`. Still one command, so still one instruction.
@@ -180,7 +194,7 @@ fn escapes(stmts: &[hir::Stmt]) -> Escapes {
                 continues: true,
                 ..Escapes::default()
             },
-            hir::Stmt::Return(_) => Escapes {
+            hir::Stmt::Return { .. } => Escapes {
                 returns: true,
                 ..Escapes::default()
             },
@@ -236,16 +250,28 @@ enum Value {
 }
 
 pub fn lower(hir: &Hir) -> Mir {
-    let mut temps = Temps::default();
+    let components = strongly_connected(hir);
+    let mut program = Program {
+        functions: &hir.functions,
+        components,
+        temps: Temps::default(),
+        used: Vec::new(),
+        initialised: Vec::new(),
+    };
     let mut functions = Vec::new();
     for f in &hir.functions {
+        program.used.clear();
+        // Parameters arrive with values already in them, written by the caller.
+        program.initialised.clear();
+        program.initialised.extend(f.params.iter().copied());
         let mut cx = Lowering {
             function: f,
+            program: &mut program,
             insts: Vec::new(),
-            temps: &mut temps,
             generated: Vec::new(),
             prefix: f.path.clone(),
             counter: 0,
+            top_level: true,
         };
         for stmt in &f.body {
             cx.stmt(stmt);
@@ -267,9 +293,9 @@ pub fn lower(hir: &Hir) -> Mir {
 
 /// Temporary names, counted across the whole program.
 ///
-/// A name is therefore never reused, so no two temporaries can ever be live at once
-/// under the same name and correctness needs no liveness analysis. Shrinking this is
-/// M9-7's job; until then the naive version is the one that is obviously right.
+/// A name is therefore never reused, so no two temporaries can be live at once under
+/// the same name and correctness needs no liveness analysis. Shrinking this is M9-7's
+/// job; until then the naive version is the one that is obviously right.
 #[derive(Debug, Default)]
 struct Temps(u32);
 
@@ -284,23 +310,213 @@ impl Temps {
     }
 }
 
-struct Lowering<'a> {
+/// State shared by every block of one program.
+struct Program<'a> {
+    functions: &'a [hir::Function],
+    /// Which strongly connected component each function belongs to. Two functions in
+    /// the same one can reach each other, so a call between them is recursive.
+    components: Vec<u32>,
+    temps: Temps,
+    /// Temporaries handed out in the function being lowered, in order.
+    used: Vec<Reg>,
+    /// Locals that have been given a value at this point in the lowering. A local
+    /// whose `let` has not run yet holds nothing, and reading it to save it would fail
+    /// the command — so it is not saved.
+    initialised: Vec<LocalId>,
+}
+
+impl Program<'_> {
+    fn same_component(&self, a: FnId, b: FnId) -> bool {
+        self.components[a.0 as usize] == self.components[b.0 as usize]
+    }
+}
+
+/// Tarjan's algorithm over the call graph.
+///
+/// A function is recursive exactly when something in its own component calls it, which
+/// covers direct and mutual recursion alike. Everything else pays nothing for frames.
+fn strongly_connected(hir: &Hir) -> Vec<u32> {
+    let n = hir.functions.len();
+    let edges: Vec<Vec<usize>> = hir
+        .functions
+        .iter()
+        .map(|f| {
+            let mut callees = Vec::new();
+            collect_calls(&f.body, &mut callees);
+            callees
+        })
+        .collect();
+
+    struct State {
+        index: Vec<Option<u32>>,
+        low: Vec<u32>,
+        on_stack: Vec<bool>,
+        stack: Vec<usize>,
+        next_index: u32,
+        component: Vec<u32>,
+        next_component: u32,
+    }
+
+    fn visit(v: usize, edges: &[Vec<usize>], st: &mut State) {
+        st.index[v] = Some(st.next_index);
+        st.low[v] = st.next_index;
+        st.next_index += 1;
+        st.stack.push(v);
+        st.on_stack[v] = true;
+        for &w in &edges[v] {
+            match st.index[w] {
+                None => {
+                    visit(w, edges, st);
+                    st.low[v] = st.low[v].min(st.low[w]);
+                }
+                Some(index) if st.on_stack[w] => st.low[v] = st.low[v].min(index),
+                Some(_) => {}
+            }
+        }
+        if st.low[v] == st.index[v].expect("visited") {
+            let id = st.next_component;
+            st.next_component += 1;
+            while let Some(w) = st.stack.pop() {
+                st.on_stack[w] = false;
+                st.component[w] = id;
+                if w == v {
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut st = State {
+        index: vec![None; n],
+        low: vec![0; n],
+        on_stack: vec![false; n],
+        stack: Vec::new(),
+        next_index: 0,
+        component: vec![0; n],
+        next_component: 0,
+    };
+    for v in 0..n {
+        if st.index[v].is_none() {
+            visit(v, &edges, &mut st);
+        }
+    }
+
+    // Tarjan gives every function a component; a function is only recursive when a
+    // call edge actually reaches it from its own component, and `same_component` is
+    // asked exactly at call edges, so nothing more is needed here.
+    let mut components = st.component;
+    for (v, callees) in edges.iter().enumerate() {
+        let alone = components.iter().filter(|c| **c == components[v]).count() == 1;
+        if alone && !callees.contains(&v) {
+            // Alone and not self-calling: give it a component nothing else can match,
+            // including itself via a call edge that does not exist.
+            components[v] = u32::MAX - v as u32;
+        }
+    }
+    components
+}
+
+fn collect_calls(stmts: &[hir::Stmt], out: &mut Vec<usize>) {
+    for stmt in stmts {
+        match stmt {
+            hir::Stmt::Let { value, .. } | hir::Stmt::Assign { value, .. } => calls_in(value, out),
+            hir::Stmt::Return {
+                value: Some(value), ..
+            } => calls_in(value, out),
+            hir::Stmt::CallFor { callee, args, .. } => {
+                out.push(callee.0 as usize);
+                for arg in args {
+                    calls_in(arg, out);
+                }
+            }
+            hir::Stmt::If {
+                cond,
+                then,
+                otherwise,
+                ..
+            } => {
+                calls_in(cond, out);
+                collect_calls(then, out);
+                if let Some(otherwise) = otherwise {
+                    collect_calls(otherwise, out);
+                }
+            }
+            hir::Stmt::Loop { cond, body, .. } => {
+                if let Some(cond) = cond {
+                    calls_in(cond, out);
+                }
+                collect_calls(body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn calls_in(expr: &hir::Expr, out: &mut Vec<usize>) {
+    match &expr.kind {
+        hir::ExprKind::Call { callee, args } => {
+            out.push(callee.0 as usize);
+            for arg in args {
+                calls_in(arg, out);
+            }
+        }
+        hir::ExprKind::Unary(_, operand) => calls_in(operand, out),
+        hir::ExprKind::Binary(_, lhs, rhs) => {
+            calls_in(lhs, out);
+            calls_in(rhs, out);
+        }
+        _ => {}
+    }
+}
+
+/// Whether evaluating this expression can do anything other than produce a value.
+/// Only calls can, and only they make short-circuiting observable.
+fn is_pure(expr: &hir::Expr) -> bool {
+    match &expr.kind {
+        hir::ExprKind::Call { .. } => false,
+        hir::ExprKind::Unary(_, operand) => is_pure(operand),
+        hir::ExprKind::Binary(_, lhs, rhs) => is_pure(lhs) && is_pure(rhs),
+        _ => true,
+    }
+}
+
+fn local_reg(function: &hir::Function, local: LocalId) -> Reg {
+    Reg {
+        // Qualified by function so two functions' locals cannot collide.
+        holder: format!(
+            "${}.{}",
+            function.name, function.locals[local.0 as usize].name
+        ),
+        kind: RegKind::Var,
+    }
+}
+
+fn param_reg(function: &hir::Function, local: LocalId) -> Reg {
+    local_reg(function, local)
+}
+
+struct Lowering<'a, 'p> {
     function: &'a hir::Function,
+    program: &'a mut Program<'p>,
     insts: Vec<Inst>,
-    temps: &'a mut Temps,
     /// Functions split out of this one. Named under `prefix`, so the output stays
     /// walkable (requirements section 12.2).
     generated: Vec<Function>,
     prefix: String,
     counter: u32,
+    /// A plain `return` only reaches the caller from the function's own top level.
+    top_level: bool,
 }
 
-impl Lowering<'_> {
+impl<'p> Lowering<'_, 'p> {
     fn stmt(&mut self, stmt: &hir::Stmt) {
         match stmt {
             hir::Stmt::Break(_) => self.jump(CTL_BREAK),
             hir::Stmt::Continue(_) => self.jump(CTL_CONTINUE),
-            hir::Stmt::Return(_) => self.jump(CTL_RETURN),
+            hir::Stmt::Return { value, .. } => self.return_stmt(value.as_ref()),
+            hir::Stmt::CallFor { callee, args, .. } => {
+                self.call(*callee, args, false);
+            }
             hir::Stmt::If {
                 cond,
                 then,
@@ -316,6 +532,9 @@ impl Lowering<'_> {
             hir::Stmt::Let { local, value, .. } => {
                 let dst = self.local(*local);
                 self.store(dst, None, value);
+                // Only now: a call inside `value` must not try to save this local,
+                // which has nothing in it yet.
+                self.program.initialised.push(*local);
             }
             hir::Stmt::Assign {
                 local, op, value, ..
@@ -385,6 +604,37 @@ impl Lowering<'_> {
         }
     }
 
+    /// `return` from a generated block cannot reach the caller by itself: mcfunction's
+    /// `return` only leaves the function it is written in. So a nested `return` parks
+    /// its value in `$<fn>.ret`, raises the control register, and lets the propagation
+    /// guards carry it out to the top, where it becomes a real return.
+    fn return_stmt(&mut self, value: Option<&hir::Expr>) {
+        let value = value.map(|expr| self.expr(expr));
+        if self.top_level {
+            match value {
+                // `return` takes an integer literal, so a constant needs no help.
+                Some(Value::Const(n)) => self.insts.push(Inst::Return { value: n }),
+                Some(Value::Reg(src)) => self.insts.push(Inst::ReturnRun {
+                    inst: Box::new(Inst::Get { src }),
+                }),
+                None => self.insts.push(Inst::Return { value: 0 }),
+            }
+            return;
+        }
+        if let Some(value) = value {
+            let ret = self.ret_reg();
+            self.copy_into(ret, value);
+        }
+        self.jump(CTL_RETURN);
+    }
+
+    fn ret_reg(&self) -> Reg {
+        Reg {
+            holder: format!("${}.ret", self.function.name),
+            kind: RegKind::Var,
+        }
+    }
+
     /// `break`, `continue` and `return` all leave the same way: record why in the
     /// control register, then return. Only `return` survives past the enclosing loop.
     fn jump(&mut self, code: i32) {
@@ -449,14 +699,7 @@ impl Lowering<'_> {
         let path = format!("{}/{name}_{}", self.prefix, self.counter);
         self.counter += 1;
 
-        let mut inner = Lowering {
-            function: self.function,
-            insts: Vec::new(),
-            temps: self.temps,
-            generated: Vec::new(),
-            prefix: path.clone(),
-            counter: 0,
-        };
+        let mut inner = self.child(path.clone());
         if let Some(cond) = cond {
             let cond = inner.cond(cond);
             inner.insts.push(Inst::Guarded {
@@ -477,19 +720,8 @@ impl Lowering<'_> {
             }
         }
         inner.insts.push(Inst::Call { path: path.clone() });
-
-        let generated = std::mem::take(&mut inner.generated);
-        let insts = std::mem::take(&mut inner.insts);
-        self.generated.push(Function {
-            id: self.function.id,
-            path: path.clone(),
-            attrs: Vec::new(),
-            blocks: vec![Block {
-                id: BlockId(0),
-                insts,
-            }],
-        });
-        self.generated.extend(generated);
+        let (insts, generated) = inner.finish();
+        self.record(path.clone(), insts, generated);
 
         self.insts.push(Inst::Call { path });
         if escaping.breaks {
@@ -500,47 +732,69 @@ impl Lowering<'_> {
         }
     }
 
+    /// Splits an expression into its own function, evaluated into `dst`. Used for the
+    /// right-hand side of a short-circuiting operator.
+    fn split_expr(&mut self, kind: &str, dst: Reg, expr: &hir::Expr) -> String {
+        let path = format!("{}/{kind}_{}", self.prefix, self.counter);
+        self.counter += 1;
+        let mut inner = self.child(path.clone());
+        let value = inner.expr(expr);
+        inner.copy_into(dst, value);
+        let (insts, generated) = inner.finish();
+        self.record(path.clone(), insts, generated);
+        path
+    }
+
     /// Splits a statement list into its own function and returns its path.
     fn split(&mut self, kind: &str, stmts: &[hir::Stmt]) -> String {
         let path = format!("{}/{kind}_{}", self.prefix, self.counter);
         self.counter += 1;
-        let mut inner = Lowering {
-            function: self.function,
-            insts: Vec::new(),
-            temps: self.temps,
-            generated: Vec::new(),
-            prefix: path.clone(),
-            counter: 0,
-        };
+        let mut inner = self.child(path.clone());
         for stmt in stmts {
             inner.stmt(stmt);
         }
-        let generated = std::mem::take(&mut inner.generated);
-        let insts = std::mem::take(&mut inner.insts);
-        self.generated.push(Function {
-            id: self.function.id,
-            path: path.clone(),
-            attrs: Vec::new(),
-            blocks: vec![Block {
-                id: BlockId(0),
-                insts,
-            }],
-        });
-        self.generated.extend(generated);
+        let (insts, generated) = inner.finish();
+        self.record(path.clone(), insts, generated);
         path
     }
 
-    /// `execute if score $ctl matches 1.. run return 0` — hand the transfer upwards.
+    /// Hands a control transfer upwards.
+    ///
+    /// Inside a generated block that means returning so the parent's own guard sees
+    /// it. At a function's top level there is nowhere left to pass it to, so a pending
+    /// `return` becomes the real one, carrying the value out of `$<fn>.ret`.
     fn propagate(&mut self) {
         let ctl = self.ctl();
+        if !self.top_level {
+            self.insts.push(Inst::Guarded {
+                cond: Cond::Matches {
+                    src: ctl,
+                    min: Some(CTL_BREAK),
+                    max: None,
+                    negated: false,
+                },
+                inst: Box::new(Inst::Return { value: 0 }),
+            });
+            return;
+        }
+        // `break` and `continue` cannot reach here: HIR rejects them outside a loop,
+        // and a loop consumes its own. Only a `return` is left.
+        let inst = match self.function.ret {
+            Some(_) => Inst::ReturnRun {
+                inst: Box::new(Inst::Get {
+                    src: self.ret_reg(),
+                }),
+            },
+            None => Inst::Return { value: 0 },
+        };
         self.insts.push(Inst::Guarded {
             cond: Cond::Matches {
                 src: ctl,
-                min: Some(CTL_BREAK),
-                max: None,
+                min: Some(CTL_RETURN),
+                max: Some(CTL_RETURN),
                 negated: false,
             },
-            inst: Box::new(Inst::Return { value: 0 }),
+            inst: Box::new(inst),
         });
     }
 
@@ -569,6 +823,73 @@ impl Lowering<'_> {
     }
 
     /// A condition, written straight into the `execute` where possible.
+    /// Emits a call, returning where its result landed when one was wanted.
+    fn call(&mut self, callee: FnId, args: &[hir::Expr], want_result: bool) -> Option<Reg> {
+        let recursive = self.program.same_component(self.function.id, callee);
+        let callee_fn = &self.program.functions[callee.0 as usize];
+
+        // Arguments are evaluated before anything is saved: they are expressions in
+        // the caller's frame and must be read while that frame is still intact.
+        let values: Vec<Value> = args.iter().map(|arg| self.expr(arg)).collect();
+
+        let saved = if recursive {
+            let saved = self.live_registers();
+            self.insts.push(Inst::PushFrame);
+            for (slot, reg) in saved.iter().enumerate() {
+                self.insts.push(Inst::Save {
+                    reg: reg.clone(),
+                    slot: slot as u32,
+                });
+            }
+            saved
+        } else {
+            Vec::new()
+        };
+
+        for (value, param) in values.into_iter().zip(&callee_fn.params) {
+            let dst = param_reg(callee_fn, *param);
+            self.copy_into(dst, value);
+        }
+
+        let call = Inst::Call {
+            path: callee_fn.path.clone(),
+        };
+        // Allocated after the saves, so restoring cannot clobber it.
+        let result = want_result.then(|| self.program.temps.next());
+        match &result {
+            Some(dst) => self.insts.push(Inst::StoreResult {
+                dst: dst.clone(),
+                inst: Box::new(call),
+            }),
+            None => self.insts.push(call),
+        }
+
+        if recursive {
+            for (slot, reg) in saved.iter().enumerate() {
+                self.insts.push(Inst::Restore {
+                    reg: reg.clone(),
+                    slot: slot as u32,
+                });
+            }
+            self.insts.push(Inst::PopFrame);
+        }
+        result
+    }
+
+    /// Everything this function might still need after a call comes back.
+    ///
+    /// Every local, plus every temporary handed out so far. Narrowing this to what is
+    /// actually live is M9-7's liveness analysis; until then the set that is obviously
+    /// sufficient is the right one.
+    fn live_registers(&self) -> Vec<Reg> {
+        let locals = self
+            .program
+            .initialised
+            .iter()
+            .map(|local| local_reg(self.function, *local));
+        locals.chain(self.program.used.iter().cloned()).collect()
+    }
+
     fn cond(&mut self, expr: &hir::Expr) -> Cond {
         match &expr.kind {
             hir::ExprKind::Unary(UnaryOp::Not, inner) => self.cond(inner).negate(),
@@ -623,6 +944,9 @@ impl Lowering<'_> {
             hir::ExprKind::Local(local) => Value::Reg(self.local(*local)),
             hir::ExprKind::Unary(op, operand) => self.unary(*op, operand),
             hir::ExprKind::Binary(op, lhs, rhs) => self.binary(*op, lhs, rhs),
+            hir::ExprKind::Call { callee, args } => {
+                Value::Reg(self.call(*callee, args, true).expect("a value was wanted"))
+            }
         }
     }
 
@@ -630,7 +954,7 @@ impl Lowering<'_> {
         let value = self.expr(operand);
         match op {
             UnaryOp::Neg => {
-                let dst = self.temps.next();
+                let dst = self.temps_next();
                 self.insts.push(Inst::Const {
                     dst: dst.clone(),
                     value: 0,
@@ -645,7 +969,7 @@ impl Lowering<'_> {
             }
             UnaryOp::Not => {
                 let src = self.materialise(value);
-                let dst = self.temps.next();
+                let dst = self.temps_next();
                 self.insts.push(Inst::Matches {
                     dst: dst.clone(),
                     src,
@@ -662,10 +986,30 @@ impl Lowering<'_> {
         use BinaryOp::*;
         let is_bool = lhs.ty == Type::Bool;
         match op {
+            And | Or if !is_pure(rhs) => {
+                // Spec section 6.14. With a call on the right, short-circuiting is
+                // observable, so it has to actually happen.
+                let lhs = self.expr(lhs);
+                let dst = self.temps_next();
+                self.copy_into(dst.clone(), lhs);
+                let wanted = if op == And { 1 } else { 0 };
+                let name = if op == And { "and" } else { "or" };
+                let path = self.split_expr(name, dst.clone(), rhs);
+                self.insts.push(Inst::Guarded {
+                    cond: Cond::Matches {
+                        src: dst.clone(),
+                        min: Some(wanted),
+                        max: Some(wanted),
+                        negated: false,
+                    },
+                    inst: Box::new(Inst::Call { path }),
+                });
+                Value::Reg(dst)
+            }
             Add | Sub | Mul | Div | Rem | And | Or => {
                 let lhs = self.expr(lhs);
                 let rhs = self.expr(rhs);
-                let dst = self.temps.next();
+                let dst = self.temps_next();
                 self.copy_into(dst.clone(), lhs);
                 match (op, &rhs) {
                     (Add, Value::Const(n)) => self.insts.push(Inst::AddConst {
@@ -691,7 +1035,7 @@ impl Lowering<'_> {
                 let _ = is_bool;
                 let lhs = self.expr(lhs);
                 let rhs = self.expr(rhs);
-                let dst = self.temps.next();
+                let dst = self.temps_next();
                 self.compare_into(dst.clone(), op, lhs, rhs);
                 Value::Reg(dst)
             }
@@ -751,7 +1095,7 @@ impl Lowering<'_> {
         match value {
             Value::Reg(reg) => reg,
             Value::Const(n) => {
-                let dst = self.temps.next();
+                let dst = self.temps_next();
                 self.insts.push(Inst::Const {
                     dst: dst.clone(),
                     value: n,
@@ -762,13 +1106,44 @@ impl Lowering<'_> {
     }
 
     fn local(&self, local: LocalId) -> Reg {
-        let name = &self.function.locals[local.0 as usize].name;
-        Reg {
-            // Qualified by function so that two functions' locals cannot collide once
-            // calls exist (M4).
-            holder: format!("${}.{name}", self.function.name),
-            kind: RegKind::Var,
+        local_reg(self.function, local)
+    }
+
+    fn temps_next(&mut self) -> Reg {
+        let reg = self.program.temps.next();
+        self.program.used.push(reg.clone());
+        reg
+    }
+
+    /// A lowering context for a block split out of this one.
+    fn child(&mut self, prefix: String) -> Lowering<'_, 'p> {
+        Lowering {
+            function: self.function,
+            program: self.program,
+            insts: Vec::new(),
+            generated: Vec::new(),
+            prefix,
+            counter: 0,
+            top_level: false,
         }
+    }
+
+    /// Consumes a child context, releasing its borrow of the shared state.
+    fn finish(self) -> (Vec<Inst>, Vec<Function>) {
+        (self.insts, self.generated)
+    }
+
+    fn record(&mut self, path: String, insts: Vec<Inst>, generated: Vec<Function>) {
+        self.generated.push(Function {
+            id: self.function.id,
+            path,
+            attrs: Vec::new(),
+            blocks: vec![Block {
+                id: BlockId(0),
+                insts,
+            }],
+        });
+        self.generated.extend(generated);
     }
 }
 

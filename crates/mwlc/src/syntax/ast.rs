@@ -29,7 +29,16 @@ pub enum ItemKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FnItem {
     pub name: Ident,
+    pub params: Vec<Param>,
+    pub ret: Option<TypeName>,
     pub body: Block,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Param {
+    pub name: Ident,
+    pub ty: TypeName,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +56,10 @@ pub enum Stmt {
     Loop(LoopStmt),
     Break(Span),
     Continue(Span),
-    Return(Span),
+    Return {
+        value: Option<Expr>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,7 +110,15 @@ pub enum Expr {
     Unary(UnaryExpr),
     Binary(BinaryExpr),
     Assign(AssignExpr),
+    Call(CallExpr),
     Macro(MacroCall),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallExpr {
+    pub callee: Ident,
+    pub args: Vec<Expr>,
+    pub span: Span,
 }
 
 impl Expr {
@@ -110,6 +130,7 @@ impl Expr {
             Expr::Unary(e) => e.span,
             Expr::Binary(e) => e.span,
             Expr::Assign(e) => e.span,
+            Expr::Call(e) => e.span,
             Expr::Macro(e) => e.span,
         }
     }
