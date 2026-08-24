@@ -16,3 +16,4 @@ pub mod hir;
 pub mod mir;
 pub mod schema;
 pub mod syntax;
+pub mod toolchain;

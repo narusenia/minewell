@@ -57,6 +57,10 @@ pub enum BuildError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Source(#[from] Report),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Toolchain(#[from] crate::toolchain::Error),
 }
 
 /// Where a project's crate root lives.
@@ -76,7 +80,20 @@ pub fn build(root: &Path, profile: Profile) -> Result<Datapack, BuildError> {
     let path = root.join(ROOT_SOURCE);
     let text = read(&path)?;
 
+    // Without a toolchain the compiler simply does not know the command set, so
+    // command calls are an error and `pack_format` falls back. `raw!` still works, so
+    // a project that never calls a command needs no toolchain at all.
+    let toolchain = match &manifest.package.toolchain {
+        Some(version) => Some(crate::toolchain::Toolchains::default().load(version)?),
+        None => None,
+    };
+
     let options = Options {
+        pack_format: toolchain
+            .as_ref()
+            .map_or(crate::emit::PLACEHOLDER_PACK_FORMAT, |t| {
+                t.metadata.pack_format
+            }),
         description: manifest
             .package
             .description
@@ -87,9 +104,13 @@ pub fn build(root: &Path, profile: Profile) -> Result<Datapack, BuildError> {
             path: path.display().to_string(),
             text: text.clone(),
         }),
-        ..Options::default()
     };
-    Ok(compile(&text, manifest.package.namespace(), &options)?)
+    Ok(compile_with(
+        &text,
+        manifest.package.namespace(),
+        &options,
+        toolchain.as_ref().map(|t| &t.schema),
+    )?)
 }
 
 /// Source text to datapack, touching nothing outside memory.

@@ -364,12 +364,17 @@ JDK は M6（`toolchain build-from-jar`）で必要になった時点で `[tools
 - [x] **M6-5** `ResourceLocation` / `Pos` リテラル
   - `minecraft:stone` と `pos!(~ ~1 ~)`。どちらも `Selector` と同じくコンパイル時のみの型
   - 座標の記法混在（`~ ^ ~`）はエラー。registries による ID 検証は M6-6 の toolchain 側
-- [ ] **M6-6** toolchain の管理
-  - `~/.minewell/toolchains/<version>/`、`minewell.toml` の `toolchain` 指定、`pack_format` の反映
-  - 先に書くテスト: 指定バージョンの toolchain 未インストール時のエラーメッセージ
-- [ ] **M6-7** `mwl toolchain install` / `list` / `build-from-jar`
-  - Releases からの取得、チェックサム検証
-  - 先に書くテスト: ダウンロードをモックした install の成功パス
+- [x] **M6-6** toolchain の管理
+  - `~/.minewell/toolchains/<version>/`（`MINEWELL_HOME` で変更可）。`pack_format` が反映される
+  - **`toolchain` は省略できる。** 省略時は暫定 pack_format + コマンド呼び出し不可、`raw!` は使える
+  - **コマンド表をコンパイラに埋め込まない。** 埋め込めば「版非依存のコンパイラ」が嘘になる
+  - ルートを値として渡す設計（環境変数を関数内で読まない）。テストが並列でも競合しない
+- [x] **M6-7** `mwl toolchain list` / `add`
+  - **計画変更:** `install`（Releases からの取得）は X-2 が Release を公開してから。
+    取得先が存在しないうちに HTTP クライアントを足しても検証できない
+  - `build-from-jar` の代わりに `add <version> <commands.json> --pack-format <n>`。
+    data generator の実行はコンパイラの外に置く — データパック作者の多くはサーバ運営者ではなく、
+    コンパイルに JVM を要求するのは筋が悪い。usage に生成コマンドを書いてある
 - [ ] **M6-8** `data/` パススルーと ID 存在検査（§13）
   - 手書き JSON のコピー、`.mwl` から参照した ID の存在確認
   - 先に書くテスト: 存在しない predicate を参照するとコンパイルエラーになること
