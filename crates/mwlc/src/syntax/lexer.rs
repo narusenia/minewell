@@ -8,6 +8,8 @@
 //! Lexing never stops at the first problem. Errors are collected and the scan
 //! continues, so one stray character does not hide the rest of the file.
 
+use super::SyntaxError;
+
 /// A byte range in the source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
@@ -214,13 +216,7 @@ const PUNCTUATION: &[(&str, Punct)] = &[
     ("}", Punct::RBrace),
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LexError {
-    pub span: Span,
-    pub message: String,
-}
-
-pub fn lex(src: &str) -> (Vec<Token>, Vec<LexError>) {
+pub fn lex(src: &str) -> (Vec<Token>, Vec<SyntaxError>) {
     Lexer {
         src,
         at: src.strip_prefix('\u{feff}').map_or(0, |_| 3),
@@ -234,11 +230,11 @@ struct Lexer<'a> {
     src: &'a str,
     at: usize,
     tokens: Vec<Token>,
-    errors: Vec<LexError>,
+    errors: Vec<SyntaxError>,
 }
 
 impl<'a> Lexer<'a> {
-    fn run(mut self) -> (Vec<Token>, Vec<LexError>) {
+    fn run(mut self) -> (Vec<Token>, Vec<SyntaxError>) {
         while self.skip_trivia() {
             let start = self.at;
             match self.token(start) {
@@ -526,13 +522,13 @@ impl<'a> Lexer<'a> {
     }
 
     fn error(&mut self, start: usize, message: String) {
-        self.errors.push(LexError {
-            span: Span {
+        self.errors.push(SyntaxError::new(
+            Span {
                 start,
                 end: self.at,
             },
             message,
-        });
+        ));
     }
 }
 
@@ -556,7 +552,7 @@ mod tests {
         tokens.into_iter().map(|t| t.kind).collect()
     }
 
-    fn errors(src: &str) -> Vec<LexError> {
+    fn errors(src: &str) -> Vec<SyntaxError> {
         lex(src).1
     }
 
