@@ -1,0 +1,6 @@
+# Renames for the commands whose generated names nobody would type.
+# Only the name changes; the signature comes from commands.json either way.
+
+[rename]
+playsound_master = "play_sound"
+data_merge_entity = "merge_entity"

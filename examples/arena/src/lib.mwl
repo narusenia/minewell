@@ -1,0 +1,133 @@
+// The whole language in one datapack.
+//
+// Every tick this looks at the zombies nearby, seals the first few of them under a
+// block, works out how bad things are, and reacts. It uses the pieces the other
+// examples show one at a time: `struct` and `enum` in storage, `match`, `Vec`,
+// `impl` with borrowed receivers, execution contexts, and real commands from the
+// toolchain in `../toolchains/1.21.4`.
+//
+// Two things are worth watching in the output (`target/datapack`):
+//
+// - `arena:tally/note_tick_seen` and friends. A borrowed parameter is compiled once
+//   per place it is called on, so `seen.note()` writes straight into the caller's
+//   compound. No arguments are marshalled, and no commands are spent on the call
+//   beyond the call itself.
+// - `arena:tick/for_0`. The `for` body is one function, run once per entity by a
+//   single `execute as`. What it costs is one function call per zombie, not one per
+//   zombie per statement.
+
+/// How crowded the arena is. A tagged compound in storage: `{tag:"Rising",seen:3}`.
+enum Threat {
+    Calm,
+    Rising { seen: i32 },
+    Swarm,
+}
+
+/// What this tick found. The tags matter: vanilla treats `Byte(1)` and `Int(1)` as
+/// different values, and ignores data written with the wrong one without a word.
+struct Tally {
+    #[nbt(short)]
+    seen: i32,
+    #[nbt(byte)]
+    sealed: i32,
+    #[nbt(rename = "Alerted")]
+    alerted: bool,
+}
+
+impl Tally {
+    /// `&mut self` borrows the caller's compound; nothing is copied back.
+    fn note(&mut self) {
+        self.seen += 1;
+    }
+
+    fn sealed_one(&mut self) {
+        self.sealed += 1;
+    }
+
+    fn quiet(&self) -> bool {
+        return self.seen == 0;
+    }
+}
+
+/// A struct cannot be returned — vanilla's function return is a single number — so the
+/// answer comes back through a `&mut` parameter. That is what compile-time references
+/// are for: the write lands directly in the caller's storage.
+fn classify(tally: &Tally, out: &mut Threat) {
+    if tally.quiet() {
+        out = Threat::Calm;
+        return;
+    }
+    if tally.seen >= 6 {
+        out = Threat::Swarm;
+        return;
+    }
+    out = Threat::Rising { seen: tally.seen };
+}
+
+/// Generic, and monomorphised per element type: `total_i32` is the only instance this
+/// pack contains, because it is the only one anything asks for.
+fn total<T>(v: Vec<T>) -> i32 {
+    return v.len();
+}
+
+/// `#[ctx(entity)]` says this needs an executor. Calling it without one is a compile
+/// error — in vanilla it would run, do nothing, and say nothing.
+#[ctx(entity)]
+fn seal() {
+    // `~ ~2 ~` is relative to the position the caller is `at`, and is known while
+    // compiling, so it costs nothing to pass.
+    setblock(pos!(~ ~2 ~), minecraft:stone);
+    merge_entity(@s, "{Glowing:1b}");
+}
+
+#[tick]
+fn tick() {
+    let mut seen = Tally {
+        seen: 0,
+        sealed: 0,
+        alerted: false,
+    };
+
+    // One `execute as` for the whole block: the body is a function, run once per
+    // entity the selector finds. The position does not move with it — `at @s` is
+    // written where it is wanted, never implied.
+    for z in @e[type=zombie, distance=..12] {
+        seen.note();
+
+        if seen.sealed >= 3 {
+            continue;
+        }
+        at @s {
+            seal();
+        }
+        seen.sealed_one();
+    }
+
+    let mut threat = Threat::Calm;
+    classify(&seen, &mut threat);
+
+    // Exactly one arm runs: the compiler copies the value aside before testing, so an
+    // arm that moves the state on cannot make the arm below it run as well.
+    match threat {
+        Threat::Calm => {}
+        Threat::Rising { seen } => {
+            if seen >= 3 {
+                play_sound(minecraft:block.note_block.pling, @a);
+            }
+        }
+        Threat::Swarm => {
+            play_sound(minecraft:entity.wither.spawn, @a);
+            tellraw(@a, "{\"text\":\"the arena is swarming\",\"color\":\"red\"}");
+        }
+    }
+}
+
+#[load]
+fn setup() {
+    // A list literal is one `data modify ... set value`, whatever its length.
+    let rewards = [1, 2, 3];
+    let count = total(rewards);
+    if count == 3 {
+        say("arena online");
+    }
+}

@@ -1,0 +1,5 @@
+[package]
+name = "arena"
+namespace = "arena"
+description = "A worked example: composite types, commands and contexts together"
+toolchain = "1.21.4"
