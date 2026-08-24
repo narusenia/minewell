@@ -14,6 +14,9 @@ pub mod path;
 pub mod snbt;
 pub mod world;
 
+pub use interp::{Effect, Interpreter, Outcome, Report};
+pub use world::World;
+
 /// A hard failure: vanilla would reject the command outright and print red text.
 ///
 /// This is not the same as a command that merely does nothing. Commands that
