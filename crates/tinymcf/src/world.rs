@@ -14,6 +14,18 @@ use crate::nbt::NbtValue;
 pub struct World {
     pub scoreboard: Scoreboard,
     storage: BTreeMap<String, NbtValue>,
+    entities: BTreeMap<String, Entity>,
+    /// What each selector text finds. There is no world to search, so the harness
+    /// says. An unbound selector finds nothing, which is honest: nothing is there.
+    selectors: BTreeMap<String, Vec<String>>,
+}
+
+/// A stub entity. Enough to be an executor and to stand at a position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entity {
+    pub id: String,
+    pub pos: [f64; 3],
+    pub nbt: NbtValue,
 }
 
 impl World {
@@ -23,6 +35,39 @@ impl World {
         static EMPTY: std::sync::LazyLock<NbtValue> =
             std::sync::LazyLock::new(|| NbtValue::Compound(Default::default()));
         self.storage.get(namespace).unwrap_or(&EMPTY)
+    }
+
+    /// Declares an entity the harness can then bind selectors to.
+    pub fn spawn(&mut self, id: &str, pos: [f64; 3]) -> &mut Entity {
+        self.entities.entry(id.to_owned()).or_insert(Entity {
+            id: id.to_owned(),
+            pos,
+            nbt: NbtValue::Compound(Default::default()),
+        })
+    }
+
+    /// Declares what a selector text finds, in order.
+    pub fn bind_selector<I, S>(&mut self, selector: &str, ids: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.selectors.insert(
+            selector.to_owned(),
+            ids.into_iter().map(Into::into).collect(),
+        );
+    }
+
+    pub fn entity(&self, id: &str) -> Option<&Entity> {
+        self.entities.get(id)
+    }
+
+    /// The entities a selector finds. `@s` is the executor and needs no binding.
+    pub fn resolve(&self, selector: &str, executor: Option<&str>) -> Vec<String> {
+        if selector == "@s" {
+            return executor.map(|id| vec![id.to_owned()]).unwrap_or_default();
+        }
+        self.selectors.get(selector).cloned().unwrap_or_default()
     }
 
     pub fn storage_mut(&mut self, namespace: &str) -> &mut NbtValue {

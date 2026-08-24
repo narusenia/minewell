@@ -205,6 +205,19 @@ pub struct Report {
 pub struct Effect {
     pub name: String,
     pub args: String,
+    /// Who it ran as, if anyone. Lets a test assert not just that something happened
+    /// but who it happened for.
+    pub executor: Option<String>,
+}
+
+/// What a command runs in: an executor and a position.
+///
+/// The dimension and rotation vanilla also carries are absent because nothing here
+/// reads them yet.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Context {
+    pub executor: Option<String>,
+    pub pos: [f64; 3],
 }
 
 /// One line of a loaded function.
@@ -240,6 +253,8 @@ pub struct Interpreter {
     pub max_call_depth: usize,
     /// Commands outside the modelled subset, in the order they ran.
     pub effects: Vec<Effect>,
+    /// What the command currently running runs in.
+    pub context: Context,
     functions: BTreeMap<String, Rc<Vec<Line>>>,
     /// The functions currently executing. Empty at the top level, where `return` is an
     /// error and commands are charged to no function.
@@ -258,6 +273,7 @@ impl Default for Interpreter {
             commands_run: 0,
             max_call_depth: DEFAULT_MAX_DEPTH,
             effects: Vec::new(),
+            context: Context::default(),
             functions: BTreeMap::new(),
             stack: Vec::new(),
             per_function: BTreeMap::new(),
@@ -406,6 +422,7 @@ impl Interpreter {
                 self.effects.push(Effect {
                     name: name.clone(),
                     args: args.clone(),
+                    executor: self.context.executor.clone(),
                 });
                 Flow::Next(Outcome::ok(1))
             }
@@ -427,42 +444,67 @@ impl Interpreter {
     }
 
     fn execute(&mut self, cmd: &Execute) -> Flow {
-        let mut passed = true;
+        // Vanilla threads a *list* of contexts through the clauses: `as` and `at` fork
+        // it, conditions filter it, and the command runs once per survivor.
+        let mut contexts = vec![self.context.clone()];
         let mut stores = Vec::new();
+
         for clause in &cmd.clauses {
             match clause {
                 Clause::Store { success, into } => stores.push((*success, into)),
-                Clause::Cond { negated, cond } => {
-                    match self.condition(cond) {
-                        // A deferred clause is not a false condition; nothing about
-                        // this command can be trusted, so stop rather than pretend.
-                        None => return Flow::Next(Outcome::FAILED),
-                        Some(held) => passed &= held != *negated,
-                    }
-                }
                 Clause::Deferred(name) => {
                     return Flow::Next(self.fail(deferred(name)));
+                }
+                Clause::As(selector) => {
+                    contexts = contexts
+                        .into_iter()
+                        .flat_map(|ctx| {
+                            self.world
+                                .resolve(selector, ctx.executor.as_deref())
+                                .into_iter()
+                                .map(move |id| Context {
+                                    executor: Some(id),
+                                    ..ctx.clone()
+                                })
+                        })
+                        .collect();
+                }
+                Clause::At(selector) => {
+                    contexts = contexts
+                        .into_iter()
+                        .flat_map(|ctx| {
+                            let world = &self.world;
+                            world
+                                .resolve(selector, ctx.executor.as_deref())
+                                .into_iter()
+                                .filter_map(|id| world.entity(&id).map(|e| e.pos))
+                                .map(move |pos| Context { pos, ..ctx.clone() })
+                                .collect::<Vec<_>>()
+                        })
+                        .collect();
+                }
+                Clause::Cond { negated, cond } => {
+                    let mut kept = Vec::new();
+                    for ctx in contexts {
+                        let outer = std::mem::replace(&mut self.context, ctx.clone());
+                        let held = self.condition(cond);
+                        self.context = outer;
+                        match held {
+                            // A deferred condition is not a false one: nothing about
+                            // this command can be trusted, so stop rather than guess.
+                            None => return Flow::Next(Outcome::FAILED),
+                            Some(held) if held != *negated => kept.push(ctx),
+                            Some(_) => {}
+                        }
+                    }
+                    contexts = kept;
                 }
             }
         }
 
-        let (outcome, flow) = if !passed {
-            (Outcome::FAILED, None)
-        } else {
-            match &cmd.run {
-                // The bare conditional form reports the conditions themselves.
-                None => (Outcome::ok(1), None),
-                Some(command) => match self.step(command) {
-                    Flow::Next(outcome) => (outcome, None),
-                    // `run return ...` returns from the enclosing function, so the
-                    // stores below still have to happen first.
-                    Flow::Return(outcome) => (outcome, Some(outcome)),
-                    Flow::Halt => return Flow::Halt,
-                },
-            }
-        };
+        let (outcome, flow) = self.run_in(contexts, cmd);
 
-        // Stores fire even when a condition blocked the command, writing 0.
+        // Stores fire even when nothing matched, writing 0.
         for (success, into) in stores {
             self.store(success, into, outcome);
         }
@@ -470,6 +512,55 @@ impl Interpreter {
             Some(outcome) => Flow::Return(outcome),
             None => Flow::Next(outcome),
         }
+    }
+
+    /// Runs the command once per context, accumulating success as vanilla does.
+    fn run_in(&mut self, contexts: Vec<Context>, cmd: &Execute) -> (Outcome, Option<Outcome>) {
+        let Some(command) = &cmd.run else {
+            // The bare conditional form reports how many contexts survived.
+            let success = contexts.len() as u32;
+            return (
+                Outcome {
+                    success,
+                    result: success as i32,
+                },
+                None,
+            );
+        };
+
+        let outer = self.context.clone();
+        let mut total = 0u32;
+        let mut result = 0;
+        let mut flow = None;
+        for ctx in contexts {
+            self.context = ctx;
+            match self.step(command) {
+                Flow::Next(outcome) => {
+                    total += outcome.success;
+                    result = outcome.result;
+                }
+                // `run return ...` leaves the enclosing function, so the remaining
+                // contexts do not get their turn.
+                Flow::Return(outcome) => {
+                    total += outcome.success;
+                    result = outcome.result;
+                    flow = Some(outcome);
+                    break;
+                }
+                Flow::Halt => {
+                    self.context = outer;
+                    return (Outcome::FAILED, None);
+                }
+            }
+        }
+        self.context = outer;
+        (
+            Outcome {
+                success: total,
+                result,
+            },
+            flow,
+        )
     }
 
     /// `None` when the condition is one of the deferred kinds.
@@ -511,6 +602,12 @@ impl Interpreter {
                         }
                     }
                 })
+            }
+            Condition::Entity(selector) => {
+                let found = self
+                    .world
+                    .resolve(selector, self.context.executor.as_deref());
+                Some(!found.is_empty())
             }
             Condition::Data { target, path } => match self.read_target(target) {
                 Err(message) => {
@@ -1436,12 +1533,12 @@ mod execute_tests {
     }
 
     #[test]
-    fn the_entity_clauses_say_they_are_deferred_rather_than_doing_nothing() {
+    fn the_clauses_that_need_a_world_say_they_are_deferred() {
         let mut it = setup();
         for line in [
-            "execute as @e[type=zombie] run say hi",
-            "execute at @s run say hi",
-            "execute if entity @s run say hi",
+            "execute positioned 0 0 0 run say hi",
+            "execute in minecraft:overworld run say hi",
+            "execute if block 0 0 0 stone run say hi",
             "execute if predicate ns:p run say hi",
         ] {
             it.diagnostics.clear();
@@ -1559,11 +1656,13 @@ mod effect_tests {
             vec![
                 Effect {
                     name: "say".into(),
-                    args: "hello  world".into()
+                    args: "hello  world".into(),
+                    executor: None,
                 },
                 Effect {
                     name: "setblock".into(),
-                    args: "~ ~1 ~ minecraft:stone".into()
+                    args: "~ ~1 ~ minecraft:stone".into(),
+                    executor: None,
                 },
             ]
         );
@@ -1642,5 +1741,112 @@ mod measurement_tests {
         it.run_line("function ns:long");
         assert!(it.report().over_budget);
         assert_eq!(it.report().commands, 50);
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    fn zombies() -> Interpreter {
+        let mut it = Interpreter::default();
+        it.run_line("scoreboard objectives add obj dummy");
+        it.world.spawn("z1", [1.0, 64.0, 0.0]);
+        it.world.spawn("z2", [2.0, 64.0, 0.0]);
+        it.world.bind_selector("@e[type=zombie]", ["z1", "z2"]);
+        it
+    }
+
+    #[test]
+    fn as_runs_once_per_entity_and_binds_the_executor() {
+        let mut it = zombies();
+        let out = it.run_line("execute as @e[type=zombie] run say hi");
+        assert_eq!(out.success, 2);
+        assert_eq!(
+            it.effects
+                .iter()
+                .map(|e| e.executor.clone())
+                .collect::<Vec<_>>(),
+            vec![Some("z1".to_owned()), Some("z2".to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_unbound_selector_finds_nothing_and_runs_nothing() {
+        let mut it = zombies();
+        let out = it.run_line("execute as @e[type=creeper] run say hi");
+        assert_eq!(out, Outcome::FAILED);
+        assert!(it.effects.is_empty());
+    }
+
+    #[test]
+    fn at_moves_the_position_and_leaves_the_executor_alone() {
+        let mut it = zombies();
+        it.world.bind_selector("@e[type=zombie,limit=1]", ["z2"]);
+        it.run_line("execute at @e[type=zombie,limit=1] run say hi");
+        assert_eq!(
+            it.effects[0].executor, None,
+            "`at` does not change who runs it"
+        );
+    }
+
+    #[test]
+    fn as_then_at_uses_the_entity_just_bound() {
+        let mut it = zombies();
+        // `@s` needs no binding: it is whoever the enclosing `as` picked.
+        let out = it.run_line("execute as @e[type=zombie] at @s run say hi");
+        assert_eq!(out.success, 2);
+    }
+
+    #[test]
+    fn s_resolves_to_the_current_executor() {
+        let mut it = zombies();
+        it.run_line("execute as @e[type=zombie] run execute if entity @s run say hi");
+        assert_eq!(it.effects.len(), 2);
+    }
+
+    #[test]
+    fn if_entity_is_false_with_no_executor() {
+        let mut it = zombies();
+        let out = it.run_line("execute if entity @s run say hi");
+        assert_eq!(out, Outcome::FAILED);
+        assert!(it.effects.is_empty());
+    }
+
+    #[test]
+    fn a_condition_is_evaluated_once_per_context() {
+        let mut it = zombies();
+        it.world.bind_selector("@e[tag=chosen]", ["z2"]);
+        // Only the context whose executor is also `@e[tag=chosen]` survives... but
+        // `if entity` asks about the selector, not the executor, so both survive.
+        let out = it.run_line("execute as @e[type=zombie] if entity @e[tag=chosen] run say hi");
+        assert_eq!(out.success, 2);
+    }
+
+    #[test]
+    fn the_context_is_restored_afterwards() {
+        let mut it = zombies();
+        it.run_line("execute as @e[type=zombie] run say inner");
+        it.run_line("say outer");
+        assert_eq!(it.effects.last().unwrap().executor, None);
+    }
+
+    #[test]
+    fn the_still_deferred_clauses_name_themselves() {
+        let mut it = zombies();
+        for line in [
+            "execute positioned 0 0 0 run say hi",
+            "execute in minecraft:overworld run say hi",
+            "execute if block 0 0 0 stone run say hi",
+            "execute if predicate ns:p run say hi",
+        ] {
+            it.diagnostics.clear();
+            assert_eq!(it.run_line(line), Outcome::FAILED, "{line}");
+            assert!(
+                it.diagnostics.iter().any(|d| d.contains("M0-8b")),
+                "{line}: {:?}",
+                it.diagnostics
+            );
+        }
     }
 }

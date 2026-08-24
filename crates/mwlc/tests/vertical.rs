@@ -15,7 +15,8 @@ fn hello_world_goes_all_the_way_through() {
         mc.effects,
         vec![Effect {
             name: "say".into(),
-            args: "hi".into()
+            args: "hi".into(),
+            executor: None,
         }]
     );
 }

@@ -57,6 +57,10 @@ pub enum Clause {
         success: bool,
         into: StoreTarget,
     },
+    /// `as <selector>`: run once per entity found, as that entity.
+    As(String),
+    /// `at <selector>`: run once per entity found, at its position.
+    At(String),
     /// Parsed but not implemented; see `SPEC.md` §4.4.
     Deferred(String),
 }
@@ -72,6 +76,8 @@ pub enum Condition {
         target: Target,
         path: NbtPath,
     },
+    /// `entity <selector>`: does the selector find anything?
+    Entity(String),
     /// Parsed but not implemented; see `SPEC.md` §4.4.
     Deferred(String),
 }
@@ -382,10 +388,13 @@ fn clause(args: &mut Args) -> Result<Clause, ParseError> {
                 into: store_target(args)?,
             })
         }
-        // Everything that needs a world. Consumed so the rest of the line still parses.
-        "as" | "at" | "positioned" | "rotated" | "in" | "anchored" | "align" | "facing" | "on"
-        | "summon" => {
-            args.word()?;
+        "as" => Ok(Clause::As(args.word()?.to_owned())),
+        "at" => Ok(Clause::At(args.word()?.to_owned())),
+        // Everything else that needs a world. Their argument shapes differ and none of
+        // them run, so the rest of the line is swallowed whole rather than parsed into
+        // a form nothing will read.
+        "positioned" | "rotated" | "in" | "anchored" | "align" | "facing" | "on" | "summon" => {
+            args.rest();
             Ok(Clause::Deferred(word.to_owned()))
         }
         other => Err(unexpected(other)),
@@ -429,7 +438,8 @@ fn condition(args: &mut Args) -> Result<Condition, ParseError> {
             let path = args.path()?;
             Ok(Condition::Data { target, path })
         }
-        "entity" | "block" | "predicate" | "biome" | "blocks" | "dimension" | "loaded" => {
+        "entity" => Ok(Condition::Entity(args.word()?.to_owned())),
+        "block" | "predicate" | "biome" | "blocks" | "dimension" | "loaded" => {
             // Consumed whole, so the deferral is reported when it runs rather than as
             // a syntax error the caller cannot act on.
             args.rest();

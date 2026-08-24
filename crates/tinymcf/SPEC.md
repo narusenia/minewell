@@ -287,15 +287,37 @@ language. The stored number is `value × scale`, converted to the named tag; `by
 
 Nesting works: `run` takes a whole command, `execute` included.
 
-#### Deferred to M0-8b
+#### Context clauses — **done** for `as`, `at` and `if entity`
 
-`as`, `at`, `positioned`, `in`, `if entity`, `if block` and `if predicate` are **not
-implemented**. Each needs a stub registry mapping selector strings to entities the
-harness has declared, plus an execution context (executor, position, dimension), and
-that is a separate piece of design. Nothing before M5 of the compiler needs them, and
-M0's own acceptance test — factorial and Fibonacci in handwritten mcfunction — does
-not. They parse and fail with a diagnostic saying so, rather than silently doing
-nothing.
+```
+clause += as <selector> | at <selector>
+cond   += entity <selector>
+```
+
+There is no world (§1), so **the harness declares what a selector finds**:
+
+```rust
+world.spawn("zombie-1", [8.0, 64.0, 0.0]);
+world.bind_selector("@e[type=zombie]", ["zombie-1", "zombie-2"]);
+```
+
+A selector with no binding finds nothing. `@s` is the current executor and needs no
+binding.
+
+`as` and `at` **fork**: the rest of the execute runs once per entity found, and the
+command's success count is how many of those runs succeeded. `as` changes the executor
+and not the position; `at` changes the position and not the executor. An execute that
+finds no entities runs its command zero times and reports 0.
+
+Every logged side effect records the executor it ran as, so a test can assert not only
+that something happened but who it happened for.
+
+#### Still deferred
+
+`positioned`, `in`, `if block` and `if predicate` parse and fail with a diagnostic
+naming themselves. Nothing needs them yet: `positioned` and `in` want coordinate and
+dimension models, and the two conditions want a block and predicate registry. They will
+arrive with the first task that has a use for them.
 
 ### 4.5 Macro functions — **done**
 
