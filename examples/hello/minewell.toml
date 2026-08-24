@@ -1,0 +1,4 @@
+[package]
+name = "hello"
+namespace = "hello"
+description = "The smallest minewell datapack"

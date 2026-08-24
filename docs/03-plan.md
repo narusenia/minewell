@@ -492,8 +492,11 @@ JDK は M6（`toolchain build-from-jar`）で必要になった時点で `[tools
 - [ ] **X-4** ベンチマーク
   - 代表的なデータパック（raycast、状態機械、インベントリ操作）の生成コマンド数を追跡。M9 の最適化の根拠にする
 - [x] **X-5** README
-  - 目的・設計原則・リポジトリ構成・tinymcf の役割。M0 の途中で先行して用意した
-  - 動くサンプルの掲載は M5 完了時点（そこで初めて「使う価値のある道具」になる）
+  - README は M0 の途中で先行して用意
+  - `examples/` に 4 本（hello / burn-the-undead / countdown / recursion）。
+    M5 完了を待ったのは、それまでだと `raw!` だらけの見本になるため
+  - `tests/examples.rs` が全 example を debug と release の両方でビルドする。
+    コンパイルしなくなった見本は、無いより悪い
 
 ---
 

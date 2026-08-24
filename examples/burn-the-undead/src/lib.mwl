@@ -1,0 +1,33 @@
+// Why minewell exists, in one file.
+//
+// `ignite` needs an executor: `@s` means nothing without one. Saying so with
+// `#[ctx(entity)]` makes calling it from the wrong place a compile error instead of
+// a command that runs and silently does nothing.
+//
+// Try deleting the `for` block and calling `ignite()` directly from `tick` — the
+// compiler will tell you exactly what is missing and how to fix it. Vanilla would
+// have let you ship it.
+
+#[ctx(entity)]
+fn ignite() {
+    raw!("data merge entity @s {Fire: 100s}");
+}
+
+/// Everything the selector finds, once each. `z` stands for the current entity.
+#[tick]
+fn tick() {
+    let mut burnt = 0;
+
+    for z in @e[type=zombie, distance=..8] {
+        // Skip the ones already on fire, so the counter means something.
+        if burnt >= 4 {
+            break;
+        }
+        ignite();
+        burnt += 1;
+    }
+
+    if burnt > 0 {
+        raw!("playsound minecraft:entity.blaze.shoot master @a");
+    }
+}

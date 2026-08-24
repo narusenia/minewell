@@ -1,0 +1,30 @@
+// Control flow, and what it costs.
+//
+// A `while` with no `break` or `return` in it becomes one function: a guard, the
+// body, and a tail call. Nothing is spent on bookkeeping that the loop does not use —
+// add a `break` and the compiler starts emitting it, and not before.
+
+#[load]
+fn countdown() {
+    let mut n = 10;
+
+    while n > 0 {
+        n -= 1;
+
+        // Nothing interesting happens on the odd ticks.
+        if n % 2 == 1 {
+            continue;
+        }
+
+        if n == 4 {
+            break;
+        }
+    }
+
+    let finished = n == 4;
+    if finished {
+        raw!("say stopped early, as planned");
+    } else {
+        raw!("say ran to the end");
+    }
+}

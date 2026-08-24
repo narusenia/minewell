@@ -1,0 +1,10 @@
+// The smallest thing that runs.
+//
+// `#[load]` puts this function in `minecraft:load`, so the game calls it when the
+// datapack is (re)loaded. `raw!` emits a command verbatim — the escape hatch for
+// anything the language does not cover yet.
+
+#[load]
+fn greet() {
+    raw!("say minewell is running");
+}

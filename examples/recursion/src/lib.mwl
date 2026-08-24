@@ -1,0 +1,29 @@
+// Recursion works, and only recursion pays for it.
+//
+// `square` is called from `main` and calls nothing back, so its arguments are written
+// straight into the scoreboard and that is the whole calling convention.
+//
+// `fact` calls itself, so the compiler finds it in a cycle of the call graph and wraps
+// each self-call in a saved frame. Look at the generated `recursion:fact` next to
+// `recursion:square` to see the difference the analysis makes.
+
+fn square(n: i32) -> i32 {
+    return n * n;
+}
+
+fn fact(n: i32) -> i32 {
+    if n <= 1 {
+        return 1;
+    }
+    return n * fact(n - 1);
+}
+
+#[load]
+fn main() {
+    let a = square(7);
+    let b = fact(5);
+
+    if a == 49 && b == 120 {
+        raw!("say both agree");
+    }
+}

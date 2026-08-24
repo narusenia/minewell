@@ -1,0 +1,4 @@
+[package]
+name = "burn_the_undead"
+namespace = "burn"
+description = "Set nearby zombies alight, once a second"

@@ -1,0 +1,4 @@
+[package]
+name = "recursion"
+namespace = "recursion"
+description = "Recursive functions, and what they cost"
