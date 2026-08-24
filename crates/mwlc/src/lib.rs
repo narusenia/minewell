@@ -14,4 +14,5 @@ pub mod driver;
 pub mod emit;
 pub mod hir;
 pub mod mir;
+pub mod schema;
 pub mod syntax;

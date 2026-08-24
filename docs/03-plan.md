@@ -348,12 +348,12 @@ JDK は M6（`toolchain build-from-jar`）で必要になった時点で `[tools
 
 **完了の判定:** `commands.json` から生成した型付き API で `setblock` を呼べる。
 
-- [ ] **M6-1** `commands.json` ローダ
-  - brigadier ツリーの読み込み、executable 葉の列挙
-  - 先に書くテスト: 実物の `commands.json` から `setblock` の全オーバーロードを取り出せること
-- [ ] **M6-2** parser 型 → minewell 型の写像（§1.4）
-  - 未知の parser 型は `RawArg` へフォールバック + 警告
-  - 先に書くテスト: 存在しない parser 型を含む入力でロードが失敗せず警告が出ること
+- [x] **M6-1** `commands.json` ローダ
+  - `schema/mod.rs`。**redirect は辿らない**（`/execute run` は root に戻るので止まらない）
+  - テストは手書きの小さなフィクスチャ。実物の 1MB を読むテストは遅いだけで何も増やさない
+- [x] **M6-2** parser 型 → minewell 型の写像（§1.4）
+  - 未知の parser 型は `RawArg` + 警告。**エラーにしない** — スナップショットで引数型が
+    1 つ増えただけで toolchain 全体が生成できなくなる
 - [ ] **M6-3** コマンド API の機械生成
   - literal 経路の `snake_case` 連結による命名
   - 先に書くテスト: 生成された関数一覧の `insta` スナップショット

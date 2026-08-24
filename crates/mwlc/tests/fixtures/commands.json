@@ -1,0 +1,69 @@
+{
+  "type": "root",
+  "children": {
+    "reload": { "type": "literal", "executable": true },
+    "setblock": {
+      "type": "literal",
+      "children": {
+        "pos": {
+          "type": "argument",
+          "parser": "minecraft:block_pos",
+          "children": {
+            "block": {
+              "type": "argument",
+              "parser": "minecraft:block_state",
+              "executable": true
+            }
+          }
+        }
+      }
+    },
+    "data": {
+      "type": "literal",
+      "children": {
+        "get": {
+          "type": "literal",
+          "children": {
+            "entity": {
+              "type": "literal",
+              "children": {
+                "target": {
+                  "type": "argument",
+                  "parser": "minecraft:entity",
+                  "executable": true,
+                  "children": {
+                    "path": {
+                      "type": "argument",
+                      "parser": "minecraft:nbt_path",
+                      "executable": true
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "experiment": {
+      "type": "literal",
+      "children": {
+        "thing": {
+          "type": "argument",
+          "parser": "minecraft:invented",
+          "executable": true
+        }
+      }
+    },
+    "execute": {
+      "type": "literal",
+      "children": {
+        "run": {
+          "type": "literal",
+          "executable": true,
+          "redirect": []
+        }
+      }
+    }
+  }
+}
