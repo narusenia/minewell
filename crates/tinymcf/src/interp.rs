@@ -11,12 +11,48 @@ use std::rc::Rc;
 
 use crate::args::ParseError;
 use crate::command::{
-    Clause, Cmp, Command, Condition, Data, Execute, ModifyKind, NumTag, Op, Return, ScoreTest,
-    Scoreboard, Source, StoreTarget, Target,
+    Clause, Cmp, Command, Condition, Data, Execute, FnArgs, ModifyKind, NumTag, Op, Return,
+    ScoreTest, Scoreboard, Source, StoreTarget, Target,
 };
 use crate::nbt::{Compound, NbtValue};
 use crate::path::NbtPath;
 use crate::world::World;
+
+/// Replaces every `$(name)` with its argument.
+fn substitute(text: &str, args: &Compound) -> Result<String, String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("$(") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after
+            .find(')')
+            .ok_or_else(|| format!("unclosed '$(' in macro line: {text}"))?;
+        let name = &after[..end];
+        let value = args
+            .get(name)
+            .ok_or_else(|| format!("no argument named '{name}' was supplied"))?;
+        out.push_str(&render(value));
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// How vanilla renders an argument into a command line: a string contributes its
+/// characters, a number its digits with no tag suffix, anything else its SNBT.
+fn render(value: &NbtValue) -> String {
+    match value {
+        NbtValue::String(s) => s.clone(),
+        NbtValue::Byte(v) => v.to_string(),
+        NbtValue::Short(v) => v.to_string(),
+        NbtValue::Int(v) => v.to_string(),
+        NbtValue::Long(v) => v.to_string(),
+        NbtValue::Float(v) => v.to_string(),
+        NbtValue::Double(v) => v.to_string(),
+        other => other.to_string(),
+    }
+}
 
 fn deferred(what: &str) -> String {
     format!("'{what}' is not implemented yet; see SPEC.md section 4.4 (M0-8b)")
@@ -150,6 +186,16 @@ impl Outcome {
 /// Vanilla's default `maxCommandChainLength`.
 pub const DEFAULT_BUDGET: u64 = 65536;
 
+/// One line of a loaded function.
+#[derive(Debug)]
+enum Line {
+    /// Parsed at load time.
+    Plain(Command),
+    /// A `$` line. Its text can only be parsed once the arguments are known, so it is
+    /// kept verbatim and parsed per call.
+    Macro(String),
+}
+
 /// How a command left the enclosing function.
 enum Flow {
     /// Carry on with the next line.
@@ -169,7 +215,7 @@ pub struct Interpreter {
     /// `maxCommandChainLength`. Also what stops a runaway recursion from hanging a test.
     pub budget: u64,
     pub commands_run: u64,
-    functions: BTreeMap<String, Rc<Vec<Command>>>,
+    functions: BTreeMap<String, Rc<Vec<Line>>>,
     /// 0 at the top level. `return` outside a function is an error.
     depth: usize,
     over_budget: bool,
@@ -193,35 +239,61 @@ impl Interpreter {
     /// Parses a function body and registers it. Blank lines and `#` comments are
     /// dropped; everything else is parsed now, so syntax errors surface at load time.
     pub fn load(&mut self, id: &str, source: &str) -> Result<(), ParseError> {
-        let mut commands = Vec::new();
+        let mut lines = Vec::new();
         for line in source.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            commands.push(Command::parse(line)?);
+            lines.push(match line.strip_prefix('$') {
+                Some(rest) => Line::Macro(rest.to_owned()),
+                None => Line::Plain(Command::parse(line)?),
+            });
         }
-        self.functions.insert(id.to_owned(), Rc::new(commands));
+        self.functions.insert(id.to_owned(), Rc::new(lines));
         Ok(())
     }
 
     /// Runs a loaded function, as the `function` command does.
     pub fn call(&mut self, id: &str) -> Outcome {
-        match self.call_inner(id) {
+        match self.call_inner(id, None) {
             Flow::Next(outcome) | Flow::Return(outcome) => outcome,
             Flow::Halt => Outcome::FAILED,
         }
     }
 
-    fn call_inner(&mut self, id: &str) -> Flow {
+    fn call_inner(&mut self, id: &str, args: Option<&Compound>) -> Flow {
         let Some(body) = self.functions.get(id).cloned() else {
             return Flow::Next(self.fail(format!("unknown function '{id}'")));
         };
+        if args.is_none() && body.iter().any(|l| matches!(l, Line::Macro(_))) {
+            return Flow::Next(self.fail(format!(
+                "function '{id}' has macro lines but was called without arguments"
+            )));
+        }
         self.depth += 1;
         let mut ran = 0i32;
         let mut outcome = None;
-        for command in body.iter() {
-            match self.step(command) {
+        for line in body.iter() {
+            let command = match line {
+                Line::Plain(command) => command.clone(),
+                Line::Macro(text) => match substitute(text, args.expect("checked above")) {
+                    Err(message) => {
+                        self.fail(message);
+                        self.depth -= 1;
+                        return Flow::Next(Outcome::FAILED);
+                    }
+                    Ok(line) => match Command::parse(&line) {
+                        Err(e) => {
+                            self.fail(format!("{line}: {e}"));
+                            self.depth -= 1;
+                            return Flow::Next(Outcome::FAILED);
+                        }
+                        Ok(command) => command,
+                    },
+                },
+            };
+            match self.step(&command) {
                 Flow::Next(_) => ran = ran.saturating_add(1),
                 Flow::Return(o) => {
                     outcome = Some(o);
@@ -273,11 +345,28 @@ impl Interpreter {
         match command {
             Command::Scoreboard(cmd) => Flow::Next(self.scoreboard(cmd)),
             Command::Data(cmd) => Flow::Next(self.data(cmd)),
-            Command::Function(id) => self.call_inner(id),
+            Command::Function { id, args } => match self.function_args(args) {
+                Err(message) => Flow::Next(self.fail(message)),
+                Ok(args) => self.call_inner(id, args.as_ref()),
+            },
             Command::Return(kind) => self.ret(kind),
             Command::Execute(cmd) => self.execute(cmd),
             // Unmodelled commands are assumed to have worked; M0-10 records them.
             Command::Unknown { .. } => Flow::Next(Outcome::ok(1)),
+        }
+    }
+
+    fn function_args(&self, args: &FnArgs) -> Result<Option<Compound>, String> {
+        match args {
+            FnArgs::None => Ok(None),
+            FnArgs::Inline(fields) => Ok(Some(fields.clone())),
+            FnArgs::From { target, path } => match self.read_source(target, path.as_ref())? {
+                NbtValue::Compound(fields) => Ok(Some(fields)),
+                other => Err(format!(
+                    "function arguments must be a compound, found {}",
+                    other.tag_name()
+                )),
+            },
         }
     }
 
@@ -1323,5 +1412,95 @@ mod execute_tests {
                 it.diagnostics
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod macro_tests {
+    use super::*;
+
+    fn setup(functions: &[(&str, &str)]) -> Interpreter {
+        let mut it = Interpreter::default();
+        it.run_line("scoreboard objectives add obj dummy");
+        for (id, source) in functions {
+            it.load(id, source).unwrap();
+        }
+        it
+    }
+
+    fn score(it: &Interpreter, holder: &str) -> Option<i32> {
+        it.world.scoreboard.get("obj", holder).unwrap()
+    }
+
+    #[test]
+    fn an_argument_is_substituted_into_the_line() {
+        let mut it = setup(&[("ns:f", "$scoreboard players set $(who) obj $(n)")]);
+        it.run_line("function ns:f {who:\"$a\", n:7}");
+        assert_eq!(score(&it, "$a"), Some(7));
+    }
+
+    #[test]
+    fn values_render_without_their_tag_suffix() {
+        let mut it = setup(&[("ns:f", "$data modify storage ns:mw v set value $(x)")]);
+        it.run_line("function ns:f {x:3b}");
+        assert_eq!(
+            crate::path::NbtPath::parse("v")
+                .unwrap()
+                .resolve(it.world.storage("ns:mw")),
+            vec![crate::nbt::NbtValue::Int(3)]
+        );
+    }
+
+    #[test]
+    fn arguments_can_come_from_storage() {
+        let mut it = setup(&[("ns:f", "$scoreboard players set $(who) obj 5")]);
+        it.run_line("data modify storage ns:mw args set value {who:\"$b\"}");
+        it.run_line("function ns:f with storage ns:mw args");
+        assert_eq!(score(&it, "$b"), Some(5));
+    }
+
+    #[test]
+    fn a_macro_function_called_without_arguments_fails() {
+        // The rule a compiler is tested against: a #[tick] function must not be a
+        // macro function, because function tags invoke without arguments.
+        let mut it = setup(&[("ns:f", "$say $(x)")]);
+        assert_eq!(it.run_line("function ns:f"), Outcome::FAILED);
+        assert!(
+            it.diagnostics.iter().any(|d| d.contains("macro")),
+            "{:?}",
+            it.diagnostics
+        );
+    }
+
+    #[test]
+    fn referring_to_a_missing_argument_fails() {
+        let mut it = setup(&[("ns:f", "$say $(missing)")]);
+        assert_eq!(it.run_line("function ns:f {other:1}"), Outcome::FAILED);
+        assert!(it.diagnostics.iter().any(|d| d.contains("missing")));
+    }
+
+    #[test]
+    fn a_substituted_line_that_does_not_parse_fails_at_call_time() {
+        let mut it = setup(&[("ns:f", "$scoreboard players set $a obj $(n)")]);
+        it.load("ns:f", "$scoreboard players set $a obj $(n)")
+            .unwrap();
+        assert_eq!(
+            it.run_line("function ns:f {n:\"notanumber\"}"),
+            Outcome::FAILED
+        );
+    }
+
+    #[test]
+    fn arguments_to_a_plain_function_are_harmless() {
+        let mut it = setup(&[("ns:f", "scoreboard players set $a obj 1")]);
+        assert!(!it.run_line("function ns:f {unused:1}").failed());
+        assert_eq!(score(&it, "$a"), Some(1));
+    }
+
+    #[test]
+    fn a_macro_line_without_any_placeholder_still_runs() {
+        let mut it = setup(&[("ns:f", "$scoreboard players set $a obj 2")]);
+        it.run_line("function ns:f {}");
+        assert_eq!(score(&it, "$a"), Some(2));
     }
 }

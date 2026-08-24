@@ -8,14 +8,17 @@
 //! runnable.
 
 use crate::args::{Args, ParseError};
-use crate::nbt::NbtValue;
+use crate::nbt::{Compound, NbtValue};
 use crate::path::NbtPath;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Scoreboard(Scoreboard),
     Data(Data),
-    Function(String),
+    Function {
+        id: String,
+        args: FnArgs,
+    },
     Return(Return),
     Execute(Execute),
     /// A command outside the modelled subset. Kept verbatim rather than rejected: a
@@ -23,6 +26,17 @@ pub enum Command {
     Unknown {
         name: String,
         args: String,
+    },
+}
+
+/// Where a macro function's arguments come from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FnArgs {
+    None,
+    Inline(Compound),
+    From {
+        target: Target,
+        path: Option<NbtPath>,
     },
 }
 
@@ -278,8 +292,30 @@ impl Command {
             "execute" => Ok(Command::Execute(execute(&mut args)?)),
             "function" => {
                 let id = args.word()?.to_owned();
+                let fn_args = if args.is_empty() {
+                    FnArgs::None
+                } else if args.literal("with") {
+                    let target = Target::parse(&mut args)?;
+                    FnArgs::From {
+                        target,
+                        path: optional_path(&mut args)?,
+                    }
+                } else {
+                    match args.value()? {
+                        NbtValue::Compound(fields) => FnArgs::Inline(fields),
+                        other => {
+                            return Err(ParseError::new(
+                                0,
+                                format!(
+                                    "function arguments must be a compound, found {}",
+                                    other.tag_name()
+                                ),
+                            ));
+                        }
+                    }
+                };
                 args.end()?;
-                Ok(Command::Function(id))
+                Ok(Command::Function { id, args: fn_args })
             }
             "return" => Ok(Command::Return(if args.literal("fail") {
                 args.end()?;
@@ -302,7 +338,7 @@ impl Command {
         match self {
             Command::Scoreboard(_) => "scoreboard",
             Command::Data(_) => "data",
-            Command::Function(_) => "function",
+            Command::Function { .. } => "function",
             Command::Return(_) => "return",
             Command::Execute(_) => "execute",
             Command::Unknown { name, .. } => name,

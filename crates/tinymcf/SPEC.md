@@ -297,12 +297,30 @@ M0's own acceptance test — factorial and Fibonacci in handwritten mcfunction �
 not. They parse and fail with a diagnostic saying so, rather than silently doing
 nothing.
 
-### 4.5 Macro functions — *pending (M0-9)*
+### 4.5 Macro functions — **done**
 
-Lines beginning `$` are macro lines. `$(name)` is substituted from the compound the
-function was invoked with. Invoking a macro function without the arguments it
-references fails, as in vanilla — this is what makes "a `#[tick]` function must not be
-a macro function" a testable rule.
+```
+function <id> <compound>
+function <id> with storage <id> [<path>]
+```
+
+A line whose first character is `$` is a **macro line**. The `$` is dropped and every
+`$(name)` in the rest is replaced by the argument of that name, after which the line is
+parsed and run. A function containing at least one macro line is a macro function.
+
+- Macro lines are parsed **per call**, after substitution — a load-time parse is
+  impossible, so a macro line with a syntax error only fails when it runs.
+- Calling a macro function **without** arguments fails. This is what makes "a `#[tick]`
+  function must not be a macro function" a rule a compiler can be tested against:
+  function tags invoke without arguments.
+- Referring to an argument that was not supplied fails.
+- Passing arguments to a function with no macro lines is allowed and does nothing.
+
+Substitution renders a value as vanilla does: a string inserts its characters with no
+quotes, an integer or a decimal inserts its number with no tag suffix, and anything
+else inserts its SNBT.
+
+`with entity` and `with block` parse and fail, like every other entity target (§4.2).
 
 ### 4.6 Side-effecting commands — *pending (M0-10)*
 
