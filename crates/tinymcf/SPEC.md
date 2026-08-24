@@ -141,6 +141,12 @@ Removal detaches every matched value from its parent, and reports how many.
 
 ## 4. Commands
 
+Command lines are split by a single balanced scanner: whitespace separates arguments
+unless it sits inside brackets, braces or quotes. That makes selectors
+(`@e[type=zombie, distance=..8]`), SNBT (`{Health: 20f}`) and quoted strings single
+arguments without each command needing to know. A trailing greedy argument (`say hi
+there`) takes the rest of the line.
+
 ### 4.1 `scoreboard` — *pending (M0-5)*
 
 `objectives add|remove`, `players get|set|add|remove|reset|operation`.

@@ -32,6 +32,13 @@ pub fn parse(src: &str) -> Result<NbtValue, SnbtError> {
     }
 }
 
+/// Parses any value starting at `at`, returning it and the offset just past it.
+pub fn parse_value_at(src: &str, at: usize) -> Result<(NbtValue, usize), SnbtError> {
+    let mut p = Parser { src, at };
+    let value = p.value()?;
+    Ok((value, p.at))
+}
+
 /// Parses a `{...}` starting at `at`, returning it and the offset just past it.
 /// The path parser needs this to read the filters embedded in a path.
 pub fn parse_compound_at(src: &str, at: usize) -> Result<(Compound, usize), SnbtError> {

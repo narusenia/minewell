@@ -8,7 +8,7 @@
 
 | # | マイルストーン | 状態 | 進捗 |
 |---|---|---|---|
-| M0 | `tinymcf`（インタプリタ） | 進行中 | 4 / 13 |
+| M0 | `tinymcf`（インタプリタ） | 進行中 | 5 / 13 |
 | M1 | Hello World 縦断 | 未着手 | 0 / 9 |
 | M2 | 値と式 | 未着手 | 0 / 7 |
 | M3 | 制御フロー | 未着手 | 0 / 7 |
@@ -19,7 +19,7 @@
 | M8 | 数値拡張 | 未着手 | 0 / 7 |
 | M9 | 仕上げ | 未着手 | 0 / 9 |
 | — | 横断（CI・文書） | 進行中 | 2 / 6 |
-| | **合計** | | **6 / 88** |
+| | **合計** | | **7 / 88** |
 
 状態は `未着手` / `進行中` / `完了` / `保留`。
 タスクを閉じたらチェックボックスと上表の両方を更新する。
@@ -101,12 +101,18 @@ JDK は M6（`toolchain build-from-jar`）で必要になった時点で `[tools
 - [x] **M0-3** NBT パス解析
   - `path.rs`。解決・書き込み・削除。フィルタは部分一致かつ再帰、タグも一致を要求
   - 書き込み時の中間生成はバニラの preferred parent 規則に合わせた（次の step が添字ならリスト）
-- [ ] **M0-4** コマンド字句・構文解析（サブセット）
-  - 対象は §16 の実装範囲に限る。未対応コマンドは `Unknown(String)` として保持
-  - 先に書くテスト: `execute if score $a obj matches 1..5 run say hi` のパース
+- [x] **M0-4** コマンド行の字句解析基盤
+  - 引数トークナイザ（語・引用文字列・セレクタ・NBT パス・SNBT 値・貪欲な残り）、
+    `Command` 列挙、未対応コマンドの `Unknown` フォールバックとディスパッチ骨格
+  - **計画変更:** 全コマンドの構文を先に書き切るのをやめ、M0-5〜M0-10 が
+    自分のコマンド族の**構文と実行を同時に**足す。構文だけ先行させると振る舞いで
+    検証できず、計画が警告している golden file 化そのものになるため
+  - `args.rs` の balanced scanner 1 本で、セレクタ・SNBT・引用文字列を 1 語として扱う
+  - `command.rs` は現状 `Unknown` のみ。各コマンド族は実行側のタスクで足す
 - [ ] **M0-5** `scoreboard` コマンドの実行
   - `objectives add/remove`、`players set/get/add/remove/operation/reset`
   - `operation` の全演算子（`=` `+=` `-=` `*=` `/=` `%=` `<` `>` `><`）
+  - 構文と実行を同時に実装する（M0-4 参照）
   - 先に書くテスト: `/=` の負数における切り捨て方向がバニラと一致すること
 - [ ] **M0-6** `data` コマンドの実行
   - `get`（数値はスケール倍、文字列は長さ、list/compound は要素数）
@@ -120,6 +126,7 @@ JDK は M6（`toolchain build-from-jar`）で必要になった時点で `[tools
   - `if` / `unless`（`score` / `data` / `entity` / `block` / `predicate`）
   - `store result` / `store success`（`score` / `storage` へ、スケール付き）
   - `as` / `at` / `positioned` / `in`（コンテキストの積み替え）
+  - 受け入れ: `execute if score $a obj matches 1..5 run say hi` が構文解析され実行される
   - 先に書くテスト: `store success` が失敗コマンドに対して 0 を書くこと
 - [ ] **M0-9** マクロ関数
   - `function ns:f with storage ns:path`、行頭 `$` のマクロ行、`$(name)` 展開
