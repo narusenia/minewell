@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! Splitting a command line into arguments.
 //!
 //! Vanilla's grammar is positional and mostly whitespace-separated, but three kinds of

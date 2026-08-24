@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! NBT paths: the `foo.bar[0]{k:1}` notation `data` commands address values with.
 //!
 //! A path resolves to zero or more values, which is why every operation here reports a

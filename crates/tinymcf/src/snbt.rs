@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! SNBT: the textual NBT notation commands are written in.
 //!
 //! Parsing and formatting live together so that the round trip stays honest —

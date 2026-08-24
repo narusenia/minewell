@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! Running commands against a [`World`].
 //!
 //! See `SPEC.md` §2: a command that fails does not abort anything. Execution walks on

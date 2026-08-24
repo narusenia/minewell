@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! A tiny interpreter for a subset of Minecraft's mcfunction.
 //!
 //! Exists so that a transpiler targeting mcfunction can assert on *behaviour*

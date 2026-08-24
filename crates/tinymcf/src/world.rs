@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! Mutable state a running datapack can observe: the scoreboard and command storage.
 //!
 //! Entities and blocks are deliberately absent. Commands that touch them are recorded

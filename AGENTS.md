@@ -139,6 +139,17 @@ A task is complete when:
   - Good: `feat/tarjan-scc-analysis`, `fix/wgpu-shader-compilation`
   - Bad: `feat/m4`, `chore/cleanup`
 
+### Licensing
+
+MIT. Every `.rs`, `.toml` and `.yml` file starts with an SPDX line:
+
+```
+// SPDX-License-Identifier: MIT
+```
+
+New files get one. Markdown is covered by the repository `LICENSE` and carries no
+header, so that documents render clean.
+
 ### Naming inside generated datapacks
 
 These are load-bearing; see `docs/01-requirements.md` §3.3.

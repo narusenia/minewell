@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! NBT values.
 //!
 //! The tag distinction is load-bearing: vanilla treats `Byte(1)` and `Int(1)` as

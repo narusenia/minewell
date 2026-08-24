@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! Command syntax.
 //!
 //! Each command family is added by the task that implements its execution, so that
