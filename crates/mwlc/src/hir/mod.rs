@@ -15,9 +15,10 @@
 
 use std::collections::HashMap;
 
+use crate::schema::{ArgType, Schema};
 use crate::syntax::SyntaxError;
 use crate::syntax::ast::{self, BinaryOp, Expr as AstExpr, ItemKind, SourceFile, UnaryOp};
-use crate::syntax::lexer::{Span, TokenKind};
+use crate::syntax::lexer::{Punct, Span, TokenKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FnId(pub u32);
@@ -33,6 +34,10 @@ pub enum Type {
     /// A compile-time selector. It has no runtime representation: the only thing that
     /// can be done with one is hand it to `as`, `at` or `for`.
     Selector,
+    /// `minecraft:stone`. Compile-time only.
+    Resource,
+    /// `pos!(~ ~1 ~)`. Compile-time only.
+    Pos,
 }
 
 impl Type {
@@ -46,11 +51,19 @@ impl Type {
         }
     }
 
+    /// Whether the type exists only while compiling, with nothing to put in a
+    /// register at runtime.
+    pub fn is_compile_time(&self) -> bool {
+        matches!(self, Type::Selector | Type::Resource | Type::Pos)
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Type::I32 => "i32",
             Type::Bool => "bool",
             Type::Selector => "selector",
+            Type::Resource => "ResourceLocation",
+            Type::Pos => "Pos",
         }
     }
 }
@@ -176,6 +189,7 @@ pub struct Expr {
 pub enum ExprKind {
     Int(i32),
     Bool(bool),
+    Str(String),
     Local(LocalId),
     Unary(UnaryOp, Box<Expr>),
     Binary(BinaryOp, Box<Expr>, Box<Expr>),
@@ -185,6 +199,10 @@ pub enum ExprKind {
     },
     /// A compile-time selector. Never evaluated into a register.
     Selector(String),
+    Resource(String),
+    Pos(String),
+    /// A whole command, already rendered. One command, one line.
+    Command(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,7 +267,11 @@ struct Signature {
     ctx: Vec<Ctx>,
 }
 
-pub fn lower(file: &SourceFile, namespace: &str) -> (Hir, Vec<SyntaxError>) {
+pub fn lower(
+    file: &SourceFile,
+    namespace: &str,
+    toolchain: Option<&Schema>,
+) -> (Hir, Vec<SyntaxError>) {
     let mut errors = Vec::new();
     let mut signatures: HashMap<String, Signature> = HashMap::new();
     let mut items: Vec<(&ast::Item, &ast::FnItem)> = Vec::new();
@@ -302,6 +324,7 @@ pub fn lower(file: &SourceFile, namespace: &str) -> (Hir, Vec<SyntaxError>) {
             loop_depth: 0,
             ret: signature.ret,
             signatures: &signatures,
+            toolchain,
             errors: &mut errors,
         };
         let attrs = cx.attrs(&item.attrs);
@@ -413,6 +436,8 @@ struct FnLowering<'a> {
     locals: Vec<Local>,
     ret: Option<Type>,
     signatures: &'a HashMap<String, Signature>,
+    /// The command surface of the configured Minecraft version, if there is one.
+    toolchain: Option<&'a Schema>,
     /// Innermost scope last. A `let` shadows an outer binding of the same name.
     scopes: Vec<HashMap<String, LocalId>>,
     /// Bindings that stand for a selector rather than a value.
@@ -510,6 +535,17 @@ impl FnLowering<'_> {
             ast::Stmt::Let(let_stmt) => self.let_stmt(let_stmt),
             ast::Stmt::Expr(AstExpr::Macro(call)) => self.macro_call(call).map(Stmt::Raw),
             ast::Stmt::Expr(AstExpr::Assign(assign)) => self.assign(assign),
+            ast::Stmt::Expr(AstExpr::Call(call))
+                if !self.signatures.contains_key(&call.callee.name) =>
+            {
+                let ExprKind::Command(text) = self.command(call)?.kind else {
+                    return None;
+                };
+                Some(Stmt::Raw(RawCommand {
+                    text,
+                    span: call.span,
+                }))
+            }
             ast::Stmt::Expr(AstExpr::Call(call)) => {
                 let (callee, _) = self.call_signature(call)?;
                 let args = self.call_args(call)?;
@@ -861,6 +897,9 @@ impl FnLowering<'_> {
                 self.error(span, "an assignment is a statement and produces no value");
                 None
             }
+            AstExpr::Call(call) if !self.signatures.contains_key(&call.callee.name) => {
+                self.command(call)
+            }
             AstExpr::Call(call) => {
                 let (callee, ty) = self.call_signature(call)?;
                 let Some(ty) = ty else {
@@ -880,6 +919,22 @@ impl FnLowering<'_> {
                 ty: Type::Selector,
                 span,
             }),
+            AstExpr::Str(lit) => Some(Expr {
+                kind: ExprKind::Str(lit.value.clone()),
+                // Strings are compile-time only until M8 gives them a storage home.
+                ty: Type::Resource,
+                span,
+            }),
+            AstExpr::Resource(lit) => Some(Expr {
+                kind: ExprKind::Resource(lit.text.clone()),
+                ty: Type::Resource,
+                span,
+            }),
+            AstExpr::Macro(call) if call.name.name == "pos" => Some(Expr {
+                kind: ExprKind::Pos(self.pos(call)?),
+                ty: Type::Pos,
+                span,
+            }),
             AstExpr::Macro(call) => {
                 let name = &call.name.name;
                 self.error(span, format!("'{name}!' does not produce a value"));
@@ -890,12 +945,11 @@ impl FnLowering<'_> {
 
     fn binary_type(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr, span: Span) -> Option<Type> {
         use BinaryOp::*;
-        if lhs.ty == Type::Selector || rhs.ty == Type::Selector {
-            self.error(
-                span,
-                "a selector has no runtime value; it can only be given to 'as', 'at' or 'for'",
-            );
-            return None;
+        for side in [lhs, rhs] {
+            if side.ty.is_compile_time() {
+                self.error(span, format!("a {} has no runtime value", side.ty.name()));
+                return None;
+            }
         }
         let (want, result) = match op {
             Add | Sub | Mul | Div | Rem => (Some(Type::I32), Type::I32),
@@ -926,6 +980,86 @@ impl FnLowering<'_> {
             return None;
         }
         Some(result)
+    }
+
+    /// A command call, if the name is one. User functions win: defining `fn setblock`
+    /// shadows the command, which is the only way to wrap one.
+    fn command(&mut self, call: &ast::CallExpr) -> Option<Expr> {
+        if self.signatures.contains_key(&call.callee.name) {
+            return None;
+        }
+        let Some(schema) = self.toolchain else {
+            self.error(
+                call.callee.span,
+                format!(
+                    "'{}' is not defined; if it is a Minecraft command, set 'toolchain' \
+                     in minewell.toml so the compiler knows the command set",
+                    call.callee.name
+                ),
+            );
+            return None;
+        };
+        let signature = schema.get(&call.callee.name)?.clone();
+        if call.args.len() != signature.params.len() {
+            let (name, n, m) = (&signature.name, signature.params.len(), call.args.len());
+            self.error(
+                call.span,
+                format!("the command '{name}' takes {n} argument(s), but {m} were given"),
+            );
+            return None;
+        }
+        let mut parts = signature.literals.clone();
+        for (arg, param) in call.args.iter().zip(&signature.params) {
+            parts.push(self.command_arg(arg, param.ty)?);
+        }
+        Some(Expr {
+            kind: ExprKind::Command(parts.join(" ")),
+            ty: Type::I32,
+            span: call.span,
+        })
+    }
+
+    /// Renders one argument into the command text.
+    ///
+    /// Everything has to be known now: a command is a string, and putting a runtime
+    /// value into one needs a macro function (requirements section 10.1), which
+    /// arrives in M9. Until then this says so rather than emitting something wrong.
+    fn command_arg(&mut self, arg: &ast::Expr, want: ArgType) -> Option<String> {
+        let value = self.expr(arg)?;
+        let rendered = match (&value.kind, want) {
+            (ExprKind::Pos(text), ArgType::Pos) => text.clone(),
+            (ExprKind::Resource(text), ArgType::Resource) => text.clone(),
+            (ExprKind::Selector(text), ArgType::Selector) => text.clone(),
+            (ExprKind::Int(n), ArgType::I32) => n.to_string(),
+            (ExprKind::Bool(b), ArgType::Bool) => b.to_string(),
+            // The types with no literal of their own take a string, unexamined.
+            (
+                ExprKind::Str(text),
+                ArgType::Str | ArgType::Nbt | ArgType::Component | ArgType::Raw,
+            ) => text.clone(),
+            (kind, want) => {
+                let found = match kind {
+                    ExprKind::Local(_) | ExprKind::Binary(..) | ExprKind::Unary(..) => {
+                        return {
+                            self.error(
+                                value.span,
+                                "a command argument has to be known at compile time; \
+                                 passing a runtime value needs a macro function, which \
+                                 is not implemented yet",
+                            );
+                            None
+                        };
+                    }
+                    _ => value.ty.name(),
+                };
+                self.error(
+                    value.span,
+                    format!("expected {} here, found {found}", want.name()),
+                );
+                return None;
+            }
+        };
+        Some(rendered)
     }
 
     fn call_signature(&mut self, call: &ast::CallExpr) -> Option<(FnId, Option<Type>)> {
@@ -987,6 +1121,74 @@ impl FnLowering<'_> {
             args.push(arg);
         }
         Some(args)
+    }
+
+    /// `pos!(~ ~1 ~)`. Three coordinates, all in the same notation.
+    ///
+    /// A coordinate is a token pair rather than a literal because `~` and `^` are
+    /// separate tokens (spec section 2.6) — which is also why coordinates live inside
+    /// a macro instead of in the expression grammar.
+    fn pos(&mut self, call: &ast::MacroCall) -> Option<String> {
+        let mut coords: Vec<(Option<char>, Option<i32>)> = Vec::new();
+        let mut tokens = call.tokens.iter().peekable();
+        while let Some(token) = tokens.next() {
+            let prefix = match &token.kind {
+                TokenKind::Punct(Punct::Tilde) => Some('~'),
+                TokenKind::Punct(Punct::Caret) => Some('^'),
+                _ => None,
+            };
+            let value = if prefix.is_some() {
+                match tokens.peek().map(|t| &t.kind) {
+                    Some(TokenKind::Int(n)) => {
+                        let n = *n;
+                        tokens.next();
+                        Some(n)
+                    }
+                    _ => None,
+                }
+            } else {
+                match &token.kind {
+                    TokenKind::Int(n) => Some(*n),
+                    TokenKind::Punct(Punct::Minus) => match tokens.next().map(|t| &t.kind) {
+                        Some(TokenKind::Int(n)) => Some(-n),
+                        _ => {
+                            self.error(token.span, "expected a coordinate");
+                            return None;
+                        }
+                    },
+                    _ => {
+                        self.error(token.span, "expected a coordinate");
+                        return None;
+                    }
+                }
+            };
+            coords.push((prefix, value));
+        }
+        if coords.len() != 3 {
+            self.error(call.span, "pos! takes three coordinates");
+            return None;
+        }
+        // Vanilla rejects a mix, and so does this: `~ ^ ~` is not a position.
+        let first = coords[0].0;
+        if coords.iter().any(|(prefix, _)| *prefix != first) {
+            self.error(
+                call.span,
+                "all three coordinates must use the same notation: all absolute, all '~' or all '^'",
+            );
+            return None;
+        }
+        Some(
+            coords
+                .iter()
+                .map(|(prefix, value)| match (prefix, value) {
+                    (Some(p), Some(n)) => format!("{p}{n}"),
+                    (Some(p), None) => p.to_string(),
+                    (None, Some(n)) => n.to_string(),
+                    (None, None) => "0".to_owned(),
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
     }
 
     fn macro_call(&mut self, call: &ast::MacroCall) -> Option<RawCommand> {
@@ -1065,7 +1267,7 @@ mod tests {
     fn lower_ok(src: &str) -> Hir {
         let (file, errors) = parse(src);
         assert!(errors.is_empty(), "{errors:?}");
-        let (hir, errors) = lower(&file, "myns");
+        let (hir, errors) = lower(&file, "myns", None);
         assert!(errors.is_empty(), "{errors:?}");
         hir
     }
@@ -1073,7 +1275,97 @@ mod tests {
     fn lower_err(src: &str) -> Vec<SyntaxError> {
         let (file, errors) = parse(src);
         assert!(errors.is_empty(), "{errors:?}");
-        lower(&file, "myns").1
+        lower(&file, "myns", None).1
+    }
+
+    fn schema() -> Schema {
+        Schema::parse(include_str!("../../tests/fixtures/commands.json")).expect("fixture")
+    }
+
+    fn with_toolchain(src: &str) -> Result<Hir, Vec<SyntaxError>> {
+        let (file, errors) = parse(src);
+        assert!(errors.is_empty(), "{errors:?}");
+        let (hir, errors) = lower(&file, "myns", Some(&schema()));
+        if errors.is_empty() {
+            Ok(hir)
+        } else {
+            Err(errors)
+        }
+    }
+
+    fn command_text(src: &str) -> String {
+        let hir = with_toolchain(src).expect("compiles");
+        match &hir.functions[0].body[0] {
+            Stmt::Raw(raw) => raw.text.clone(),
+            other => panic!("expected a command, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_command_becomes_one_line() {
+        assert_eq!(
+            command_text("fn main() { setblock(pos!(~ ~1 ~), minecraft:stone); }"),
+            "setblock ~ ~1 ~ minecraft:stone"
+        );
+        assert_eq!(command_text("fn main() { reload(); }"), "reload");
+    }
+
+    #[test]
+    fn coordinates_render_the_way_they_were_written() {
+        assert!(
+            command_text("fn main() { setblock(pos!(10 64 -5), minecraft:stone); }")
+                .contains("10 64 -5")
+        );
+        assert!(
+            command_text("fn main() { setblock(pos!(^ ^ ^5), minecraft:stone); }")
+                .contains("^ ^ ^5")
+        );
+    }
+
+    #[test]
+    fn coordinate_notations_cannot_be_mixed() {
+        let errors =
+            with_toolchain("fn main() { setblock(pos!(~ ^ ~), minecraft:stone); }").unwrap_err();
+        assert!(errors[0].message.contains("same notation"), "{errors:?}");
+    }
+
+    #[test]
+    fn pos_needs_exactly_three_coordinates() {
+        assert!(
+            with_toolchain("fn main() { setblock(pos!(~ ~), minecraft:stone); }").unwrap_err()[0]
+                .message
+                .contains("three")
+        );
+    }
+
+    #[test]
+    fn a_command_argument_of_the_wrong_kind_is_reported() {
+        let errors = with_toolchain("fn main() { setblock(minecraft:stone, minecraft:stone); }")
+            .unwrap_err();
+        assert!(errors[0].message.contains("Pos"), "{errors:?}");
+    }
+
+    #[test]
+    fn a_runtime_value_cannot_go_into_a_command_yet() {
+        let errors = with_toolchain(
+            "fn main() { let p = 1; data_get_entity(@s); setblock(pos!(~ ~ ~), minecraft:stone); }",
+        );
+        // The command above is fine; this one is not.
+        let errors2 = with_toolchain("fn main() { let n = 1; experiment(n); }").unwrap_err();
+        assert!(errors.is_ok(), "{errors:?}");
+        assert!(errors2[0].message.contains("compile time"), "{errors2:?}");
+    }
+
+    #[test]
+    fn a_command_needs_a_toolchain_to_be_known() {
+        let errors = lower_err("fn main() { setblock(pos!(~ ~ ~), minecraft:stone); }");
+        assert!(errors[0].message.contains("toolchain"), "{errors:?}");
+    }
+
+    #[test]
+    fn a_user_function_shadows_a_command_of_the_same_name() {
+        let hir = with_toolchain("fn reload() { } fn main() { reload(); }").expect("compiles");
+        assert!(matches!(hir.functions[1].body[0], Stmt::CallFor { .. }));
     }
 
     #[test]

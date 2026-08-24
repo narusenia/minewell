@@ -125,6 +125,7 @@ pub struct TypeName {
 pub enum Expr {
     Int(IntLit),
     Bool(BoolLit),
+    Str(StrLit),
     /// A reference to a binding.
     Path(Ident),
     Unary(UnaryExpr),
@@ -132,6 +133,7 @@ pub enum Expr {
     Assign(AssignExpr),
     Call(CallExpr),
     Selector(SelectorLit),
+    Resource(ResourceLit),
     Macro(MacroCall),
 }
 
@@ -139,6 +141,13 @@ pub enum Expr {
 /// language's, so they are carried through untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectorLit {
+    pub text: String,
+    pub span: Span,
+}
+
+/// `minecraft:stone`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceLit {
     pub text: String,
     pub span: Span,
 }
@@ -155,12 +164,14 @@ impl Expr {
         match self {
             Expr::Int(e) => e.span,
             Expr::Bool(e) => e.span,
+            Expr::Str(e) => e.span,
             Expr::Path(e) => e.span,
             Expr::Unary(e) => e.span,
             Expr::Binary(e) => e.span,
             Expr::Assign(e) => e.span,
             Expr::Call(e) => e.span,
             Expr::Selector(e) => e.span,
+            Expr::Resource(e) => e.span,
             Expr::Macro(e) => e.span,
         }
     }
@@ -175,6 +186,13 @@ pub struct IntLit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoolLit {
     pub value: bool,
+    pub span: Span,
+}
+
+/// Only meaningful as a command argument today; `String` values arrive in M8.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrLit {
+    pub value: String,
     pub span: Span,
 }
 

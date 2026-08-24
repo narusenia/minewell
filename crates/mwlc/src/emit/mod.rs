@@ -395,7 +395,7 @@ mod tests {
     fn compile(src: &str, options: &Options) -> Datapack {
         let (file, errors) = parse(src);
         assert!(errors.is_empty(), "{errors:?}");
-        let (hir, errors) = crate::hir::lower(&file, "myns");
+        let (hir, errors) = crate::hir::lower(&file, "myns", None);
         assert!(errors.is_empty(), "{errors:?}");
         emit(&crate::mir::lower(&hir), options)
     }

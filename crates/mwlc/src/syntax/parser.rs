@@ -495,6 +495,16 @@ impl Parser {
                 self.expect(Punct::RParen, ")")?;
                 Some(inner)
             }
+            Some(TokenKind::Str(text)) => {
+                let value = text.clone();
+                self.bump();
+                Some(Expr::Str(StrLit { value, span }))
+            }
+            Some(TokenKind::Resource(text)) => {
+                let text = text.clone();
+                self.bump();
+                Some(Expr::Resource(ResourceLit { text, span }))
+            }
             Some(TokenKind::Selector(text)) => {
                 let text = text.clone();
                 self.bump();

@@ -1085,9 +1085,21 @@ impl<'p> Lowering<'_, 'p> {
             hir::ExprKind::Call { callee, args } => {
                 Value::Reg(self.call(*callee, args, true).expect("a value was wanted"))
             }
-            // A selector never reaches a register: HIR only lets one be handed to
-            // `as`, `at` or `for`, which consume it at compile time.
-            hir::ExprKind::Selector(_) => unreachable!("a selector has no runtime value"),
+            // A command as an expression is a command that ran; its value is not
+            // captured, so this is the statement form reaching here by mistake.
+            hir::ExprKind::Command(text) => {
+                self.insts.push(Inst::Raw {
+                    text: text.clone(),
+                    span: expr.span,
+                });
+                Value::Const(1)
+            }
+            // Compile-time values never reach a register: HIR only lets them be handed
+            // to the constructs that consume them while compiling.
+            hir::ExprKind::Selector(_) | hir::ExprKind::Resource(_) | hir::ExprKind::Pos(_) => {
+                unreachable!("a {} has no runtime value", expr.ty.name())
+            }
+            hir::ExprKind::Str(_) => unreachable!("strings have no runtime value until M8"),
         }
     }
 

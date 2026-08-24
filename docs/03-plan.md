@@ -354,15 +354,16 @@ JDK は M6（`toolchain build-from-jar`）で必要になった時点で `[tools
 - [x] **M6-2** parser 型 → minewell 型の写像（§1.4）
   - 未知の parser 型は `RawArg` + 警告。**エラーにしない** — スナップショットで引数型が
     1 つ増えただけで toolchain 全体が生成できなくなる
-- [ ] **M6-3** コマンド API の機械生成
-  - literal 経路の `snake_case` 連結による命名
-  - 先に書くテスト: 生成された関数一覧の `insta` スナップショット
+- [x] **M6-3** コマンド API の機械生成
+  - コマンドは関数呼び出しの形。**ユーザ定義関数が同名のコマンドを覆い隠す**（唯一のラップ手段）
+  - **引数はすべてコンパイル時の値。** 実行時の値を埋めるにはマクロ関数が要る（M9）ので、
+    それまでは「まだ実装されていない」と言って止まる。黙って動かないより止まるほうがいい
 - [ ] **M6-4** `overrides.toml`
   - 頻出 30 コマンドの命名・シグネチャ上書き
   - 先に書くテスト: 上書きが機械生成名より優先されること
-- [ ] **M6-5** `ResourceLocation` リテラル
-  - 字句規則「`:` の両側に空白なし」で型注釈と区別。registries による ID 検証
-  - 先に書くテスト: `let x: i32 = 1;` と `minecraft:stone` が正しく区別されること
+- [x] **M6-5** `ResourceLocation` / `Pos` リテラル
+  - `minecraft:stone` と `pos!(~ ~1 ~)`。どちらも `Selector` と同じくコンパイル時のみの型
+  - 座標の記法混在（`~ ^ ~`）はエラー。registries による ID 検証は M6-6 の toolchain 側
 - [ ] **M6-6** toolchain の管理
   - `~/.minewell/toolchains/<version>/`、`minewell.toml` の `toolchain` 指定、`pack_format` の反映
   - 先に書くテスト: 指定バージョンの toolchain 未インストール時のエラーメッセージ

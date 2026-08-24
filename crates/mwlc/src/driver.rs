@@ -97,13 +97,23 @@ pub fn build(root: &Path, profile: Profile) -> Result<Datapack, BuildError> {
 /// The whole compiler between the two I/O edges. Tests drive this directly, which is
 /// what lets the vertical harness compile and run a program without a project on disk.
 pub fn compile(text: &str, namespace: &str, options: &Options) -> Result<Datapack, Report> {
+    compile_with(text, namespace, options, None)
+}
+
+/// As [`compile`], against a particular version's command set.
+pub fn compile_with(
+    text: &str,
+    namespace: &str,
+    options: &Options,
+    toolchain: Option<&crate::schema::Schema>,
+) -> Result<Datapack, Report> {
     let shown = options
         .source
         .as_ref()
         .map_or("<input>", |source| source.path.as_str());
 
     let (file, mut errors) = crate::syntax::parser::parse(text);
-    let (hir, more) = crate::hir::lower(&file, namespace);
+    let (hir, more) = crate::hir::lower(&file, namespace, toolchain);
     errors.extend(more);
     if let Some(report) = Report::of(shown, text, errors) {
         return Err(report);
