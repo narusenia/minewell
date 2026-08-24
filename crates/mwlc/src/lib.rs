@@ -9,4 +9,5 @@
 //! This crate does not depend on `tinymcf`, in either direction. The interpreter is
 //! independently publishable, and the two only meet in tests.
 
+pub mod diagnostics;
 pub mod syntax;

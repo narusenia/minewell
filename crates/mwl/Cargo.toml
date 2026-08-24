@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+miette = { version = "7", features = ["fancy"] }
 mwlc = { path = "../mwlc" }
 
 [lints]

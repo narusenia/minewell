@@ -9,6 +9,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+miette = "7"
+thiserror = "2"
+
+[dev-dependencies]
+# The graphical renderer lives behind `fancy`. The library only needs the derive and
+# the traits; only tests and the CLI actually draw anything.
+miette = { version = "7", features = ["fancy"] }
 
 [lints]
 workspace = true
