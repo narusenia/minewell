@@ -8,7 +8,7 @@
 
 | # | マイルストーン | 状態 | 進捗 |
 |---|---|---|---|
-| M0 | `tinymcf`（インタプリタ） | 進行中 | 8 / 13 |
+| M0 | `tinymcf`（インタプリタ） | 進行中 | 9 / 14 |
 | M1 | Hello World 縦断 | 未着手 | 0 / 9 |
 | M2 | 値と式 | 未着手 | 0 / 7 |
 | M3 | 制御フロー | 未着手 | 0 / 7 |
@@ -19,7 +19,7 @@
 | M8 | 数値拡張 | 未着手 | 0 / 7 |
 | M9 | 仕上げ | 未着手 | 0 / 9 |
 | — | 横断（CI・文書） | 進行中 | 3 / 6 |
-| | **合計** | | **11 / 88** |
+| | **合計** | | **12 / 89** |
 
 状態は `未着手` / `進行中` / `完了` / `保留`。
 タスクを閉じたらチェックボックスと上表の両方を更新する。
@@ -126,12 +126,18 @@ JDK は M6（`toolchain build-from-jar`）で必要になった時点で `[tools
   - `return` は呼び出し元に伝播しない。末尾まで落ちた場合の result は実行コマンド数
   - `maxCommandChainLength`（既定 65536）を実装。暴走再帰がテストを止めない担保でもある
   - 再帰の停止条件テストは `execute if` が要るので M0-8 に置いた
-- [ ] **M0-8** `execute` の実行
-  - `if` / `unless`（`score` / `data` / `entity` / `block` / `predicate`）
-  - `store result` / `store success`（`score` / `storage` へ、スケール付き）
-  - `as` / `at` / `positioned` / `in`（コンテキストの積み替え）
+- [x] **M0-8** `execute` の条件と `store`
+  - `if` / `unless`（`score` の比較と `matches`、`data`）
+  - `store result` / `store success`（`score` / `storage` へ、型とスケール付き）
   - 受け入れ: `execute if score $a obj matches 1..5 run say hi` が構文解析され実行される
-  - 先に書くテスト: `store success` が失敗コマンドに対して 0 を書くこと
+  - `store` は条件が落ちた場合も発火して 0 を書く（要件定義 §13 の `Option<T>` の前提）
+  - 未設定スコアは条件を偽にするだけでエラーにしない
+- [ ] **M0-8b** `execute` のエンティティ系
+  - `as` / `at` / `positioned` / `in` / `if entity` / `if block` / `if predicate`
+  - セレクタ文字列 → ハーネスが登録したエンティティ、の스タブ登録簿と実行コンテキスト
+  - **M0-8 から分離した理由:** これらは世界のスタブという別設計を必要とし、
+    M0 の受け入れ条件（階乗・フィボナッチ）にも M4 までにも要らない。M5 で要る
+  - 先に書くテスト: `as` が位置を変えず、`at` だけが変えること
 - [ ] **M0-9** マクロ関数
   - `function ns:f with storage ns:path`、行頭 `$` のマクロ行、`$(name)` 展開
   - 先に書くテスト: 引数不足のマクロ呼び出しがバニラ同様に失敗すること

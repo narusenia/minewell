@@ -10,10 +10,17 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use crate::args::ParseError;
-use crate::command::{Command, Data, ModifyKind, Op, Return, Scoreboard, Source, Target};
+use crate::command::{
+    Clause, Cmp, Command, Condition, Data, Execute, ModifyKind, NumTag, Op, Return, ScoreTest,
+    Scoreboard, Source, StoreTarget, Target,
+};
 use crate::nbt::{Compound, NbtValue};
 use crate::path::NbtPath;
 use crate::world::World;
+
+fn deferred(what: &str) -> String {
+    format!("'{what}' is not implemented yet; see SPEC.md section 4.4 (M0-8b)")
+}
 
 fn unmodelled(target: &Target) -> String {
     format!(
@@ -268,8 +275,137 @@ impl Interpreter {
             Command::Data(cmd) => Flow::Next(self.data(cmd)),
             Command::Function(id) => self.call_inner(id),
             Command::Return(kind) => self.ret(kind),
+            Command::Execute(cmd) => self.execute(cmd),
             // Unmodelled commands are assumed to have worked; M0-10 records them.
             Command::Unknown { .. } => Flow::Next(Outcome::ok(1)),
+        }
+    }
+
+    fn execute(&mut self, cmd: &Execute) -> Flow {
+        let mut passed = true;
+        let mut stores = Vec::new();
+        for clause in &cmd.clauses {
+            match clause {
+                Clause::Store { success, into } => stores.push((*success, into)),
+                Clause::Cond { negated, cond } => {
+                    match self.condition(cond) {
+                        // A deferred clause is not a false condition; nothing about
+                        // this command can be trusted, so stop rather than pretend.
+                        None => return Flow::Next(Outcome::FAILED),
+                        Some(held) => passed &= held != *negated,
+                    }
+                }
+                Clause::Deferred(name) => {
+                    return Flow::Next(self.fail(deferred(name)));
+                }
+            }
+        }
+
+        let (outcome, flow) = if !passed {
+            (Outcome::FAILED, None)
+        } else {
+            match &cmd.run {
+                // The bare conditional form reports the conditions themselves.
+                None => (Outcome::ok(1), None),
+                Some(command) => match self.step(command) {
+                    Flow::Next(outcome) => (outcome, None),
+                    // `run return ...` returns from the enclosing function, so the
+                    // stores below still have to happen first.
+                    Flow::Return(outcome) => (outcome, Some(outcome)),
+                    Flow::Halt => return Flow::Halt,
+                },
+            }
+        };
+
+        // Stores fire even when a condition blocked the command, writing 0.
+        for (success, into) in stores {
+            self.store(success, into, outcome);
+        }
+        match flow {
+            Some(outcome) => Flow::Return(outcome),
+            None => Flow::Next(outcome),
+        }
+    }
+
+    /// `None` when the condition is one of the deferred kinds.
+    fn condition(&mut self, cond: &Condition) -> Option<bool> {
+        match cond {
+            Condition::Deferred(name) => {
+                let message = deferred(name);
+                self.fail(message);
+                None
+            }
+            // An unset score makes the condition false rather than an error, so
+            // `if score` never needs the holder to exist first.
+            Condition::Score {
+                holder,
+                objective,
+                test,
+            } => {
+                let Ok(Some(value)) = self.world.scoreboard.get(objective, holder) else {
+                    return Some(false);
+                };
+                Some(match test {
+                    ScoreTest::Matches { min, max } => {
+                        min.is_none_or(|min| value >= min) && max.is_none_or(|max| value <= max)
+                    }
+                    ScoreTest::Against {
+                        op,
+                        holder,
+                        objective,
+                    } => {
+                        let Ok(Some(other)) = self.world.scoreboard.get(objective, holder) else {
+                            return Some(false);
+                        };
+                        match op {
+                            Cmp::Lt => value < other,
+                            Cmp::Le => value <= other,
+                            Cmp::Eq => value == other,
+                            Cmp::Ge => value >= other,
+                            Cmp::Gt => value > other,
+                        }
+                    }
+                })
+            }
+            Condition::Data { target, path } => match self.read_target(target) {
+                Err(message) => {
+                    self.fail(message);
+                    None
+                }
+                Ok(root) => Some(!path.resolve(&root).is_empty()),
+            },
+        }
+    }
+
+    fn store(&mut self, success: bool, into: &StoreTarget, outcome: Outcome) {
+        let value = if success {
+            outcome.success as i32
+        } else {
+            outcome.result
+        };
+        match into {
+            StoreTarget::Score { holder, objective } => {
+                if let Err(e) = self.world.scoreboard.set(objective, holder, value) {
+                    self.fail(e.to_string());
+                }
+            }
+            StoreTarget::Storage {
+                id,
+                path,
+                tag,
+                scale,
+            } => {
+                let scaled = value as f64 * scale;
+                let value = match tag {
+                    NumTag::Byte => NbtValue::Byte(scaled as i8),
+                    NumTag::Short => NbtValue::Short(scaled as i16),
+                    NumTag::Int => NbtValue::Int(scaled as i32),
+                    NumTag::Long => NbtValue::Long(scaled as i64),
+                    NumTag::Float => NbtValue::Float(scaled as f32),
+                    NumTag::Double => NbtValue::Double(scaled),
+                };
+                path.set(self.world.storage_mut(id), value);
+            }
         }
     }
 
@@ -976,5 +1112,216 @@ mod function_tests {
             it.diagnostics
         );
         assert_eq!(it.commands_run, 1000);
+    }
+}
+
+#[cfg(test)]
+mod execute_tests {
+    use super::*;
+    use crate::nbt::NbtValue;
+    use crate::path::NbtPath;
+
+    fn setup() -> Interpreter {
+        let mut it = Interpreter::default();
+        it.run_line("scoreboard objectives add obj dummy");
+        it
+    }
+
+    fn score(it: &Interpreter, holder: &str) -> Option<i32> {
+        it.world.scoreboard.get("obj", holder).unwrap()
+    }
+
+    fn at(it: &Interpreter, path: &str) -> Vec<NbtValue> {
+        NbtPath::parse(path)
+            .unwrap()
+            .resolve(it.world.storage("ns:mw"))
+    }
+
+    #[test]
+    fn a_condition_with_no_run_reports_whether_it_held() {
+        let mut it = setup();
+        it.run_line("scoreboard players set $a obj 3");
+        assert_eq!(
+            it.run_line("execute if score $a obj matches 1..5"),
+            Outcome::ok(1)
+        );
+        assert_eq!(
+            it.run_line("execute if score $a obj matches 4..5"),
+            Outcome::FAILED
+        );
+        assert_eq!(
+            it.run_line("execute unless score $a obj matches 4..5"),
+            Outcome::ok(1)
+        );
+    }
+
+    #[test]
+    fn ranges_are_open_at_either_end() {
+        let mut it = setup();
+        it.run_line("scoreboard players set $a obj 3");
+        for (range, expected) in [
+            ("3", true),
+            ("4", false),
+            ("3..", true),
+            ("4..", false),
+            ("..3", true),
+            ("..2", false),
+            ("1..5", true),
+        ] {
+            let out = it.run_line(&format!("execute if score $a obj matches {range}"));
+            assert_eq!(!out.failed(), expected, "range {range}");
+        }
+    }
+
+    #[test]
+    fn scores_compare_against_each_other() {
+        let mut it = setup();
+        it.run_line("scoreboard players set $a obj 3");
+        it.run_line("scoreboard players set $b obj 5");
+        for (op, expected) in [
+            ("<", true),
+            ("<=", true),
+            ("=", false),
+            (">=", false),
+            (">", false),
+        ] {
+            let out = it.run_line(&format!("execute if score $a obj {op} $b obj"));
+            assert_eq!(!out.failed(), expected, "operator {op}");
+        }
+    }
+
+    #[test]
+    fn an_unset_score_makes_a_condition_false_rather_than_an_error() {
+        let mut it = setup();
+        let out = it.run_line("execute if score $missing obj matches 0..");
+        assert_eq!(out, Outcome::FAILED);
+        assert!(it.diagnostics.is_empty(), "{:?}", it.diagnostics);
+    }
+
+    #[test]
+    fn if_data_tests_whether_a_path_matches() {
+        let mut it = setup();
+        it.run_line("data modify storage ns:mw a.b set value 1");
+        assert_eq!(
+            it.run_line("execute if data storage ns:mw a.b"),
+            Outcome::ok(1)
+        );
+        assert_eq!(
+            it.run_line("execute if data storage ns:mw a.c"),
+            Outcome::FAILED
+        );
+        assert_eq!(
+            it.run_line("execute unless data storage ns:mw a.c"),
+            Outcome::ok(1)
+        );
+    }
+
+    #[test]
+    fn run_executes_only_when_every_condition_holds() {
+        let mut it = setup();
+        it.run_line("scoreboard players set $a obj 1");
+        it.run_line("execute if score $a obj matches 1 run scoreboard players set $hit obj 1");
+        assert_eq!(score(&it, "$hit"), Some(1));
+
+        it.run_line("execute if score $a obj matches 1 if score $a obj matches 2 run scoreboard players set $miss obj 1");
+        assert_eq!(score(&it, "$miss"), None);
+    }
+
+    #[test]
+    fn store_result_captures_the_commands_value() {
+        let mut it = setup();
+        it.run_line("scoreboard players set $a obj 42");
+        it.run_line("execute store result score $out obj run scoreboard players get $a obj");
+        assert_eq!(score(&it, "$out"), Some(42));
+    }
+
+    #[test]
+    fn store_success_is_zero_for_a_failed_command() {
+        // The premise behind `Option<T>` being cheap in the source language.
+        let mut it = setup();
+        it.run_line("execute store success score $ok obj run scoreboard players get $missing obj");
+        assert_eq!(score(&it, "$ok"), Some(0));
+
+        it.run_line("scoreboard players set $missing obj 1");
+        it.run_line("execute store success score $ok obj run scoreboard players get $missing obj");
+        assert_eq!(score(&it, "$ok"), Some(1));
+    }
+
+    #[test]
+    fn store_applies_even_when_a_condition_blocked_the_command() {
+        let mut it = setup();
+        it.run_line("scoreboard players set $out obj 99");
+        it.run_line("execute store result score $out obj if score $a obj matches 1 run say hi");
+        assert_eq!(score(&it, "$out"), Some(0));
+    }
+
+    #[test]
+    fn store_into_storage_honours_the_tag_and_scale() {
+        let mut it = setup();
+        it.run_line("scoreboard players set $a obj 7");
+        it.run_line("execute store result storage ns:mw v int 1 run scoreboard players get $a obj");
+        it.run_line(
+            "execute store result storage ns:mw b byte 1 run scoreboard players get $a obj",
+        );
+        it.run_line(
+            "execute store result storage ns:mw d double 0.5 run scoreboard players get $a obj",
+        );
+        assert_eq!(at(&it, "v"), vec![NbtValue::Int(7)]);
+        assert_eq!(at(&it, "b"), vec![NbtValue::Byte(7)]);
+        assert_eq!(at(&it, "d"), vec![NbtValue::Double(3.5)]);
+    }
+
+    #[test]
+    fn several_stores_all_fire() {
+        let mut it = setup();
+        it.run_line("scoreboard players set $a obj 5");
+        it.run_line(
+            "execute store result score $r obj store success score $s obj run scoreboard players get $a obj",
+        );
+        assert_eq!((score(&it, "$r"), score(&it, "$s")), (Some(5), Some(1)));
+    }
+
+    #[test]
+    fn execute_nests() {
+        let mut it = setup();
+        it.run_line("scoreboard players set $a obj 1");
+        it.run_line(
+            "execute if score $a obj matches 1 run execute if score $a obj matches 1 run scoreboard players set $deep obj 1",
+        );
+        assert_eq!(score(&it, "$deep"), Some(1));
+    }
+
+    #[test]
+    fn recursion_terminates_when_its_condition_stops_holding() {
+        let mut it = setup();
+        it.load(
+            "ns:count",
+            "scoreboard players remove $n obj 1\n\
+             execute if score $n obj matches 1.. run function ns:count",
+        )
+        .unwrap();
+        it.run_line("scoreboard players set $n obj 5");
+        it.run_line("function ns:count");
+        assert_eq!(score(&it, "$n"), Some(0));
+        assert!(it.diagnostics.is_empty(), "{:?}", it.diagnostics);
+    }
+
+    #[test]
+    fn the_entity_clauses_say_they_are_deferred_rather_than_doing_nothing() {
+        let mut it = setup();
+        for line in [
+            "execute as @e[type=zombie] run say hi",
+            "execute at @s run say hi",
+            "execute if entity @s run say hi",
+            "execute if predicate ns:p run say hi",
+        ] {
+            it.diagnostics.clear();
+            assert_eq!(it.run_line(line), Outcome::FAILED, "{line}");
+            assert!(
+                it.diagnostics.iter().any(|d| d.contains("M0-8b")),
+                "{line}: {:?}",
+                it.diagnostics
+            );
+        }
     }
 }

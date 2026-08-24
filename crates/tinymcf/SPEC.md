@@ -259,17 +259,43 @@ A function call's outcome is:
 
 Calling an unknown function fails.
 
-### 4.4 `execute` — *pending (M0-8)*
+### 4.4 `execute` — **done**, except the entity clauses (M0-8b)
 
-- `if` / `unless`: `score`, `data`, `entity`, `block`, `predicate`
-- `store result` / `store success` into `score` or `storage`, with scale and tag
-- `as`, `at`, `positioned`, `in`
+```
+execute <clause>* [run <command>]
 
-Context is executor, position, rotation and dimension. `as` changes the executor and
-**not** the position; `at` changes the position.
+clause := if|unless score <holder> <obj> <|<=|=|>=|> <holder> <obj>
+        | if|unless score <holder> <obj> matches <range>
+        | if|unless data <target> <path>
+        | store result|success score <holder> <obj>
+        | store result|success storage <id> <path> <type> <scale>
+range  := <int> | <min>.. | ..<max> | <min>..<max>
+type   := byte | short | int | long | float | double
+```
 
-Since there are no entities (§1), `as` and `if entity` operate on selector strings the
-caller has registered with the harness rather than on a simulated world.
+With `run`, the outcome is the command's. Without it, the outcome is 1 when every
+condition holds and 0 otherwise.
+
+Conditions are evaluated left to right. A score that is not set makes a condition
+false; it is not an error.
+
+`store` clauses apply **after** the command, and apply even when it failed — a failed
+command stores `success` 0 and `result` 0. Code that reads back a store therefore sees
+a definite value either way, which is what makes `Option<T>` cheap in the source
+language. The stored number is `value × scale`, converted to the named tag; `byte`,
+`short`, `int` and `long` truncate toward zero and wrap.
+
+Nesting works: `run` takes a whole command, `execute` included.
+
+#### Deferred to M0-8b
+
+`as`, `at`, `positioned`, `in`, `if entity`, `if block` and `if predicate` are **not
+implemented**. Each needs a stub registry mapping selector strings to entities the
+harness has declared, plus an execution context (executor, position, dimension), and
+that is a separate piece of design. Nothing before M5 of the compiler needs them, and
+M0's own acceptance test — factorial and Fibonacci in handwritten mcfunction — does
+not. They parse and fail with a diagnostic saying so, rather than silently doing
+nothing.
 
 ### 4.5 Macro functions — *pending (M0-9)*
 

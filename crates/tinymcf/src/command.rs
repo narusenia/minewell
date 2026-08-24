@@ -17,12 +17,93 @@ pub enum Command {
     Data(Data),
     Function(String),
     Return(Return),
+    Execute(Execute),
     /// A command outside the modelled subset. Kept verbatim rather than rejected: a
     /// compiler emitting something unmodelled should still produce a usable trace.
     Unknown {
         name: String,
         args: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Execute {
+    pub clauses: Vec<Clause>,
+    /// Absent for the bare conditional form, whose outcome is the conditions themselves.
+    pub run: Option<Box<Command>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Clause {
+    Cond {
+        negated: bool,
+        cond: Condition,
+    },
+    Store {
+        success: bool,
+        into: StoreTarget,
+    },
+    /// Parsed but not implemented; see `SPEC.md` §4.4.
+    Deferred(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Condition {
+    Score {
+        holder: String,
+        objective: String,
+        test: ScoreTest,
+    },
+    Data {
+        target: Target,
+        path: NbtPath,
+    },
+    /// Parsed but not implemented; see `SPEC.md` §4.4.
+    Deferred(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScoreTest {
+    Against {
+        op: Cmp,
+        holder: String,
+        objective: String,
+    },
+    /// An open range: either bound may be absent.
+    Matches { min: Option<i32>, max: Option<i32> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cmp {
+    Lt,
+    Le,
+    Eq,
+    Ge,
+    Gt,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StoreTarget {
+    Score {
+        holder: String,
+        objective: String,
+    },
+    Storage {
+        id: String,
+        path: NbtPath,
+        tag: NumTag,
+        scale: f64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumTag {
+    Byte,
+    Short,
+    Int,
+    Long,
+    Float,
+    Double,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -194,6 +275,7 @@ impl Command {
         match name.as_str() {
             "scoreboard" => Ok(Command::Scoreboard(scoreboard(&mut args)?)),
             "data" => Ok(Command::Data(data(&mut args)?)),
+            "execute" => Ok(Command::Execute(execute(&mut args)?)),
             "function" => {
                 let id = args.word()?.to_owned();
                 args.end()?;
@@ -222,8 +304,157 @@ impl Command {
             Command::Data(_) => "data",
             Command::Function(_) => "function",
             Command::Return(_) => "return",
+            Command::Execute(_) => "execute",
             Command::Unknown { name, .. } => name,
         }
+    }
+}
+
+fn execute(args: &mut Args) -> Result<Execute, ParseError> {
+    let mut clauses = Vec::new();
+    loop {
+        if args.is_empty() {
+            return Ok(Execute { clauses, run: None });
+        }
+        if args.literal("run") {
+            let run = Box::new(Command::parse(args.rest())?);
+            return Ok(Execute {
+                clauses,
+                run: Some(run),
+            });
+        }
+        clauses.push(clause(args)?);
+    }
+}
+
+fn clause(args: &mut Args) -> Result<Clause, ParseError> {
+    let word = args.word()?;
+    match word {
+        "if" | "unless" => Ok(Clause::Cond {
+            negated: word == "unless",
+            cond: condition(args)?,
+        }),
+        "store" => {
+            let what = args.word()?;
+            let success = match what {
+                "result" => false,
+                "success" => true,
+                other => return Err(unexpected(other)),
+            };
+            Ok(Clause::Store {
+                success,
+                into: store_target(args)?,
+            })
+        }
+        // Everything that needs a world. Consumed so the rest of the line still parses.
+        "as" | "at" | "positioned" | "rotated" | "in" | "anchored" | "align" | "facing" | "on"
+        | "summon" => {
+            args.word()?;
+            Ok(Clause::Deferred(word.to_owned()))
+        }
+        other => Err(unexpected(other)),
+    }
+}
+
+fn condition(args: &mut Args) -> Result<Condition, ParseError> {
+    let kind = args.word()?;
+    match kind {
+        "score" => {
+            let holder = args.word()?.to_owned();
+            let objective = args.word()?.to_owned();
+            let word = args.word()?;
+            let test = if word == "matches" {
+                let range = args.word()?;
+                let (min, max) = parse_range(range)?;
+                ScoreTest::Matches { min, max }
+            } else {
+                let op = match word {
+                    "<" => Cmp::Lt,
+                    "<=" => Cmp::Le,
+                    "=" => Cmp::Eq,
+                    ">=" => Cmp::Ge,
+                    ">" => Cmp::Gt,
+                    other => return Err(unexpected(other)),
+                };
+                ScoreTest::Against {
+                    op,
+                    holder: args.word()?.to_owned(),
+                    objective: args.word()?.to_owned(),
+                }
+            };
+            Ok(Condition::Score {
+                holder,
+                objective,
+                test,
+            })
+        }
+        "data" => {
+            let target = Target::parse(args)?;
+            let path = args.path()?;
+            Ok(Condition::Data { target, path })
+        }
+        "entity" | "block" | "predicate" | "biome" | "blocks" | "dimension" | "loaded" => {
+            // Consumed whole, so the deferral is reported when it runs rather than as
+            // a syntax error the caller cannot act on.
+            args.rest();
+            Ok(Condition::Deferred(kind.to_owned()))
+        }
+        other => Err(unexpected(other)),
+    }
+}
+
+/// `3`, `3..`, `..3`, `1..5`.
+fn parse_range(text: &str) -> Result<(Option<i32>, Option<i32>), ParseError> {
+    let bound = |s: &str| -> Result<Option<i32>, ParseError> {
+        if s.is_empty() {
+            Ok(None)
+        } else {
+            s.parse()
+                .map(Some)
+                .map_err(|_| ParseError::new(0, format!("bad range bound '{s}'")))
+        }
+    };
+    match text.split_once("..") {
+        Some((min, max)) => Ok((bound(min)?, bound(max)?)),
+        None => {
+            let exact = bound(text)?;
+            Ok((exact, exact))
+        }
+    }
+}
+
+fn store_target(args: &mut Args) -> Result<StoreTarget, ParseError> {
+    let kind = args.word()?;
+    match kind {
+        "score" => Ok(StoreTarget::Score {
+            holder: args.word()?.to_owned(),
+            objective: args.word()?.to_owned(),
+        }),
+        "storage" => {
+            let id = args.word()?.to_owned();
+            let path = args.path()?;
+            let word = args.word()?;
+            let tag = match word {
+                "byte" => NumTag::Byte,
+                "short" => NumTag::Short,
+                "int" => NumTag::Int,
+                "long" => NumTag::Long,
+                "float" => NumTag::Float,
+                "double" => NumTag::Double,
+                other => return Err(unexpected(other)),
+            };
+            let word = args.word()?;
+            let scale = word
+                .parse()
+                .map_err(|_| ParseError::new(0, format!("expected a scale, found '{word}'")))?;
+            Ok(StoreTarget::Storage {
+                id,
+                path,
+                tag,
+                scale,
+            })
+        }
+        other => Err(unexpected(other)),
     }
 }
 
