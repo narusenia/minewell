@@ -20,6 +20,8 @@ toml = "0.9"
 insta = "1"
 miette = { version = "7", features = ["fancy"] }
 tempfile = "3"
+# The interpreter is a dev-dependency only. See tests/independence.rs.
+tinymcf = { path = "../tinymcf" }
 
 [lints]
 workspace = true

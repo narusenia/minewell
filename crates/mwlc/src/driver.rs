@@ -75,14 +75,6 @@ pub fn build(root: &Path, profile: Profile) -> Result<Datapack, BuildError> {
     let manifest = manifest(root)?;
     let path = root.join(ROOT_SOURCE);
     let text = read(&path)?;
-    let shown = path.display().to_string();
-
-    let (file, mut errors) = crate::syntax::parser::parse(&text);
-    let (hir, more) = crate::hir::lower(&file, manifest.package.namespace());
-    errors.extend(more);
-    if let Some(report) = Report::of(&shown, &text, errors) {
-        return Err(report.into());
-    }
 
     let options = Options {
         description: manifest
@@ -92,12 +84,31 @@ pub fn build(root: &Path, profile: Profile) -> Result<Datapack, BuildError> {
             .unwrap_or_else(|| manifest.package.name.clone()),
         profile,
         source: Some(emit::Source {
-            path: shown,
+            path: path.display().to_string(),
             text: text.clone(),
         }),
         ..Options::default()
     };
-    Ok(emit::emit(&crate::mir::lower(&hir), &options))
+    Ok(compile(&text, manifest.package.namespace(), &options)?)
+}
+
+/// Source text to datapack, touching nothing outside memory.
+///
+/// The whole compiler between the two I/O edges. Tests drive this directly, which is
+/// what lets the vertical harness compile and run a program without a project on disk.
+pub fn compile(text: &str, namespace: &str, options: &Options) -> Result<Datapack, Report> {
+    let shown = options
+        .source
+        .as_ref()
+        .map_or("<input>", |source| source.path.as_str());
+
+    let (file, mut errors) = crate::syntax::parser::parse(text);
+    let (hir, more) = crate::hir::lower(&file, namespace);
+    errors.extend(more);
+    if let Some(report) = Report::of(shown, text, errors) {
+        return Err(report);
+    }
+    Ok(emit::emit(&crate::mir::lower(&hir), options))
 }
 
 fn read(path: &Path) -> Result<String, BuildError> {
