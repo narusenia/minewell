@@ -7,9 +7,17 @@
 //
 // Passing a struct is one command too — the compound is copied from the caller's path
 // to the callee's. Nothing is boxed, nothing is looked up by name at runtime.
+//
+// `#[nbt(..)]` decides how a field is written. It matters: vanilla treats `Byte(1)` and
+// `Int(1)` as different values, and ignores data written with the wrong tag without
+// saying a word. The tag is part of the type here so that mistake is a compile error.
 
 struct Stats {
+    /// Mob health in vanilla is `Health`, and it is a float — but the arithmetic here
+    /// is integer, so this pack keeps its own copy under a name of its choosing.
+    #[nbt(rename = "HealthPoints")]
     health: i32,
+    #[nbt(byte)]
     armour: i32,
     poisoned: bool,
 }

@@ -873,6 +873,43 @@ mod structs {
         assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
     }
 
+    /// `#[nbt(..)]`, spec section 4.8. Vanilla silently ignores data written with the
+    /// wrong tag, so choosing the tag is the whole point of the attribute.
+    #[test]
+    fn a_field_can_choose_its_nbt_tag() {
+        let mc = run("struct Mob { #[nbt(byte)] hp: i32 } \
+             fn main() { let m = Mob { hp: 3 }; }");
+        assert_eq!(
+            stored(&mc, "main", "m"),
+            Some(compound(&[("hp", NbtValue::Byte(3))]))
+        );
+    }
+
+    #[test]
+    fn a_computed_field_is_written_with_its_chosen_tag() {
+        let mc = run("struct Mob { #[nbt(short)] hp: i32 } \
+             fn main() { let n = 20; let m = Mob { hp: n * 2 }; }");
+        assert_eq!(
+            stored(&mc, "main", "m"),
+            Some(compound(&[("hp", NbtValue::Short(40))]))
+        );
+    }
+
+    #[test]
+    fn a_field_can_be_renamed_for_vanilla() {
+        let mc = run("struct Mob { #[nbt(rename = \"Health\")] hp: i32 } \
+             fn main() { let mut m = Mob { hp: 3 }; m.hp = 4; let x = m.hp; }");
+        assert_eq!(
+            at_path(&mc, "mw.vars.main.m.Health"),
+            Some(NbtValue::Int(4))
+        );
+        assert_eq!(
+            local(&mc, "main", "x"),
+            Some(4),
+            "reading follows the rename"
+        );
+    }
+
     #[test]
     fn a_mutable_binding_can_be_replaced_wholesale() {
         let mc = run("struct Point { x: i32 } \

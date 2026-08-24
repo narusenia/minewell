@@ -98,10 +98,12 @@ fn type_name(ty: Type, structs: &[StructDef]) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Place {
     pub local: LocalId,
-    /// Field names from the binding outwards; empty for the binding itself.
+    /// NBT keys from the binding outwards; empty for the binding itself.
     pub fields: Vec<String>,
     /// The type of the value addressed, which is the innermost field's.
     pub ty: Type,
+    /// The tag it is stored as; `None` for a whole compound.
+    pub tag: Option<NbtTag>,
 }
 
 /// A `struct` definition: an NBT compound with a known shape (spec section 4.8).
@@ -115,8 +117,67 @@ pub struct StructDef {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
+    /// The name the source writes.
     pub name: String,
+    /// The key in the compound, which `#[nbt(rename = "..")]` can change.
+    pub nbt: String,
     pub ty: Type,
+    /// `None` for a composite field: a compound has no scalar tag.
+    pub tag: Option<NbtTag>,
+}
+
+/// The NBT tag a scalar field is stored as.
+///
+/// It has to be part of the type, not a detail of emission: vanilla treats `Byte(1)`
+/// and `Int(1)` as different values and ignores the wrong one without a word
+/// (requirements section 4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NbtTag {
+    Byte,
+    Short,
+    Int,
+    Long,
+}
+
+impl NbtTag {
+    fn parse(name: &str) -> Option<NbtTag> {
+        Some(match name {
+            "byte" => NbtTag::Byte,
+            "short" => NbtTag::Short,
+            "int" => NbtTag::Int,
+            "long" => NbtTag::Long,
+            _ => return None,
+        })
+    }
+
+    /// As `execute store result storage` spells it.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            NbtTag::Byte => "byte",
+            NbtTag::Short => "short",
+            NbtTag::Int => "int",
+            NbtTag::Long => "long",
+        }
+    }
+
+    /// As SNBT spells a literal of this tag.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            NbtTag::Byte => "b",
+            NbtTag::Short => "s",
+            NbtTag::Int => "",
+            NbtTag::Long => "L",
+        }
+    }
+
+    /// The tag a type is written as when nothing says otherwise.
+    fn default_for(ty: Type) -> Option<NbtTag> {
+        match ty {
+            Type::I32 => Some(NbtTag::Int),
+            Type::Bool => Some(NbtTag::Byte),
+            _ => None,
+        }
+    }
 }
 
 impl StructDef {
@@ -528,13 +589,6 @@ fn collect_structs(
         }
         let mut fields: Vec<Field> = Vec::new();
         for field in &declared.fields {
-            for attr in &field.attrs {
-                errors.push(SyntaxError::new(
-                    attr.span,
-                    "field attributes are not implemented yet; the NBT tag of a field \
-                     is its type's default for now",
-                ));
-            }
             let Some(ty) = resolve_type(&field.ty, &ids, errors) else {
                 continue;
             };
@@ -546,9 +600,23 @@ fn collect_structs(
                 ));
                 continue;
             }
+            let (tag, rename) = nbt_attrs(field, ty, errors);
+            let nbt = rename.unwrap_or_else(|| field.name.name.clone());
+            // Two fields writing one key is one field, silently: the second write
+            // would overwrite the first and nothing would say so.
+            if let Some(other) = fields.iter().find(|f| f.nbt == nbt) {
+                let other = other.name.clone();
+                errors.push(SyntaxError::new(
+                    field.name.span,
+                    format!("this field and '{other}' would both be stored as '{nbt}'"),
+                ));
+                continue;
+            }
             fields.push(Field {
                 name: field.name.name.clone(),
+                nbt,
                 ty,
+                tag,
             });
         }
         structs.push(StructDef {
@@ -569,6 +637,78 @@ fn collect_structs(
         }
     }
     (structs, ids)
+}
+
+/// The `#[nbt(..)]` options on a field: which tag, and which key.
+fn nbt_attrs(
+    field: &ast::FieldDef,
+    ty: Type,
+    errors: &mut Vec<SyntaxError>,
+) -> (Option<NbtTag>, Option<String>) {
+    let mut tag = NbtTag::default_for(ty);
+    let mut rename = None;
+    for attr in &field.attrs {
+        let Some(TokenKind::Ident(name)) = attr.tokens.first().map(|t| &t.kind) else {
+            errors.push(SyntaxError::new(attr.span, "expected an attribute name"));
+            continue;
+        };
+        if name != "nbt" {
+            let name = name.clone();
+            errors.push(SyntaxError::new(
+                attr.span,
+                format!("'{name}' is not an attribute a field can carry"),
+            ));
+            continue;
+        }
+        let mut tokens = attr.tokens.iter().skip(1).peekable();
+        while let Some(token) = tokens.next() {
+            let TokenKind::Ident(option) = &token.kind else {
+                continue;
+            };
+            if option == "rename" {
+                // `rename = "Health"`.
+                let text = tokens.nth(1).map(|t| t.kind.clone());
+                match text {
+                    Some(TokenKind::Str(text)) => rename = Some(text),
+                    _ => errors.push(SyntaxError::new(
+                        token.span,
+                        "rename takes a string: #[nbt(rename = \"Health\")]",
+                    )),
+                }
+                continue;
+            }
+            if option == "optional" {
+                errors.push(SyntaxError::new(
+                    token.span,
+                    "#[nbt(optional)] is not implemented yet: a missing field is read \
+                     as Option<T>, which arrives with enums",
+                ));
+                continue;
+            }
+            match NbtTag::parse(option) {
+                Some(_) if ty == Type::Bool => errors.push(SyntaxError::new(
+                    token.span,
+                    "a bool is stored as a byte; vanilla has no other boolean tag",
+                )),
+                Some(_) if ty.is_storage() => errors.push(SyntaxError::new(
+                    token.span,
+                    "a struct field is a compound, so it has no scalar tag",
+                )),
+                Some(chosen) => tag = Some(chosen),
+                None => {
+                    let option = option.clone();
+                    errors.push(SyntaxError::new(
+                        token.span,
+                        format!(
+                            "unknown nbt option '{option}'; expected byte, short, int, \
+                             long or rename"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    (tag, rename)
 }
 
 /// Whether a struct can reach itself through its fields, directly or through others.
@@ -1068,10 +1208,12 @@ impl FnLowering<'_> {
         match expr {
             AstExpr::Path(name) => {
                 let local = self.lookup(name)?;
+                let ty = self.locals[local.0 as usize].ty;
                 Some(Place {
                     local,
                     fields: Vec::new(),
-                    ty: self.locals[local.0 as usize].ty,
+                    ty,
+                    tag: NbtTag::default_for(ty),
                 })
             }
             AstExpr::Field(access) => {
@@ -1093,13 +1235,14 @@ impl FnLowering<'_> {
                     );
                     return None;
                 };
-                let ty = field.ty;
+                let (ty, tag, key) = (field.ty, field.tag, field.nbt.clone());
                 let mut fields = base.fields;
-                fields.push(access.name.name.clone());
+                fields.push(key);
                 Some(Place {
                     local: base.local,
                     fields,
                     ty,
+                    tag,
                 })
             }
             other => {
@@ -2310,9 +2453,40 @@ mod tests {
         }
 
         #[test]
-        fn a_field_attribute_says_it_is_not_implemented() {
-            let errors = lower_err("struct Mob { #[nbt(byte)] hp: i32 }");
+        fn an_nbt_tag_a_bool_cannot_have_is_reported() {
+            let errors = lower_err("struct Mob { #[nbt(int)] alive: bool }");
+            assert!(errors[0].message.contains("byte"), "{errors:?}");
+        }
+
+        #[test]
+        fn an_unknown_nbt_option_is_reported() {
+            let errors = lower_err("struct Mob { #[nbt(gigantic)] hp: i32 }");
+            assert!(errors[0].message.contains("gigantic"), "{errors:?}");
+        }
+
+        #[test]
+        fn nbt_optional_says_what_it_is_waiting_for() {
+            let errors = lower_err("struct Mob { #[nbt(optional)] hp: i32 }");
             assert!(errors[0].message.contains("not implemented"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_tag_on_a_composite_field_is_reported() {
+            let errors =
+                lower_err("struct Inner { a: i32 } struct Outer { #[nbt(byte)] i: Inner }");
+            assert!(errors[0].message.contains("compound"), "{errors:?}");
+        }
+
+        #[test]
+        fn two_fields_cannot_share_one_nbt_key() {
+            let errors = lower_err("struct Mob { hp: i32, #[nbt(rename = \"hp\")] health: i32 }");
+            assert!(errors[0].message.contains("both be stored"), "{errors:?}");
+        }
+
+        #[test]
+        fn an_unknown_field_attribute_is_reported() {
+            let errors = lower_err("struct Mob { #[score] hp: i32 }");
+            assert!(errors[0].message.contains("score"), "{errors:?}");
         }
 
         #[test]

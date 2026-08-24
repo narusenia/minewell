@@ -13,7 +13,7 @@
 //!
 //! Today every function is one block. Control flow arrives in M3.
 
-use crate::hir::{self, FnId, Hir, LocalId, StructDef, Type};
+use crate::hir::{self, FnId, Hir, LocalId, NbtTag, StructDef, Type};
 use crate::syntax::ast::{BinaryOp, UnaryOp};
 use crate::syntax::lexer::Span;
 
@@ -578,12 +578,9 @@ fn place_path(function: &hir::Function, place: &hir::Place) -> String {
     path
 }
 
-/// The NBT tag a scalar field is written as (requirements section 4.2).
-fn tag_of(ty: Type) -> &'static str {
-    match ty {
-        Type::Bool => "byte",
-        _ => "int",
-    }
+/// The tag to store a scalar as when nothing named one.
+fn tag_of(tag: Option<NbtTag>) -> &'static str {
+    tag.unwrap_or(NbtTag::Int).keyword()
 }
 
 struct Lowering<'a, 'p> {
@@ -641,7 +638,7 @@ impl<'p> Lowering<'_, 'p> {
                 place, op, value, ..
             } if place.ty.is_storage() || !place.fields.is_empty() => {
                 let path = place_path(self.function, place);
-                self.assign_in_storage(&path, place.ty, *op, value);
+                self.assign_in_storage(&path, place.ty, place.tag, *op, value);
             }
             hir::Stmt::Let { local, value, .. } => {
                 let dst = self.local(*local);
@@ -668,7 +665,14 @@ impl<'p> Lowering<'_, 'p> {
     /// A compound assignment is the one case that costs three commands: the arithmetic
     /// has to happen on the scoreboard, so the field is read out, changed and written
     /// back. Vanilla has no arithmetic on storage to shorten this with.
-    fn assign_in_storage(&mut self, path: &str, ty: Type, op: Option<BinaryOp>, value: &hir::Expr) {
+    fn assign_in_storage(
+        &mut self,
+        path: &str,
+        ty: Type,
+        tag: Option<NbtTag>,
+        op: Option<BinaryOp>,
+        value: &hir::Expr,
+    ) {
         if ty.is_storage() {
             self.store_struct(path, value);
             return;
@@ -691,14 +695,11 @@ impl<'p> Lowering<'_, 'p> {
             // A constant needs no register to pass through: `set value` takes it.
             Value::Const(n) => self.insts.push(Inst::SetValue {
                 path: path.to_owned(),
-                value: match ty {
-                    Type::Bool => format!("{n}b"),
-                    _ => n.to_string(),
-                },
+                value: format!("{n}{}", tag.unwrap_or(NbtTag::Int).suffix()),
             }),
             Value::Reg(src) => self.insts.push(Inst::StoreData {
                 path: path.to_owned(),
-                tag: tag_of(ty),
+                tag: tag_of(tag),
                 inst: Box::new(Inst::Get { src }),
             }),
         }
@@ -711,7 +712,7 @@ impl<'p> Lowering<'_, 'p> {
     fn store_struct(&mut self, path: &str, value: &hir::Expr) {
         match &value.kind {
             hir::ExprKind::Struct { .. } => {
-                let snbt = self.snbt(value);
+                let snbt = self.snbt(value, None);
                 self.insts.push(Inst::SetValue {
                     path: path.to_owned(),
                     value: snbt,
@@ -741,26 +742,26 @@ impl<'p> Lowering<'_, 'p> {
     /// The placeholder costs nothing: the key has to be in the compound either way,
     /// and writing it here means the store that follows overwrites rather than
     /// creates — one fewer way for a mistake to leave the field quietly absent.
-    fn snbt(&self, value: &hir::Expr) -> String {
+    fn snbt(&self, value: &hir::Expr, tag: Option<NbtTag>) -> String {
+        let suffix = tag.map(NbtTag::suffix).unwrap_or_default();
         match &value.kind {
-            hir::ExprKind::Int(n) => n.to_string(),
-            hir::ExprKind::Bool(b) => format!("{}b", i32::from(*b)),
+            hir::ExprKind::Int(n) => format!("{n}{suffix}"),
+            hir::ExprKind::Bool(b) => format!("{}{suffix}", i32::from(*b)),
             hir::ExprKind::Struct { id, fields } => {
                 let def = &self.program.structs[id.0 as usize];
                 let body = def
                     .fields
                     .iter()
                     .zip(fields)
-                    .map(|(field, value)| format!("{}:{}", field.name, self.snbt(value)))
+                    .map(|(field, value)| format!("{}:{}", field.nbt, self.snbt(value, field.tag)))
                     .collect::<Vec<_>>()
                     .join(",");
                 format!("{{{body}}}")
             }
             // Not known now: leave room for the write that follows.
             _ => match value.ty {
-                Type::Bool => "0b".to_owned(),
                 Type::Struct(_) => "{}".to_owned(),
-                _ => "0".to_owned(),
+                _ => format!("0{suffix}"),
             },
         }
     }
@@ -772,7 +773,7 @@ impl<'p> Lowering<'_, 'p> {
         };
         let def = self.program.structs[id.0 as usize].clone();
         for (field, value) in def.fields.iter().zip(fields) {
-            let path = format!("{path}.{}", field.name);
+            let path = format!("{path}.{}", field.nbt);
             match &value.kind {
                 hir::ExprKind::Int(_) | hir::ExprKind::Bool(_) => {}
                 hir::ExprKind::Struct { .. } => self.write_runtime_fields(&path, value),
@@ -782,7 +783,7 @@ impl<'p> Lowering<'_, 'p> {
                     let src = self.materialise(src);
                     self.insts.push(Inst::StoreData {
                         path,
-                        tag: tag_of(field.ty),
+                        tag: tag_of(field.tag),
                         inst: Box::new(Inst::Get { src }),
                     });
                 }
