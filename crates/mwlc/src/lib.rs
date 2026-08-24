@@ -10,4 +10,5 @@
 //! independently publishable, and the two only meet in tests.
 
 pub mod diagnostics;
+pub mod hir;
 pub mod syntax;
