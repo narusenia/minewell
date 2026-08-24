@@ -342,6 +342,7 @@ fn print_generated_commands() {
                      o.inner.a += 1; let x = take(o); }",
         "fn main() { let mut v = [1, 2, 3]; let i = 2; v[i] = 9; let x = v[i]; v.push(x);
                      let n = v.len(); }",
+        "fn main() { let v = [1, 2, 3]; let mut sum = 0; for x in v { sum += x; } }",
         "enum State { Idle, Chasing { target: i32 } }
          fn main() { let mut s = State::Chasing { target: 3 }; let mut x = 0;
                      match s { State::Idle => { x = 1; }
@@ -1259,5 +1260,100 @@ mod vectors {
         mc.call("test:main");
         assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
         assert_eq!(local(&mc, "main", "n"), Some(2));
+    }
+}
+
+/// `for x in vec`. Spec section 6.22: destructive iteration over a copy, no macros.
+mod iteration {
+    use super::harness::{local, run, stored};
+    use tinymcf::nbt::NbtValue;
+
+    #[test]
+    fn every_element_is_visited() {
+        let mc = run("fn main() { let v = [1, 2, 3]; let mut sum = 0; \
+                         for x in v { sum += x; } }");
+        assert_eq!(local(&mc, "main", "sum"), Some(6));
+    }
+
+    /// The task's "test to write first": the index is always `[0]`, so nothing here
+    /// needs a macro function.
+    #[test]
+    fn iterating_generates_no_macro_lines() {
+        let src = "fn main() { let v = [1, 2, 3]; let mut sum = 0; \
+                    for x in v { sum += x; } }";
+        let pack =
+            mwlc::driver::compile(src, "test", &mwlc::emit::Options::default()).expect("compiles");
+        for (path, text) in &pack.files {
+            assert!(
+                !text.lines().any(|line| line.starts_with('$')),
+                "{path} is a macro function:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_original_list_is_left_alone() {
+        let mc = run(
+            "fn main() { let v = [1, 2]; let mut n = 0; for x in v { n += 1; } \
+                         let left = v.len(); }",
+        );
+        assert_eq!(local(&mc, "main", "n"), Some(2));
+        assert_eq!(local(&mc, "main", "left"), Some(2), "iteration copies");
+        assert_eq!(
+            stored(&mc, "main", "v"),
+            Some(NbtValue::List(vec![NbtValue::Int(1), NbtValue::Int(2)]))
+        );
+    }
+
+    #[test]
+    fn break_and_continue_work_inside() {
+        let mc = run("fn main() { let v = [1, 2, 3, 4]; let mut sum = 0; \
+                         for x in v { \
+                             if x == 2 { continue; } \
+                             if x == 4 { break; } \
+                             sum += x; \
+                         } }");
+        assert_eq!(local(&mc, "main", "sum"), Some(4), "1 + 3");
+    }
+
+    #[test]
+    fn a_composite_element_is_bound_whole() {
+        let mc = run("struct Point { x: i32 } \
+             fn main() { let v = [Point { x: 2 }, Point { x: 5 }]; let mut sum = 0; \
+                         for p in v { sum += p.x; } }");
+        assert_eq!(local(&mc, "main", "sum"), Some(7));
+    }
+
+    #[test]
+    fn a_return_inside_leaves_the_function() {
+        let mc = run("fn first_big(v: Vec<i32>) -> i32 { \
+                 for x in v { if x > 2 { return x; } } \
+                 return 0; \
+             } \
+             fn main() { let v = [1, 5, 9]; let x = first_big(v); }");
+        assert_eq!(local(&mc, "main", "x"), Some(5));
+    }
+
+    #[test]
+    fn a_list_in_a_field_can_be_iterated() {
+        let mc = run("struct Bag { items: Vec<i32> } \
+             fn main() { let b = Bag { items: [3, 4] }; let mut sum = 0; \
+                         for x in b.items { sum += x; } }");
+        assert_eq!(local(&mc, "main", "sum"), Some(7));
+    }
+
+    #[test]
+    fn the_binding_cannot_be_assigned_to() {
+        let src = "fn main() { let v = [1]; for x in v { x = 2; } }";
+        let report = mwlc::driver::compile(src, "test", &mwlc::emit::Options::default())
+            .expect_err("x is not mutable");
+        assert!(format!("{report:?}").contains("not mutable"), "{report:?}");
+    }
+
+    #[test]
+    fn nested_iteration_keeps_its_own_copy() {
+        let mc = run("fn main() { let v = [1, 2]; let mut sum = 0; \
+                         for a in v { for b in v { sum += a * b; } } }");
+        assert_eq!(local(&mc, "main", "sum"), Some(9), "(1+2) * (1+2)");
     }
 }

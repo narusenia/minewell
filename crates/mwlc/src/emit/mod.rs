@@ -289,6 +289,7 @@ fn command(inst: &Inst, ns: &str) -> String {
             format!("data modify storage {ns}:mw {path} set value {value}")
         }
         Inst::GetData { path } => format!("data get storage {ns}:mw {path}"),
+        Inst::RemoveData { path } => format!("data remove storage {ns}:mw {path}"),
         Inst::AppendValue { path, value } => {
             format!("data modify storage {ns}:mw {path} append value {value}")
         }

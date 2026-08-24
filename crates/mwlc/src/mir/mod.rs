@@ -117,6 +117,8 @@ pub enum Inst {
     CopyData { dst: String, src: String },
     /// `data get storage <ns>:mw <path>`, whose result is the value there.
     GetData { path: String },
+    /// `data remove storage <ns>:mw <path>`
+    RemoveData { path: String },
     /// `data modify storage <ns>:mw <path> append value <snbt>`
     AppendValue { path: String, value: String },
     /// `data modify storage <ns>:mw <dst> append from storage <ns>:mw <src>`
@@ -265,6 +267,11 @@ fn escapes(stmts: &[hir::Stmt]) -> Escapes {
             hir::Stmt::Match { arms, .. } => arms
                 .iter()
                 .fold(Escapes::default(), |acc, arm| acc.union(escapes(&arm.body))),
+            // A list loop swallows its own `break` and `continue`, as `while` does.
+            hir::Stmt::ForVec { body, .. } => Escapes {
+                returns: escapes(body).returns,
+                ..Escapes::default()
+            },
             // A context block consumes its own `continue`: returning from the body is
             // what going to the next entity means. `break` and `return` get out.
             hir::Stmt::Context { body, .. } => Escapes {
@@ -408,6 +415,7 @@ pub fn lower(hir: &Hir) -> Mir {
 struct Temps {
     scores: u32,
     data: u32,
+    iters: u32,
 }
 
 impl Temps {
@@ -424,6 +432,14 @@ impl Temps {
     fn next_data(&mut self) -> String {
         let path = format!("mw.tmp.m{}", self.data);
         self.data += 1;
+        path
+    }
+
+    /// The copy a `for` walks through, under the root reserved for it
+    /// (requirements section 3.3).
+    fn next_iter(&mut self) -> String {
+        let path = format!("mw.iter.i{}", self.iters);
+        self.iters += 1;
         path
     }
 }
@@ -575,6 +591,7 @@ fn collect_calls(stmts: &[hir::Stmt], out: &mut Vec<usize>) {
                     collect_calls(&arm.body, out);
                 }
             }
+            hir::Stmt::ForVec { body, .. } => collect_calls(body, out),
             _ => {}
         }
     }
@@ -714,6 +731,12 @@ impl<'p> Lowering<'_, 'p> {
                 ..
             } => self.if_stmt(cond, then, otherwise.as_deref(), *inline),
             hir::Stmt::Loop { cond, body, .. } => self.loop_stmt(cond.as_ref(), body),
+            hir::Stmt::ForVec {
+                source,
+                binding,
+                body,
+                ..
+            } => self.for_vec(source, *binding, body),
             hir::Stmt::Match {
                 scrutinee, arms, ..
             } => self.match_stmt(scrutinee, arms),
@@ -1458,6 +1481,74 @@ impl<'p> Lowering<'_, 'p> {
         }
     }
 
+    /// `for x in v`: walk a copy, taking `[0]` each time (spec section 6.22).
+    ///
+    /// The index is always zero, so every path is known while compiling and no macro
+    /// is needed — which is the reason iteration is destructive in the first place.
+    fn for_vec(&mut self, source: &hir::Place, binding: LocalId, body: &[hir::Stmt]) {
+        let escaping = escapes(body);
+        let src = place_path(self.function, source);
+        let iter = self.iter_temp();
+        self.insts.push(Inst::CopyData {
+            dst: iter.clone(),
+            src,
+        });
+        let path = format!("{}/for_{}", self.prefix, self.counter);
+        self.counter += 1;
+
+        let mut inner = self.child(path.clone());
+        let head = format!("{iter}[0]");
+        // Nothing left to take: the loop is over.
+        inner.insts.push(Inst::Guarded {
+            cond: Cond::Data {
+                path: head.clone(),
+                filter: String::new(),
+                negated: true,
+            },
+            inst: Box::new(Inst::Return { value: 0 }),
+        });
+        let ty = inner.local_ty(binding);
+        if ty.is_storage() {
+            let dst = local_path(inner.function, binding);
+            inner.insts.push(Inst::CopyData {
+                dst,
+                src: head.clone(),
+            });
+        } else {
+            let dst = local_reg(inner.function, binding);
+            inner.insts.push(Inst::StoreResult {
+                dst,
+                inst: Box::new(Inst::GetData { path: head.clone() }),
+            });
+        }
+        inner.insts.push(Inst::RemoveData { path: head });
+        // The binding holds a value from here on, so a recursive call has to save it.
+        inner.program.initialised.push(binding);
+        if escaping.continues {
+            // `continue` returns, and a return from the loop function would end the
+            // loop. Give the body its own function so the tail call still happens.
+            let body_path = inner.split("body", body);
+            inner.insts.push(Inst::Call { path: body_path });
+            inner.consume(CTL_CONTINUE);
+            inner.propagate();
+        } else {
+            for stmt in body {
+                inner.stmt(stmt);
+            }
+        }
+        inner.insts.push(Inst::Call { path: path.clone() });
+        let (insts, generated) = inner.finish();
+        self.record(path.clone(), insts, generated);
+
+        self.insts.push(Inst::Call { path });
+        if escaping.breaks {
+            self.consume(CTL_BREAK);
+        }
+        if escaping.returns {
+            self.propagate();
+        }
+    }
+
     fn loop_stmt(&mut self, cond: Option<&hir::Expr>, body: &[hir::Stmt]) {
         let escaping = escapes(body);
         let name = if cond.is_some() { "while" } else { "loop" };
@@ -1938,6 +2029,12 @@ impl<'p> Lowering<'_, 'p> {
 
     fn data_temp(&mut self) -> String {
         let path = self.program.temps.next_data();
+        self.program.used_data.push(path.clone());
+        path
+    }
+
+    fn iter_temp(&mut self) -> String {
+        let path = self.program.temps.next_iter();
         self.program.used_data.push(path.clone());
         path
     }

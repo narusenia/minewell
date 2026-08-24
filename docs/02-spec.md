@@ -381,6 +381,8 @@ method_call := primary "." IDENT "(" [args] ")"
   - 空リストだけは注釈が要る。要素が無いので型を決める材料が無い（§4.2 のとおり推論はしない）
   - `Vec::new()` は入れない。`[]` と同じものを 2 通りで書けるようにしても増えるものが無い
 - メソッドは `v.len()` と `v.push(x)` の 2 つ。`impl` の固有メソッドは M7-9
+- `for x in v { }` は `for` 文（[§3.8](#38-実行コンテキスト--確定m5)）と同じ構文。
+  対象がセレクタか `Vec` かで lowering が変わる（[§6.22](#622-for-x-in-vec--確定m7)）
 - 添字は定数でも実行時の値でもよい（コストは違う。[§6.21](#621-vect--確定m7)）
 
 ### 3.5 未定
@@ -1117,3 +1119,30 @@ v[i] = x;
   中だけにあり、`#[tick]` の関数がマクロ関数になることはない
 - 実行時の添字は**最後の段でだけ**使える。`v[i].field` のように後ろが続く形はエラーにする —
   マクロ 1 回では書けず、テンポラリを増やして隠すより、束縛に取り出させるほうが読める
+
+---
+
+### 6.22 `for x in vec` — 確定（M7）
+
+要件定義 §7.1 のとおり**破壊的反復**。コピーを作り、`[0]` を読んでは消す。
+
+```
+for x in v { .. }
+→  data modify storage <ns>:mw mw.iter.i0 set from storage <ns>:mw mw.vars.main.v
+   function <親>/for_0
+
+<親>/for_0:
+   execute unless data storage <ns>:mw mw.iter.i0[0] run return 0
+   execute store result score $main.x <ns>.v run data get storage <ns>:mw mw.iter.i0[0]
+   data remove storage <ns>:mw mw.iter.i0[0]
+   .. 本体 ..
+   function <親>/for_0
+```
+
+- **マクロを使わない。** 添字はつねに `[0]` なので、パスはコンパイル時に決まる。
+  要素数に関わらず生成コマンド数は一定
+- コピーを取るので**元の `Vec` は変わらない**。`for x in &mut vec` は v1 では持たない
+  （破壊的反復と両立しない。要件定義 §7.1）
+- 反復ごとのコストは、空判定 1 + 取り出し 2 + 削除 1 + 本体 + 末尾呼び出し 1
+- コピー置き場は `mw.iter.i<n>`。`break` / `continue` / `return` は `while` と同じ
+  （[§6.9](#69-ループ)・[§6.10](#610-break--continue--return)）。再帰時は退避対象に入る

@@ -410,6 +410,13 @@ pub enum Stmt {
         arms: Vec<Arm>,
         span: Span,
     },
+    /// `for x in vec`: destructive iteration over a copy (spec section 6.22).
+    ForVec {
+        source: Place,
+        binding: LocalId,
+        body: Vec<Stmt>,
+        span: Span,
+    },
     /// `as` / `at` / `for`. The body runs once per entity the selector finds.
     Context {
         kind: ContextKind,
@@ -1431,6 +1438,12 @@ impl FnLowering<'_> {
     }
 
     fn context_stmt(&mut self, stmt: &ast::ContextStmt) -> Option<Stmt> {
+        // `for` over a list is a different construct that happens to share a keyword.
+        if stmt.kind == ast::ContextKind::For
+            && let Some(place) = self.list_source(&stmt.selector)
+        {
+            return self.for_vec(stmt, place);
+        }
         let selector = self.selector(&stmt.selector)?;
         let kind = match stmt.kind {
             ast::ContextKind::As => ContextKind::As,
@@ -1475,6 +1488,71 @@ impl FnLowering<'_> {
             selector,
             body,
             inline,
+            span: stmt.span,
+        })
+    }
+
+    /// The list a `for` iterates, if that is what it was given.
+    ///
+    /// Reported quietly: anything that is not a list is a selector, and the selector
+    /// path produces the diagnostic when it is not one of those either.
+    fn list_source(&mut self, expr: &AstExpr) -> Option<Place> {
+        if !matches!(
+            expr,
+            AstExpr::Path(_) | AstExpr::Field(_) | AstExpr::Index(_)
+        ) {
+            return None;
+        }
+        let before = self.errors.len();
+        let place = self.place(expr);
+        match place {
+            Some(place) if matches!(place.ty, Type::Vec(_)) => Some(place),
+            _ => {
+                self.errors.truncate(before);
+                None
+            }
+        }
+    }
+
+    /// `for x in v { .. }`.
+    fn for_vec(&mut self, stmt: &ast::ContextStmt, source: Place) -> Option<Stmt> {
+        let Type::Vec(id) = source.ty else {
+            unreachable!("checked by the caller")
+        };
+        if !source.is_static() {
+            self.error(
+                stmt.selector.span(),
+                "an index that is only known at runtime has to be the last step; \
+                 read the element into a binding first",
+            );
+            return None;
+        }
+        let elem = self.types.element(id);
+        let inline = self.inline_attr(&stmt.attrs)?;
+        if inline != Inline::Auto {
+            self.error(stmt.span, "a loop is always its own function");
+            return None;
+        }
+        let name = stmt.binding.as_ref().expect("'for' always binds a name");
+        self.scopes.push(HashMap::new());
+        let binding = self.declare(&name.name, elem, false);
+        self.loop_depth += 1;
+        // Not an entity loop: `continue` here means the next element, which is the
+        // same thing `while` means by it.
+        let outer = std::mem::replace(&mut self.in_entity_loop, false);
+        let body = stmt
+            .body
+            .stmts
+            .iter()
+            .filter_map(|stmt| self.stmt(stmt))
+            .collect();
+        self.in_entity_loop = outer;
+        self.loop_depth -= 1;
+        self.scopes.pop();
+        Some(Stmt::ForVec {
+            source,
+            binding,
+            body,
             span: stmt.span,
         })
     }
