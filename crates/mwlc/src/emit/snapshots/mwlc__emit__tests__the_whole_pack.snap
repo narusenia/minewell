@@ -1,0 +1,9 @@
+---
+source: crates/mwlc/src/emit/mod.rs
+expression: pack.files
+---
+{
+    "data/myns/function/main.mcfunction": "say hi\nsay bye\n",
+    "data/myns/function/other.mcfunction": "say x\n",
+    "pack.mcmeta": "{\n  \"pack\": {\n    \"pack_format\": 48,\n    \"description\": \"a test pack\"\n  }\n}\n",
+}

@@ -15,7 +15,9 @@ thiserror = "2"
 [dev-dependencies]
 # The graphical renderer lives behind `fancy`. The library only needs the derive and
 # the traits; only tests and the CLI actually draw anything.
+insta = "1"
 miette = { version = "7", features = ["fancy"] }
+tempfile = "3"
 
 [lints]
 workspace = true
