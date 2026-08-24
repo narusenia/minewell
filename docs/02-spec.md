@@ -177,7 +177,7 @@ debug ビルドで生成 mcfunction に埋める `# src/foo.mwl:42` の両方が
 
 ---
 
-## 3. 構文 — M3 の範囲まで確定
+## 3. 構文 — M4 の範囲まで確定
 
 M1 は `fn main() { raw!("say hi"); }` を全レイヤ貫通させることだけを目的とする
 （[`03-plan.md`](./03-plan.md) M1）。ここで確定させるのはその範囲に限る。
@@ -244,20 +244,41 @@ loop_stmt   := "loop" block
 - `return` は M3 では値を取らない。関数がまだ値を返さないため。
 - `else if` は `else` の後に `if_stmt` を置く形なので、追加の規則は要らない。
 
+### 3.6 関数 — 確定（M4）
+
+```
+fn_item     := "fn" IDENT "(" [params] ")" ["->" type] block
+params      := param {"," param} [","]
+param       := IDENT ":" type
+call        := IDENT "(" [args] ")"
+args        := expr {"," expr} [","]
+return_stmt := "return" [expr] ";"
+```
+
+- 引数の型注釈は必須。戻り値の型は省略すると「返さない」。
+- 呼び出しは一次式なので、`f(1) + g(2)` のように式の中に書ける。
+- 値を返さない関数の呼び出しを式の中に置くとエラー。文としてなら書ける。
+- 値を返す関数で、`return` せずに末尾まで到達したらエラー。
+  **末尾式による暗黙の戻り値は無い** — `if` が式でない以上、末尾式だけを特別扱いしても
+  一貫しない。M4 では `return` だけ。
+
+`if` を式にするのは引き続き**未定**。合流点で値を作る仕組みが要り、
+`match` を入れる M7 と一緒に考えるほうが小さい。
+
 ### 3.5 未定
 
 以降のタスクが、実装の直前に確定させる。
 
 | 節 | 内容 | タスク |
 |---|---|---|
-| 3.6 | 関数の引数・戻り値・呼び出し、`if` 式 | M4 |
-| 3.7 | `as` / `at` / `for`、`#[ctx]` | M5 |
-| 3.8 | `struct` / `enum` / `match` / ジェネリクス / `impl` | M7 |
-| 3.9 | `mod` / `use` / `pub` / `extern fn` | 最小限を M4 まで、完全版は M7 |
+| 3.7 | `if` 式 | M7（`match` と一緒に） |
+| 3.8 | `as` / `at` / `for`、`#[ctx]` | M5 |
+| 3.9 | `struct` / `enum` / `match` / ジェネリクス / `impl` | M7 |
+| 3.10 | `mod` / `use` / `pub` / `extern fn` | 完全版は M7 |
 
 ---
 
-## 4. 意味論 — M3 の範囲まで確定
+## 4. 意味論 — M4 の範囲まで確定
 
 ### 4.1 名前解決
 
@@ -308,6 +329,13 @@ Rust では代入式は `()` を返すが、minewell に `()` 型は無い。値
   **同じフェイクプレイヤーを再利用する**。反復間で値が残るが、`let` が必ず初期化するので
   観測できない。ここを分けるとループごとに未使用のレジスタが増えるだけで、得るものが無い。
 
+### 4.5 関数
+
+- 引数は値渡し。呼び出し側で評価してから呼ぶ。
+- 呼び出せるのは同じソースに定義された関数だけ（`mod` は M7）。
+- 未定義の関数を呼ぶとエラー。引数の個数と型が合わないとエラー。
+- 再帰は許す。相互再帰も許す。
+
 ## 5. 型の表現 — M2 の範囲のみ確定
 
 | 型 | 置き場所 | 表現 |
@@ -320,7 +348,7 @@ Rust では代入式は `()` を返すが、minewell に `()` 型は無い。値
 
 `fix<S>` / storage 専用型 / `String` / `Vec<T>` / ドメイン型は M7・M8。
 
-## 6. lowering — M3 の範囲まで確定
+## 6. lowering — M4 の範囲まで確定
 
 各構文から mcfunction への写像。生成コマンド数は `tinymcf` の計測 API で検証する
 （[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §5）。
@@ -510,3 +538,88 @@ execute if score $<fn>.ctl <ns>.v matches 1.. run return 0
 
 `<n>` は親の中で 0 から数える。`__gen/` に平置きしないのは、生成物を目で追えることが
 要件（要件定義 §12.2）だから。
+
+---
+
+### 6.12 呼び出し規約
+
+引数は**呼び出し先のローカルと同じフェイクプレイヤー**に書く。引数は初期値を
+呼び出し側が入れるローカルにすぎない。
+
+```
+f(1, x)
+→  scoreboard players set $f.a <ns>.v 1
+   scoreboard players operation $f.b <ns>.v = $main.x <ns>.v
+   function <ns>:f
+```
+
+戻り値はバニラの関数戻り値をそのまま使う。
+
+```
+return 5;        →  return 5
+return <式>;     →  return run scoreboard players get $t0 <ns>.t
+let y = f();     →  execute store result score $main.y <ns>.v run function <ns>:f
+```
+
+`return <定数>` が 1 コマンドで済むのは、`return` が整数リテラルを取るから。
+式の場合は `return run` で値を取り出すコマンドを走らせる。
+
+**非再帰の呼び出しに追加コストは無い。** 引数の書き込みと `function` だけで、
+退避も復帰も出てこない。
+
+### 6.13 再帰
+
+呼び出しグラフの強連結成分を Tarjan で求める。**同じ成分内への呼び出しだけ**が
+再帰呼び出しで、そこだけがフレームの退避を払う。
+
+呼び出し側で退避する:
+
+```
+1. 現在の関数が使うレジスタを storage のスタックに push
+2. 引数を書く
+3. 呼ぶ（戻り値は新しいテンポラリへ）
+4. スタックから pop して復帰（戻り値のテンポラリは除く）
+```
+
+呼び出し側で退避するのは、呼び出し先が引数を受け取る**前**に退避しないと、
+呼び出し側の値がもう上書きされているため。呼び出し先の入口では手遅れになる。
+
+退避する範囲は、**その関数（と切り出した生成関数）が書き込むレジスタ全部**。
+生存解析で絞るのは M9-7 の仕事で、それまでは正しさを優先する。
+
+スタックは `<ns>:mw` の `mw.stack`、1 フレームが 1 つの compound。
+
+```
+data modify storage <ns>:mw mw.stack append value {}
+execute store result storage <ns>:mw mw.stack[-1].<名前> int 1 run scoreboard players get <reg>
+...
+（呼び出し）
+execute store result score <reg> ... run data get storage <ns>:mw mw.stack[-1].<名前>
+...
+data remove storage <ns>:mw mw.stack[-1]
+```
+
+### 6.14 短絡評価（§6.3 の見直し）
+
+M2 では `&&` / `||` を `min` / `max` 1 コマンドに落とした。式が純粋で、短絡と
+非短絡が観測上区別できなかったため。**関数呼び出しが入ったので、その前提は
+右辺が呼び出しを含むときに崩れる。**
+
+そこで右辺を見て分ける:
+
+| 右辺 | 生成 |
+|---|---|
+| 純粋（呼び出しを含まない） | `min` / `max` 1 コマンド |
+| 呼び出しを含みうる | 分岐して本当に短絡させる |
+
+```
+a && b（b が非純粋）
+→  <a を dst へ>
+   execute if score $dst ... matches 1 run function <親>/and_<n>
+      # and_<n>: b を dst へ
+
+a || b
+→  execute if score $dst ... matches 0 run function <親>/or_<n>
+```
+
+純粋性はコンパイル時に分かる。**呼び出しを書かない大多数の `&&` は 1 コマンドのまま。**
