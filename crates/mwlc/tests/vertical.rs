@@ -340,6 +340,10 @@ fn print_generated_commands() {
          fn take(o: Outer) -> i32 { return o.inner.a; }
          fn main() { let n = 2; let mut o = Outer { inner: Inner { a: n }, b: true };
                      o.inner.a += 1; let x = take(o); }",
+        "struct Acc { total: i32 }
+         fn walk(n: i32) -> i32 { let acc = Acc { total: n }; if n <= 0 { return 0; }
+                                  let rest = walk(n - 1); return acc.total + rest; }
+         fn main() { let x = walk(2); }",
     ] {
         println!("=== {src}");
         let options = mwlc::emit::Options {
@@ -850,6 +854,23 @@ mod structs {
         let mc = run("struct Point { x: i32, y: i32 } \
              fn main() { let mut p = Point { x: 1, y: 2 }; p.x = p.y; }");
         assert_eq!(at_path(&mc, "mw.vars.main.p.x"), Some(NbtValue::Int(2)));
+    }
+
+    /// A recursive call saves the caller's frame. A composite local is part of that
+    /// frame, and saving it as if it were a score would read a register that does not
+    /// exist and leave the callee's compound in place of the caller's.
+    #[test]
+    fn a_composite_local_survives_a_recursive_call() {
+        let mc = run("struct Acc { total: i32 } \
+             fn walk(n: i32) -> i32 { \
+                 let acc = Acc { total: n }; \
+                 if n <= 0 { return 0; } \
+                 let rest = walk(n - 1); \
+                 return acc.total + rest; \
+             } \
+             fn main() { let x = walk(3); }");
+        assert_eq!(local(&mc, "main", "x"), Some(6));
+        assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
     }
 
     #[test]

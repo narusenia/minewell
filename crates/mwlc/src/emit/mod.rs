@@ -275,6 +275,16 @@ fn command(inst: &Inst, ns: &str) -> String {
                 "execute store result score {r} {robj} run data get storage {ns}:mw mw.stack[-1].r{slot}"
             )
         }
+        Inst::SaveData { path, slot } => {
+            format!(
+                "data modify storage {ns}:mw mw.stack[-1].r{slot} set from storage {ns}:mw {path}"
+            )
+        }
+        Inst::RestoreData { path, slot } => {
+            format!(
+                "data modify storage {ns}:mw {path} set from storage {ns}:mw mw.stack[-1].r{slot}"
+            )
+        }
         Inst::SetValue { path, value } => {
             format!("data modify storage {ns}:mw {path} set value {value}")
         }

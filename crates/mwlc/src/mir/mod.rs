@@ -105,6 +105,10 @@ pub enum Inst {
     Save { reg: Reg, slot: u32 },
     /// Reads a register back out of the top frame.
     Restore { reg: Reg, slot: u32 },
+    /// Saves a value in storage into the top frame under `slot`.
+    SaveData { path: String, slot: u32 },
+    /// Reads a value in storage back out of the top frame.
+    RestoreData { path: String, slot: u32 },
     /// `return <value>`
     Return { value: i32 },
     /// `data modify storage <ns>:mw <path> set value <snbt>`
@@ -263,6 +267,17 @@ pub enum Cmp {
     Eq,
     Ge,
     Gt,
+}
+
+/// A place a frame has to be saved from and restored to.
+///
+/// Two, because a function's state is in two places: `i32` and `bool` are registers,
+/// composites are storage paths (spec section 5). Saving one as the other reads a
+/// register that was never written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Slot {
+    Score(Reg),
+    Data(String),
 }
 
 /// What an expression produced: either a number known now, or a register holding it.
@@ -1170,12 +1185,19 @@ impl<'p> Lowering<'_, 'p> {
             .collect();
 
         let saved = if recursive {
-            let saved = self.live_registers();
+            let saved = self.live_slots();
             self.insts.push(Inst::PushFrame);
-            for (slot, reg) in saved.iter().enumerate() {
-                self.insts.push(Inst::Save {
-                    reg: reg.clone(),
-                    slot: slot as u32,
+            for (slot, place) in saved.iter().enumerate() {
+                let slot = slot as u32;
+                self.insts.push(match place {
+                    Slot::Score(reg) => Inst::Save {
+                        reg: reg.clone(),
+                        slot,
+                    },
+                    Slot::Data(path) => Inst::SaveData {
+                        path: path.clone(),
+                        slot,
+                    },
                 });
             }
             saved
@@ -1207,10 +1229,17 @@ impl<'p> Lowering<'_, 'p> {
         }
 
         if recursive {
-            for (slot, reg) in saved.iter().enumerate() {
-                self.insts.push(Inst::Restore {
-                    reg: reg.clone(),
-                    slot: slot as u32,
+            for (slot, place) in saved.iter().enumerate() {
+                let slot = slot as u32;
+                self.insts.push(match place {
+                    Slot::Score(reg) => Inst::Restore {
+                        reg: reg.clone(),
+                        slot,
+                    },
+                    Slot::Data(path) => Inst::RestoreData {
+                        path: path.clone(),
+                        slot,
+                    },
                 });
             }
             self.insts.push(Inst::PopFrame);
@@ -1220,16 +1249,20 @@ impl<'p> Lowering<'_, 'p> {
 
     /// Everything this function might still need after a call comes back.
     ///
-    /// Every local, plus every temporary handed out so far. Narrowing this to what is
-    /// actually live is M9-7's liveness analysis; until then the set that is obviously
-    /// sufficient is the right one.
-    fn live_registers(&self) -> Vec<Reg> {
-        let locals = self
-            .program
-            .initialised
-            .iter()
-            .map(|local| local_reg(self.function, *local));
-        locals.chain(self.program.used.iter().cloned()).collect()
+    /// Every local, plus every temporary handed out so far, each from wherever its
+    /// type actually lives. Narrowing this to what is live is the liveness analysis's
+    /// job later; until then the set that is obviously sufficient is the right one.
+    fn live_slots(&self) -> Vec<Slot> {
+        let locals = self.program.initialised.iter().map(|local| {
+            if self.local_ty(*local).is_storage() {
+                Slot::Data(local_path(self.function, *local))
+            } else {
+                Slot::Score(local_reg(self.function, *local))
+            }
+        });
+        // Temporaries are always registers: a composite never lands in one.
+        let temps = self.program.used.iter().cloned().map(Slot::Score);
+        locals.chain(temps).collect()
     }
 
     fn cond(&mut self, expr: &hir::Expr) -> Cond {
