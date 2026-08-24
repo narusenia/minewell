@@ -135,8 +135,13 @@ SELECTOR := "@" ("a" | "e" | "p" | "r" | "s") ["[" SELECTOR_BODY "]"]
 ### 2.8 リソースロケーション
 
 ```
-RESOURCE := IDENT {"/" IDENT} ":" IDENT {"/" IDENT}
+RESOURCE := IDENT {"/" IDENT} ":" SEG {"/" SEG}
+SEG      := (letter | digit | "_" | "." | "-")+
 ```
+
+**`:` の後ろのセグメントは `.` と `-` を含める。** バニラの ID がそう作られているため
+（`minecraft:block.note_block.pling` は 1 つの音声 ID）。リソースロケーションに
+フィールドは無いので、直後の `.` がフィールドアクセスと衝突することもない。
 
 **`:` の両側に空白を書けない。** これが型注釈の `:` と区別する唯一の規則
 （要件定義 §10.2）。`minecraft:stone` は 1 トークン、`x: i32` は 3 トークン、

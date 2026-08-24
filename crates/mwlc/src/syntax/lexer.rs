@@ -327,10 +327,12 @@ impl<'a> Lexer<'a> {
             self.take_while(is_ident_continue);
         }
         self.at += 1; // ':'
-        self.take_while(is_ident_continue);
+        // The path may hold dots and dashes: vanilla ids are built that way, and
+        // `minecraft:block.note_block.pling` is one id, not a field access.
+        self.take_while(is_resource_path);
         while self.rest().starts_with('/') {
             self.at += 1;
-            self.take_while(is_ident_continue);
+            self.take_while(is_resource_path);
         }
     }
 
@@ -538,6 +540,11 @@ fn is_ident_start(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '_'
 }
 
+/// The characters a resource location's path may hold (spec section 2.8).
+fn is_resource_path(c: char) -> bool {
+    is_ident_continue(c) || c == '.' || c == '-'
+}
+
 fn is_ident_continue(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
@@ -672,6 +679,20 @@ mod tests {
     fn a_selector_keeps_nested_brackets_and_quotes_balanced() {
         let src = r#"@e[nbt={Tags:["a]b"]}]"#;
         assert_eq!(kinds(src), vec![TokenKind::Selector(src.to_owned())]);
+    }
+
+    #[test]
+    fn a_resource_path_may_hold_dots_and_dashes() {
+        assert_eq!(
+            kinds("minecraft:block.note_block.pling"),
+            vec![TokenKind::Resource(
+                "minecraft:block.note_block.pling".to_owned()
+            )]
+        );
+        assert_eq!(
+            kinds("ns:some-thing/deep.id"),
+            vec![TokenKind::Resource("ns:some-thing/deep.id".to_owned())]
+        );
     }
 
     #[test]
