@@ -334,13 +334,33 @@ impl Types {
 /// register, and a field is the same path with one more step (spec section 6.18).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Place {
-    pub local: LocalId,
-    /// The steps from the binding to the value, in order.
+    pub root: Root,
+    /// The steps from the root to the value, in order.
     pub steps: Vec<Step>,
     /// The type of the value addressed, which is the innermost step's.
     pub ty: Type,
     /// The tag it is stored as; `None` for a compound or a list.
     pub tag: Option<NbtTag>,
+    /// Whether writing through this is allowed.
+    pub mutable: bool,
+    /// The name the source used, for diagnostics.
+    pub via: String,
+}
+
+/// Where a place starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Root {
+    /// A binding of the function being lowered.
+    Local(LocalId),
+    /// A binding of the caller, lent by reference (spec section 6.24). Borrowing is a
+    /// name for someone else's place, so the name of that place is what is carried.
+    Lent {
+        /// The function the binding belongs to.
+        owner: String,
+        local: String,
+        /// Whether that binding lives in storage rather than in a register.
+        storage: bool,
+    },
 }
 
 /// One step of a path: into a field, or into a list.
@@ -359,6 +379,29 @@ impl Place {
     /// Whether the whole path is known while compiling.
     pub fn is_static(&self) -> bool {
         !self.steps.iter().any(|step| matches!(step, Step::At(_)))
+    }
+
+    /// A stable spelling of where this points, for keying instances by what they
+    /// borrow. Only ever compared, never emitted.
+    pub fn key(&self) -> String {
+        let root = match &self.root {
+            Root::Local(id) => format!("l{}", id.0),
+            Root::Lent {
+                owner,
+                local,
+                storage,
+            } => format!("{owner}.{local}.{storage}"),
+        };
+        let steps = self
+            .steps
+            .iter()
+            .map(|step| match step {
+                Step::Field(name) => format!(".{name}"),
+                Step::Index(index) => format!("[{index}]"),
+                Step::At(_) => "[?]".to_owned(),
+            })
+            .collect::<String>();
+        format!("{root}{steps}")
     }
 }
 
@@ -610,6 +653,12 @@ pub enum Stmt {
     },
 }
 
+/// What a method call turned out to be.
+enum MethodOutcome {
+    Stmt(Stmt),
+    Value(Expr),
+}
+
 /// One arm of a `match`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arm {
@@ -758,8 +807,8 @@ struct Signature {
     id: Option<FnId>,
     /// Type parameter names, empty for an ordinary function.
     generics: Vec<String>,
-    /// Parameter types, which for a template may mention `Type::Param`.
-    params: Vec<Type>,
+    /// Parameters, which for a template may mention `Type::Param`.
+    params: Vec<ParamSig>,
     ret: Option<Type>,
     /// What the function requires of its caller, from `#[ctx(..)]`.
     ctx: Vec<Ctx>,
@@ -767,12 +816,20 @@ struct Signature {
     item: usize,
 }
 
+/// A parameter as declared: its type, and whether it is borrowed rather than passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParamSig {
+    ty: Type,
+    /// `None` for an ordinary parameter, which is written before the call.
+    borrow: Option<ast::Borrow>,
+}
+
 /// The instances monomorphisation has been asked for (spec section 6.23).
 #[derive(Debug, Default)]
 struct Instances {
-    /// Which id a template and its type arguments resolved to, so the same pair is
-    /// never instantiated twice.
-    by_key: HashMap<(usize, Vec<Type>), FnId>,
+    /// Which id a template, its type arguments and what it borrows resolved to, so
+    /// the same combination is never instantiated twice.
+    by_key: HashMap<(usize, Vec<Type>, Vec<String>), FnId>,
     /// Instances still to be lowered, in the order they were asked for.
     pending: Vec<Pending>,
     next: u32,
@@ -784,29 +841,61 @@ struct Pending {
     /// The item the template was written as.
     item: usize,
     args: Vec<Type>,
+    /// What each borrowed parameter was lent, in parameter order.
+    borrows: Vec<Option<Place>>,
     /// The name the instance is emitted under.
     name: String,
 }
 
 impl Instances {
-    fn get_or_create(&mut self, item: usize, args: Vec<Type>, base: &str, types: &Types) -> FnId {
-        let key = (item, args.clone());
+    fn get_or_create(
+        &mut self,
+        item: usize,
+        args: Vec<Type>,
+        borrows: Vec<Option<Place>>,
+        base: &str,
+        types: &Types,
+    ) -> FnId {
+        let lent: Vec<String> = borrows
+            .iter()
+            .map(|place| place.as_ref().map(Place::key).unwrap_or_default())
+            .collect();
+        let key = (item, args.clone(), lent);
         if let Some(id) = self.by_key.get(&key) {
             return *id;
         }
         let id = FnId(self.next);
         self.next += 1;
-        let suffix = args
-            .iter()
-            .map(|ty| types.mangle(*ty))
-            .collect::<Vec<_>>()
-            .join("_");
-        let name = format!("{base}_{suffix}");
+        // The name says what it was instantiated with, so the output stays readable.
+        let mut name = base.replace("::", "/").to_lowercase();
+        for ty in &args {
+            name.push('_');
+            name.push_str(&types.mangle(*ty));
+        }
+        for place in borrows.iter().flatten() {
+            if let Root::Lent { owner, local, .. } = &place.root {
+                name.push('_');
+                name.push_str(&owner.replace("::", "_").to_lowercase());
+                name.push('_');
+                name.push_str(local);
+            }
+            for step in &place.steps {
+                match step {
+                    Step::Field(field) => {
+                        name.push('_');
+                        name.push_str(field);
+                    }
+                    Step::Index(index) => name.push_str(&format!("_{index}")),
+                    Step::At(_) => {}
+                }
+            }
+        }
         self.by_key.insert(key, id);
         self.pending.push(Pending {
             id,
             item,
             args,
+            borrows,
             name,
         });
         id
@@ -822,18 +911,40 @@ pub fn lower(
     let mut references = Vec::new();
     let types = collect_types(file, &mut errors);
     let mut signatures: HashMap<String, Signature> = HashMap::new();
-    let mut items: Vec<(&ast::Item, &ast::FnItem)> = Vec::new();
+    let mut items: Vec<(&ast::Item, &ast::FnItem, String)> = Vec::new();
     // How many functions have an id already; instances are numbered after them.
     let mut concrete = 0usize;
 
     // First pass: signatures only. Without it, calling a function defined further down
     // the file would be an error — a rule about text order rather than about programs.
+    //
+    // A method is a function whose name carries its type (`Counter::bump`) and whose
+    // first parameter is the receiver.
+    let mut written: Vec<(&ast::Item, &ast::FnItem, Option<&str>)> = Vec::new();
     for item in &file.items {
-        let ItemKind::Fn(f) = &item.kind else {
-            continue;
+        match &item.kind {
+            ItemKind::Fn(f) => written.push((item, f, None)),
+            ItemKind::Impl(block) => {
+                for method in &block.methods {
+                    let ItemKind::Fn(f) = &method.kind else {
+                        errors.push(SyntaxError::new(
+                            method.span,
+                            "an impl block holds functions only",
+                        ));
+                        continue;
+                    };
+                    written.push((method, f, Some(&block.ty.name)));
+                }
+            }
+            _ => {}
+        }
+    }
+    for (item, f, owner) in written {
+        let name = match owner {
+            Some(ty) => format!("{ty}::{}", f.name.name),
+            None => f.name.name.clone(),
         };
-        if signatures.contains_key(&f.name.name) {
-            let name = &f.name.name;
+        if signatures.contains_key(&name) {
             errors.push(SyntaxError::new(
                 f.name.span,
                 format!("a function named '{name}' is already defined"),
@@ -841,17 +952,46 @@ pub fn lower(
             continue;
         }
         let generics: Vec<String> = f.generics.iter().map(|g| g.name.clone()).collect();
-        let params = f
-            .params
-            .iter()
-            .map(|param| {
-                resolve_written(&param.ty, &types, &generics, &mut errors).unwrap_or(Type::I32)
-            })
-            .collect();
+        let mut params: Vec<ParamSig> = Vec::new();
+        // The receiver is the first parameter, with the type the impl block names.
+        if let Some(receiver) = f.receiver {
+            match owner.and_then(|ty| types.get(ty)) {
+                Some(ty) => params.push(ParamSig {
+                    ty,
+                    borrow: receiver.borrow,
+                }),
+                None => errors.push(SyntaxError::new(
+                    receiver.span,
+                    "'self' is only a parameter inside an impl block for a known type",
+                )),
+            }
+        }
+        for param in &f.params {
+            let Some(ty) = resolve_written(&param.ty, &types, &generics, &mut errors) else {
+                params.push(ParamSig {
+                    ty: Type::I32,
+                    borrow: None,
+                });
+                continue;
+            };
+            params.push(ParamSig {
+                ty,
+                borrow: param.ty.borrow,
+            });
+        }
         let ret = f
             .ret
             .as_ref()
             .and_then(|written| resolve_written(written, &types, &generics, &mut errors));
+        if let Some(written) = f.ret.as_ref()
+            && written.borrow.is_some()
+        {
+            errors.push(SyntaxError::new(
+                written.span,
+                "a reference cannot be returned: it is a name for a place in the \
+                 caller, and the caller already has that name",
+            ));
+        }
         // Vanilla's function return is a single integer, so there is nowhere for a
         // compound to come back in.
         if let (Some(ty), Some(written)) = (ret, f.ret.as_ref())
@@ -868,13 +1008,16 @@ pub fn lower(
         // lowered, and this is the only part of the attributes a caller cares about.
         let ctx = declared_ctx(&item.attrs);
         let index = items.len();
-        // A template has no id of its own: only its instances are real functions.
-        let id = generics.is_empty().then_some(FnId(concrete as u32));
+        // A template has no id of its own: only its instances are real functions. A
+        // borrowed parameter makes one too, because the path it stands for is only
+        // known at the call site (spec section 6.24).
+        let borrows = params.iter().any(|param| param.borrow.is_some());
+        let id = (generics.is_empty() && !borrows).then_some(FnId(concrete as u32));
         if id.is_some() {
             concrete += 1;
         }
         signatures.insert(
-            f.name.name.clone(),
+            name.clone(),
             Signature {
                 id,
                 generics,
@@ -884,7 +1027,7 @@ pub fn lower(
                 item: index,
             },
         );
-        items.push((item, f));
+        items.push((item, f, name));
     }
 
     let mut instances = Instances {
@@ -892,8 +1035,8 @@ pub fn lower(
         ..Instances::default()
     };
     let mut functions = Vec::new();
-    for (item, f) in &items {
-        let signature = signatures[&f.name.name].clone();
+    for (item, f, name) in &items {
+        let signature = signatures[name].clone();
         // Templates are lowered once per set of type arguments, further down.
         let Some(id) = signature.id else {
             continue;
@@ -903,9 +1046,10 @@ pub fn lower(
                 item,
                 f,
                 id,
-                name: f.name.name.clone(),
+                name: name.replace("::", "/").to_lowercase(),
                 signature: &signature,
                 type_params: HashMap::new(),
+                borrows: Vec::new(),
             },
             namespace,
             &types,
@@ -924,8 +1068,8 @@ pub fn lower(
     while at < instances.pending.len() {
         let pending = instances.pending[at].clone();
         at += 1;
-        let (item, f) = items[pending.item];
-        let signature = signatures[&f.name.name].clone();
+        let (item, f, name) = &items[pending.item];
+        let signature = signatures[name].clone();
         let type_params: HashMap<String, Type> = signature
             .generics
             .iter()
@@ -937,7 +1081,10 @@ pub fn lower(
             params: signature
                 .params
                 .iter()
-                .map(|ty| types.substitute(*ty, &pending.args))
+                .map(|param| ParamSig {
+                    ty: types.substitute(param.ty, &pending.args),
+                    ..*param
+                })
                 .collect(),
             ret: signature.ret.map(|ty| types.substitute(ty, &pending.args)),
             ..signature.clone()
@@ -950,6 +1097,7 @@ pub fn lower(
                 name: pending.name.clone(),
                 signature: &instance,
                 type_params,
+                borrows: pending.borrows.clone(),
             },
             namespace,
             &types,
@@ -981,6 +1129,8 @@ struct LowerOne<'a> {
     signature: &'a Signature,
     /// Type parameters bound to what this instance was asked for.
     type_params: HashMap<String, Type>,
+    /// What each borrowed parameter was lent, in parameter order.
+    borrows: Vec<Option<Place>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1001,10 +1151,13 @@ fn lower_function(
         name,
         signature,
         type_params,
+        borrows,
     } = one;
     {
         let mut cx = FnLowering {
             locals: Vec::new(),
+            function: name.clone(),
+            place_aliases: HashMap::new(),
             types,
             type_params,
             instances,
@@ -1039,12 +1192,30 @@ fn lower_function(
                  invoke it with no executor, so it would silently do nothing",
             );
         }
-        let params = f
-            .params
+        // The receiver is a parameter like any other, under the name `self`.
+        let names: Vec<String> = f
+            .receiver
             .iter()
-            .zip(&signature.params)
-            .map(|(param, ty)| cx.declare(&param.name.name, *ty, false))
+            .map(|_| "self".to_owned())
+            .chain(f.params.iter().map(|param| param.name.name.clone()))
             .collect();
+        let mut params = Vec::new();
+        for (index, (name, param)) in names.iter().zip(&signature.params).enumerate() {
+            match param.borrow {
+                // Borrowed: the name stands for the caller's place, and nothing is
+                // written before the call (spec section 6.24).
+                Some(borrow) => {
+                    let local = cx.declare(name, param.ty, false);
+                    if let Some(Some(place)) = borrows.get(index) {
+                        let mut place = place.clone();
+                        place.mutable = borrow == ast::Borrow::Mutable;
+                        place.via = name.clone();
+                        cx.place_aliases.insert(local, place);
+                    }
+                }
+                None => params.push(cx.declare(name, param.ty, false)),
+            }
+        }
         let body = cx.block(&f.body);
         let locals = cx.locals;
         let returns = always_returns(&body);
@@ -1108,7 +1279,7 @@ fn collect_types(file: &SourceFile, errors: &mut Vec<SyntaxError>) -> Types {
                 enums.push((item, declared));
                 (&declared.name, ty)
             }
-            ItemKind::Fn(_) => continue,
+            ItemKind::Fn(_) | ItemKind::Impl(_) => continue,
         };
         if types.by_name.contains_key(&name.name) {
             let text = &name.name;
@@ -1244,6 +1415,14 @@ fn collect_fields(
 ) -> Vec<Field> {
     let mut fields: Vec<Field> = Vec::new();
     for field in declared {
+        if field.ty.borrow.is_some() {
+            errors.push(SyntaxError::new(
+                field.ty.span,
+                "a field cannot hold a reference: a reference is a name for a place in \
+                 the caller, and a compound outlives the call",
+            ));
+            continue;
+        }
         let Some(ty) = resolve_written(&field.ty, types, generics, errors) else {
             continue;
         };
@@ -1505,6 +1684,11 @@ fn always_returns(stmts: &[Stmt]) -> bool {
 
 struct FnLowering<'a> {
     locals: Vec<Local>,
+    /// The name of the function being lowered: what a borrow lent from here records
+    /// as its owner.
+    function: String,
+    /// Parameters taken by reference: the caller's place, under the local's name.
+    place_aliases: HashMap<LocalId, Place>,
     types: &'a Types,
     /// The type parameters of the instance being lowered, already concrete.
     type_params: HashMap<String, Type>,
@@ -2103,10 +2287,9 @@ impl FnLowering<'_> {
     fn assign(&mut self, assign: &ast::AssignExpr) -> Option<Stmt> {
         let value = self.expr(&assign.value)?;
         let place = self.place(&assign.target)?;
-        // Mutability is a property of the binding: writing a field writes the binding.
-        let binding = self.locals[place.local.0 as usize].clone();
-        if !binding.mutable {
-            let name = &binding.name;
+        // Mutability belongs to the binding, or to the borrow it came through.
+        if !place.mutable {
+            let name = &place.via;
             self.error(
                 assign.span,
                 format!("'{name}' is not mutable; declare it with 'let mut'"),
@@ -2146,12 +2329,19 @@ impl FnLowering<'_> {
         match expr {
             AstExpr::Path(name) => {
                 let local = self.lookup(name)?;
-                let ty = self.locals[local.0 as usize].ty;
+                // A parameter taken by reference is a name for the caller's place.
+                if let Some(alias) = self.place_aliases.get(&local) {
+                    return Some(alias.clone());
+                }
+                let binding = &self.locals[local.0 as usize];
+                let (ty, mutable) = (binding.ty, binding.mutable);
                 Some(Place {
-                    local,
+                    root: Root::Local(local),
                     steps: Vec::new(),
                     ty,
                     tag: NbtTag::default_for(ty),
+                    mutable,
+                    via: name.name.clone(),
                 })
             }
             AstExpr::Field(access) => {
@@ -2198,10 +2388,10 @@ impl FnLowering<'_> {
                 let mut steps = base.steps;
                 steps.push(Step::Field(key));
                 Some(Place {
-                    local: base.local,
                     steps,
                     ty,
                     tag,
+                    ..base
                 })
             }
             AstExpr::Index(access) => {
@@ -2237,10 +2427,10 @@ impl FnLowering<'_> {
                     _ => Step::At(Box::new(index)),
                 });
                 Some(Place {
-                    local: base.local,
                     steps,
                     ty,
                     tag: NbtTag::default_for(ty),
+                    ..base
                 })
             }
             other => {
@@ -2250,14 +2440,46 @@ impl FnLowering<'_> {
         }
     }
 
-    /// `v.len()` and `v.push(x)`. Methods on user types arrive with `impl`.
+    /// A method call: an inherent method from an `impl`, or one of the two on a list.
     fn method(&mut self, call: &ast::MethodCall, as_statement: bool) -> Option<Stmt> {
+        match self.method_call(call, as_statement)? {
+            MethodOutcome::Stmt(stmt) => Some(stmt),
+            MethodOutcome::Value(_) => {
+                self.error(call.span, "this expression has no effect");
+                None
+            }
+        }
+    }
+
+    fn method_call(&mut self, call: &ast::MethodCall, as_statement: bool) -> Option<MethodOutcome> {
         let place = self.place(&call.receiver)?;
+        // An inherent method wins: `impl` is how a type gets behaviour of its own.
+        let key = format!("{}::{}", self.types.name_of(place.ty), call.name.name);
+        if self.signatures.contains_key(&key) {
+            let (callee, ty, args) = self.invoke(&key, call.span, Some(place), &call.args)?;
+            return Some(match (as_statement, ty) {
+                (true, _) => MethodOutcome::Stmt(Stmt::CallFor {
+                    callee,
+                    args,
+                    span: call.span,
+                }),
+                (false, Some(ty)) => MethodOutcome::Value(Expr {
+                    kind: ExprKind::Call { callee, args },
+                    ty,
+                    span: call.span,
+                }),
+                (false, None) => {
+                    let name = &call.name.name;
+                    self.error(call.span, format!("'{name}' does not return a value"));
+                    return None;
+                }
+            });
+        }
         let Type::Vec(id) = place.ty else {
-            let found = self.ty(place.ty);
+            let (found, name) = (self.ty(place.ty), &call.name.name);
             self.error(
-                call.span,
-                format!("{found} has no methods; user-defined methods are not implemented yet"),
+                call.name.span,
+                format!("'{found}' has no method named '{name}'"),
             );
             return None;
         };
@@ -2268,9 +2490,8 @@ impl FnLowering<'_> {
                     self.error(call.span, "'push' does not return a value");
                     return None;
                 }
-                let binding = self.locals[place.local.0 as usize].clone();
-                if !binding.mutable {
-                    let name = &binding.name;
+                if !place.mutable {
+                    let name = &place.via;
                     self.error(
                         call.span,
                         format!("'{name}' is not mutable; declare it with 'let mut'"),
@@ -2287,15 +2508,22 @@ impl FnLowering<'_> {
                     self.error(value.span, format!("expected {want}, found {found}"));
                     return None;
                 }
-                Some(Stmt::Push {
+                Some(MethodOutcome::Stmt(Stmt::Push {
                     place,
                     value,
                     span: call.span,
-                })
+                }))
             }
             "len" => {
-                self.error(call.span, "'len' produces a value; it is not a statement");
-                None
+                if !call.args.is_empty() {
+                    self.error(call.span, "'len' takes no arguments");
+                    return None;
+                }
+                Some(MethodOutcome::Value(Expr {
+                    kind: ExprKind::Len(place),
+                    ty: Type::I32,
+                    span: call.span,
+                }))
             }
             other => {
                 let list = self.ty(place.ty);
@@ -2323,6 +2551,15 @@ impl FnLowering<'_> {
             }),
             AstExpr::Path(name) => {
                 let local = self.lookup(name)?;
+                // Reading through a borrow reads the caller's place, not a local of
+                // this function — there is no local behind the name.
+                if let Some(alias) = self.place_aliases.get(&local).cloned() {
+                    return Some(Expr {
+                        ty: alias.ty,
+                        kind: ExprKind::Field(alias),
+                        span,
+                    });
+                }
                 Some(Expr {
                     kind: ExprKind::Local(local),
                     ty: self.locals[local.0 as usize].ty,
@@ -2407,6 +2644,16 @@ impl FnLowering<'_> {
                 None
             }
             AstExpr::Struct(lit) => self.composite_lit(lit),
+            // A reference is a name for a place, and a name has to be a parameter to
+            // stand for anything (spec section 4.13).
+            AstExpr::Borrow(borrow) => {
+                self.error(
+                    borrow.span,
+                    "a reference can only be an argument: pass it to a function, or \
+                     use the place directly",
+                );
+                None
+            }
             AstExpr::Field(_) | AstExpr::Index(_) => {
                 let place = self.place(expr)?;
                 Some(Expr {
@@ -2416,23 +2663,14 @@ impl FnLowering<'_> {
                 })
             }
             AstExpr::List(lit) => self.list_lit(lit, None),
-            AstExpr::Method(call) => {
-                let place = self.place(&call.receiver)?;
-                if !matches!(place.ty, Type::Vec(_)) || call.name.name != "len" {
-                    // Everything that is not `len` is either a statement or not there.
-                    self.method(call, false);
-                    return None;
+            AstExpr::Method(call) => match self.method_call(call, false)? {
+                MethodOutcome::Value(value) => Some(value),
+                MethodOutcome::Stmt(_) => {
+                    let name = &call.name.name;
+                    self.error(span, format!("'{name}' does not return a value"));
+                    None
                 }
-                if !call.args.is_empty() {
-                    self.error(call.span, "'len' takes no arguments");
-                    return None;
-                }
-                Some(Expr {
-                    kind: ExprKind::Len(place),
-                    ty: Type::I32,
-                    span,
-                })
-            }
+            },
         }
     }
 
@@ -2581,29 +2819,113 @@ impl FnLowering<'_> {
 
     /// The callee and what it returns, with a generic call resolved to its instance.
     fn call_parts(&mut self, call: &ast::CallExpr) -> Option<(FnId, Option<Type>, Vec<Expr>)> {
-        let sig = self.signatures.get(&call.callee.name)?.clone();
-        self.check_ctx(call, &sig.ctx);
-        if sig.generics.is_empty() {
-            let args = self.call_args(call)?;
-            return Some((sig.id.expect("a plain function has an id"), sig.ret, args));
-        }
-        // The argument types decide the type arguments (spec section 4.12).
-        if call.args.len() != sig.params.len() {
-            let name = &call.callee.name;
-            let (n, m) = (sig.params.len(), call.args.len());
+        self.invoke(&call.callee.name, call.span, None, &call.args)
+    }
+
+    /// Resolves a call: checks the arguments, borrows what is borrowed, and picks the
+    /// instance this combination of type arguments and lent places belongs to.
+    fn invoke(
+        &mut self,
+        name: &str,
+        span: Span,
+        receiver: Option<Place>,
+        written: &[AstExpr],
+    ) -> Option<(FnId, Option<Type>, Vec<Expr>)> {
+        let sig = self.signatures.get(name)?.clone();
+        self.check_ctx(name, span, &sig.ctx);
+        let given = written.len() + usize::from(receiver.is_some());
+        if given != sig.params.len() {
+            let (n, m) = (sig.params.len(), given);
             self.error(
-                call.span,
+                span,
                 format!("'{name}' takes {n} argument(s), but {m} were given"),
             );
             return None;
         }
-        let mut args = Vec::new();
-        for arg in &call.args {
-            args.push(self.expr(arg)?);
+
+        // Every parameter is either a value to write before the call, or a place to
+        // lend (spec section 6.24).
+        let mut args: Vec<Expr> = Vec::new();
+        let mut borrows: Vec<Option<Place>> = Vec::new();
+        let mut actual: Vec<Type> = Vec::new();
+        let mut receiver = receiver;
+        let mut at = 0;
+        for param in &sig.params {
+            let place = receiver.take();
+            let arg = match place {
+                Some(_) => None,
+                None => {
+                    let arg = &written[at];
+                    at += 1;
+                    Some(arg)
+                }
+            };
+            match param.borrow {
+                None => {
+                    let value = match (place, arg) {
+                        // A receiver taken by value is read like any other expression.
+                        (Some(place), _) => Expr {
+                            ty: place.ty,
+                            kind: ExprKind::Field(place),
+                            span,
+                        },
+                        (None, Some(arg)) => self.expr(arg)?,
+                        (None, None) => unreachable!("one of the two is always there"),
+                    };
+                    actual.push(value.ty);
+                    args.push(value);
+                    borrows.push(None);
+                }
+                Some(kind) => {
+                    let place = match (place, arg) {
+                        (Some(place), _) => place,
+                        (None, Some(AstExpr::Borrow(borrow))) => {
+                            if borrow.borrow != kind && kind == ast::Borrow::Mutable {
+                                self.error(
+                                    borrow.span,
+                                    format!("'{name}' takes this by &mut; write '&mut'"),
+                                );
+                                return None;
+                            }
+                            self.place(&borrow.place)?
+                        }
+                        (None, Some(other)) => {
+                            self.error(
+                                other.span(),
+                                format!("'{name}' takes this by reference; write '&' or '&mut'"),
+                            );
+                            return None;
+                        }
+                        (None, None) => unreachable!("one of the two is always there"),
+                    };
+                    // A borrow is a name for a path, and a path that is only finished
+                    // at runtime has no name (requirements section 5).
+                    if !place.is_static() {
+                        self.error(
+                            span,
+                            "an element reached by a runtime index cannot be borrowed: \
+                             its path is not known while compiling; assign to it instead",
+                        );
+                        return None;
+                    }
+                    if kind == ast::Borrow::Mutable && !place.mutable {
+                        let via = &place.via;
+                        self.error(
+                            span,
+                            format!("'{via}' is not mutable; declare it with 'let mut'"),
+                        );
+                        return None;
+                    }
+                    actual.push(place.ty);
+                    borrows.push(Some(self.lend(&place)));
+                }
+            }
         }
+
+        // The argument types decide the type arguments (spec section 4.12).
         let mut bound: Vec<Option<Type>> = vec![None; sig.generics.len()];
-        for (declared, arg) in sig.params.iter().zip(&args) {
-            self.types.unify(*declared, arg.ty, &mut bound);
+        for (param, actual) in sig.params.iter().zip(&actual) {
+            self.types.unify(param.ty, *actual, &mut bound);
         }
         let Some(type_args) = bound.iter().copied().collect::<Option<Vec<Type>>>() else {
             let unknown: Vec<&str> = sig
@@ -2613,9 +2935,9 @@ impl FnLowering<'_> {
                 .filter(|(_, known)| known.is_none())
                 .map(|(name, _)| name.as_str())
                 .collect();
-            let (name, list) = (&call.callee.name, unknown.join(", "));
+            let list = unknown.join(", ");
             self.error(
-                call.span,
+                span,
                 format!(
                     "cannot tell what {list} is in the call to '{name}'; \
                      no argument mentions it"
@@ -2624,26 +2946,46 @@ impl FnLowering<'_> {
             return None;
         };
         // Now that the parameters are concrete, they are checked as any others are.
-        for (declared, arg) in sig.params.iter().zip(&args) {
-            let want = self.types.substitute(*declared, &type_args);
-            if arg.ty != want {
-                let (want, found) = (self.ty(want), self.ty(arg.ty));
-                self.error(arg.span, format!("expected {want}, found {found}"));
+        for (param, actual) in sig.params.iter().zip(&actual) {
+            let want = self.types.substitute(param.ty, &type_args);
+            if *actual != want {
+                let (want, found) = (self.ty(want), self.ty(*actual));
+                self.error(span, format!("expected {want}, found {found}"));
                 return None;
             }
         }
-        let id = self.instances.get_or_create(
-            sig.item,
-            type_args.clone(),
-            &call.callee.name,
-            self.types,
-        );
         let ret = sig.ret.map(|ty| self.types.substitute(ty, &type_args));
+        let id = match sig.id {
+            Some(id) => id,
+            None => self
+                .instances
+                .get_or_create(sig.item, type_args, borrows, name, self.types),
+        };
         Some((id, ret, args))
     }
 
+    /// Turns a place of this function into one the callee can name.
+    fn lend(&self, place: &Place) -> Place {
+        let root = match &place.root {
+            Root::Local(id) => {
+                let binding = &self.locals[id.0 as usize];
+                Root::Lent {
+                    owner: self.function.clone(),
+                    local: binding.name.clone(),
+                    storage: binding.ty.is_storage(),
+                }
+            }
+            // Lending on what was already lent: the owner does not change.
+            lent => lent.clone(),
+        };
+        Place {
+            root,
+            ..place.clone()
+        }
+    }
+
     /// Complains when the call needs a context the caller does not have.
-    fn check_ctx(&mut self, call: &ast::CallExpr, ctx: &[Ctx]) {
+    fn check_ctx(&mut self, name: &str, span: Span, ctx: &[Ctx]) {
         {
             {
                 let missing: Vec<Ctx> = ctx
@@ -2652,14 +2994,13 @@ impl FnLowering<'_> {
                     .filter(|ctx| !self.provided.contains(ctx))
                     .collect();
                 if !missing.is_empty() {
-                    let name = &call.callee.name;
                     let kinds = missing
                         .iter()
                         .map(|c| c.name())
                         .collect::<Vec<_>>()
                         .join(", ");
                     self.error(
-                        call.span,
+                        span,
                         format!(
                             "'{name}' declares #[ctx({kinds})] but no {kinds} context is \
                              available here; wrap the call in an 'as' block, or declare \
@@ -2669,32 +3010,6 @@ impl FnLowering<'_> {
                 }
             }
         }
-    }
-
-    fn call_args(&mut self, call: &ast::CallExpr) -> Option<Vec<Expr>> {
-        let want = self.signatures[&call.callee.name].params.clone();
-        if call.args.len() != want.len() {
-            let name = &call.callee.name;
-            let (n, m) = (want.len(), call.args.len());
-            self.error(
-                call.span,
-                format!("'{name}' takes {n} argument(s), but {m} were given"),
-            );
-            return None;
-        }
-        let mut args = Vec::new();
-        for (arg, want) in call.args.iter().zip(want) {
-            let arg = self.expr(arg)?;
-            if arg.ty != want {
-                self.error(
-                    arg.span,
-                    format!("expected {}, found {}", self.ty(want), self.ty(arg.ty)),
-                );
-                return None;
-            }
-            args.push(arg);
-        }
-        Some(args)
     }
 
     /// `pos!(~ ~1 ~)`. Three coordinates, all in the same notation.
@@ -2805,6 +3120,14 @@ impl FnLowering<'_> {
     }
 
     fn resolve(&mut self, written: &ast::TypeName) -> Option<Type> {
+        if written.borrow.is_some() {
+            self.error(
+                written.span,
+                "a reference can only be a parameter: a binding would need a lifetime \
+                 to say how long it stays valid",
+            );
+            return None;
+        }
         // Inside an instance, a type parameter is already a concrete type.
         if let Some(ty) = self.type_params.get(&written.name).copied() {
             if !written.args.is_empty() {
@@ -4110,6 +4433,37 @@ mod tests {
                  fn main() { let n = pair(1, true); }",
             );
             assert!(errors[0].message.contains("expected i32"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_place_passed_without_an_ampersand_is_reported() {
+            let errors = lower_err(
+                "struct P { x: i32 } fn f(p: &mut P) {} \
+                 fn main() { let mut a = P { x: 1 }; f(a); }",
+            );
+            assert!(errors[0].message.contains("by reference"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_shared_borrow_where_mut_is_wanted_is_reported() {
+            let errors = lower_err(
+                "struct P { x: i32 } fn f(p: &mut P) {} \
+                 fn main() { let mut a = P { x: 1 }; f(&a); }",
+            );
+            assert!(errors[0].message.contains("&mut"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_field_cannot_hold_a_reference() {
+            let errors = lower_err("struct Inner { a: i32 } struct Outer { i: &Inner }");
+            assert!(errors[0].message.contains("reference"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_method_on_a_type_without_one_is_reported() {
+            let errors =
+                lower_err("struct P { x: i32 } fn main() { let p = P { x: 1 }; p.bump(); }");
+            assert!(errors[0].message.contains("no method named"), "{errors:?}");
         }
 
         #[test]

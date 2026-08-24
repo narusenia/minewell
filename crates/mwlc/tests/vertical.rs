@@ -342,6 +342,12 @@ fn print_generated_commands() {
                      o.inner.a += 1; let x = take(o); }",
         "fn main() { let mut v = [1, 2, 3]; let i = 2; v[i] = 9; let x = v[i]; v.push(x);
                      let n = v.len(); }",
+        "struct Point { x: i32 }
+         fn bump(p: &mut Point) { p.x += 1; }
+         fn double(n: &mut i32) { n = n * 2; }
+         fn read(p: &Point) -> i32 { return p.x; }
+         fn main() { let mut a = Point { x: 0 }; bump(&mut a); let mut k = 21; double(&mut k);
+                     let n = read(&a); }",
         "fn main() { let v = [1, 2, 3]; let mut sum = 0; for x in v { sum += x; } }",
         "struct Pair<T> { a: T, b: T }
          fn first<T>(p: Pair<T>) -> i32 { return 1; }
@@ -1453,5 +1459,115 @@ mod generics {
              fn main() { let a = keep(1, 10); let b = keep(true, 20); }");
         assert_eq!(local(&mc, "main", "a"), Some(10));
         assert_eq!(local(&mc, "main", "b"), Some(20));
+    }
+}
+
+/// Compile-time references and `impl`. Spec sections 3.15, 4.13 and 6.24: a borrow is
+/// a name for a path, so it costs nothing at runtime.
+mod references {
+    use super::harness::{at_path, cost, local, run};
+    use tinymcf::nbt::NbtValue;
+
+    fn errors(src: &str) -> String {
+        let report = mwlc::driver::compile(src, "test", &mwlc::emit::Options::default())
+            .expect_err("should not compile");
+        format!("{report:?}")
+    }
+
+    #[test]
+    fn a_mutable_borrow_writes_through_to_the_caller() {
+        let mc = run("struct Point { x: i32 } \
+             fn bump(p: &mut Point) { p.x += 1; } \
+             fn main() { let mut a = Point { x: 0 }; bump(&mut a); bump(&mut a); }");
+        assert_eq!(at_path(&mc, "mw.vars.main.a.x"), Some(NbtValue::Int(2)));
+    }
+
+    /// The task's "test to write first".
+    #[test]
+    fn a_runtime_index_cannot_be_borrowed() {
+        let message = errors(
+            "struct Point { x: i32 } \
+             fn bump(p: &mut Point) { p.x += 1; } \
+             fn main() { let mut v = [Point { x: 0 }]; let i = 0; bump(&mut v[i]); }",
+        );
+        assert!(message.contains("runtime"), "{message}");
+    }
+
+    #[test]
+    fn borrowing_costs_no_commands_of_its_own() {
+        let mc = run("struct Point { x: i32 } \
+             fn read(p: &Point) -> i32 { return p.x; } \
+             fn main() { let a = Point { x: 5 }; let n = read(&a); }");
+        assert_eq!(local(&mc, "main", "n"), Some(5));
+        // Build the compound (1), call it storing the result (2), read the field (2)
+        // and return it (2), copy the result into the binding (1). Not one of those is
+        // spent marshalling the argument, which is the whole point of a borrow.
+        assert_eq!(cost(&mc), 8);
+    }
+
+    #[test]
+    fn a_field_can_be_borrowed() {
+        let mc = run("struct Inner { a: i32 } struct Outer { inner: Inner } \
+             fn bump(i: &mut Inner) { i.a += 10; } \
+             fn main() { let mut o = Outer { inner: Inner { a: 1 } }; bump(&mut o.inner); }");
+        assert_eq!(
+            at_path(&mc, "mw.vars.main.o.inner.a"),
+            Some(NbtValue::Int(11))
+        );
+    }
+
+    #[test]
+    fn a_constant_index_can_be_borrowed() {
+        let mc = run("struct Point { x: i32 } \
+             fn bump(p: &mut Point) { p.x += 1; } \
+             fn main() { let mut v = [Point { x: 0 }, Point { x: 9 }]; bump(&mut v[1]); }");
+        assert_eq!(at_path(&mc, "mw.vars.main.v[1].x"), Some(NbtValue::Int(10)));
+    }
+
+    #[test]
+    fn a_scalar_binding_can_be_borrowed() {
+        let mc = run("fn double(n: &mut i32) { n = n * 2; } \
+             fn main() { let mut x = 21; double(&mut x); }");
+        assert_eq!(local(&mc, "main", "x"), Some(42));
+    }
+
+    #[test]
+    fn writing_through_a_shared_borrow_is_reported() {
+        let message = errors(
+            "struct Point { x: i32 } \
+             fn bump(p: &Point) { p.x += 1; } \
+             fn main() { let mut a = Point { x: 0 }; bump(&a); }",
+        );
+        assert!(message.contains("not mutable"), "{message}");
+    }
+
+    #[test]
+    fn a_reference_cannot_be_bound_or_returned() {
+        assert!(errors("fn main() { let x = 1; let r = &x; }").contains("argument"));
+        assert!(
+            errors("struct P { x: i32 } fn f(p: &P) -> &P { return p; }").contains("reference")
+        );
+    }
+
+    #[test]
+    fn a_method_borrows_its_receiver() {
+        let mc = run("struct Counter { n: i32 } \
+             impl Counter { \
+                 fn bump(&mut self) { self.n += 1; } \
+                 fn get(&self) -> i32 { return self.n; } \
+             } \
+             fn main() { let mut c = Counter { n: 0 }; c.bump(); c.bump(); \
+                         let n = c.get(); }");
+        assert_eq!(local(&mc, "main", "n"), Some(2));
+    }
+
+    #[test]
+    fn two_call_sites_borrowing_different_places_get_their_own_instance() {
+        let mc = run("struct Point { x: i32 } \
+             fn bump(p: &mut Point) { p.x += 1; } \
+             fn main() { let mut a = Point { x: 0 }; let mut b = Point { x: 10 }; \
+                         bump(&mut a); bump(&mut b); }");
+        assert_eq!(at_path(&mc, "mw.vars.main.a.x"), Some(NbtValue::Int(1)));
+        assert_eq!(at_path(&mc, "mw.vars.main.b.x"), Some(NbtValue::Int(11)));
     }
 }

@@ -13,7 +13,7 @@
 //!
 //! Today every function is one block. Control flow arrives in M3.
 
-use crate::hir::{self, FnId, Hir, LocalId, NbtTag, Step, TAG_KEY, Type, Types};
+use crate::hir::{self, FnId, Hir, LocalId, NbtTag, Root, Step, TAG_KEY, Type, Types};
 use crate::syntax::ast::{BinaryOp, UnaryOp};
 use crate::syntax::lexer::Span;
 
@@ -654,7 +654,11 @@ fn local_path(function: &hir::Function, local: LocalId) -> String {
 /// A runtime index is not part of it — that path can only be finished by a macro
 /// (spec section 6.21), so it comes back as the prefix the macro splices into.
 fn place_path(function: &hir::Function, place: &hir::Place) -> String {
-    let mut path = local_path(function, place.local);
+    let mut path = match &place.root {
+        hir::Root::Local(local) => local_path(function, *local),
+        // A borrowed place belongs to the caller, and says so by name.
+        hir::Root::Lent { owner, local, .. } => format!("mw.vars.{owner}.{local}"),
+    };
     for step in &place.steps {
         match step {
             Step::Field(name) => {
@@ -667,6 +671,17 @@ fn place_path(function: &hir::Function, place: &hir::Place) -> String {
         }
     }
     path
+}
+
+/// The register a place names, for a scalar that lives on the scoreboard.
+fn place_reg(function: &hir::Function, place: &hir::Place) -> Reg {
+    match &place.root {
+        Root::Local(local) => local_reg(function, *local),
+        Root::Lent { owner, local, .. } => Reg {
+            holder: format!("${owner}.{local}"),
+            kind: RegKind::Var,
+        },
+    }
 }
 
 /// The index expression of a place whose last step is only known at runtime.
@@ -766,7 +781,7 @@ impl<'p> Lowering<'_, 'p> {
             hir::Stmt::Assign {
                 place, op, value, ..
             } => {
-                let dst = self.local(place.local);
+                let dst = place_reg(self.function, place);
                 self.store(dst, *op, value);
             }
         }
@@ -856,6 +871,17 @@ impl<'p> Lowering<'_, 'p> {
     ///
     /// A list read this way gives its element count, which is what `len` is.
     fn read_place_into(&mut self, dst: Reg, place: &hir::Place) {
+        // A scalar binding lives on the scoreboard, borrowed or not: there is nothing
+        // in storage to read.
+        if place.steps.is_empty() && !place.ty.is_storage() {
+            let src = place_reg(self.function, place);
+            self.insts.push(Inst::Op {
+                dst,
+                op: Op::Assign,
+                src,
+            });
+            return;
+        }
         let path = place_path(self.function, place);
         let Some(index) = runtime_index(place) else {
             self.insts.push(Inst::StoreResult {

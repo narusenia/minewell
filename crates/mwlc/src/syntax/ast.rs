@@ -24,6 +24,8 @@ pub struct Item {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ItemKind {
     Fn(FnItem),
+    /// `impl Point { fn bump(&mut self) { .. } }`. Inherent methods only.
+    Impl(ImplItem),
     Struct(StructItem),
     Enum(EnumItem),
 }
@@ -41,6 +43,12 @@ pub struct VariantDef {
     /// Empty for a unit variant. Variants name their fields; there is no tuple form.
     pub fields: Vec<FieldDef>,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImplItem {
+    pub ty: Ident,
+    pub methods: Vec<Item>,
 }
 
 /// `struct Point { x: i32, y: i32 }`.
@@ -65,9 +73,18 @@ pub struct FieldDef {
 pub struct FnItem {
     pub name: Ident,
     pub generics: Vec<Ident>,
+    /// The receiver, for a method: `&self`, `&mut self` or `self`.
+    pub receiver: Option<Receiver>,
     pub params: Vec<Param>,
     pub ret: Option<TypeName>,
     pub body: Block,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Receiver {
+    /// `None` means `self` by value, which is a copy.
+    pub borrow: Option<Borrow>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,10 +198,20 @@ pub struct LetStmt {
 /// A written type. Resolved to a real type in HIR.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeName {
+    /// `&T` / `&mut T`: compile-time only, and legal on a parameter alone.
+    pub borrow: Option<Borrow>,
     pub name: String,
     /// `Vec<i32>`: the arguments between the angle brackets.
     pub args: Vec<TypeName>,
     pub span: Span,
+}
+
+/// How something is borrowed. There is no runtime difference; the distinction is what
+/// lets a write through a shared borrow be an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Borrow {
+    Shared,
+    Mutable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,6 +233,15 @@ pub enum Expr {
     List(ListLit),
     Index(IndexExpr),
     Method(MethodCall),
+    /// `&p` / `&mut p`, which only an argument can be.
+    Borrow(BorrowExpr),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BorrowExpr {
+    pub borrow: Borrow,
+    pub place: Box<Expr>,
+    pub span: Span,
 }
 
 /// `[1, 2, 3]`.
@@ -299,6 +335,7 @@ impl Expr {
             Expr::List(e) => e.span,
             Expr::Index(e) => e.span,
             Expr::Method(e) => e.span,
+            Expr::Borrow(e) => e.span,
         }
     }
 }

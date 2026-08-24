@@ -64,6 +64,7 @@ impl Parser {
             Some(TokenKind::Keyword(Keyword::Fn)) => {}
             Some(TokenKind::Keyword(Keyword::Struct)) => return self.struct_item(attrs, start),
             Some(TokenKind::Keyword(Keyword::Enum)) => return self.enum_item(attrs, start),
+            Some(TokenKind::Keyword(Keyword::Impl)) => return self.impl_item(attrs, start),
             Some(TokenKind::Reserved(word)) => {
                 let word = word.clone();
                 self.error(format!(
@@ -81,6 +82,10 @@ impl Parser {
         let name = self.ident()?;
         let generics = self.generics()?;
         self.expect(Punct::LParen, "(")?;
+        let receiver = self.receiver();
+        if receiver.is_some() {
+            self.eat_punct(Punct::Comma);
+        }
         let mut params = Vec::new();
         while self.peek() != Some(&TokenKind::Punct(Punct::RParen)) {
             params.push(self.param()?);
@@ -104,6 +109,7 @@ impl Parser {
             kind: ItemKind::Fn(FnItem {
                 name,
                 generics,
+                receiver,
                 params,
                 ret,
                 body,
@@ -134,6 +140,27 @@ impl Parser {
                 generics,
                 fields,
             }),
+            span: Span { start, end },
+        })
+    }
+
+    /// `impl Point { fn bump(&mut self) { .. } }`.
+    fn impl_item(&mut self, attrs: Vec<Attribute>, start: usize) -> Option<Item> {
+        self.bump();
+        let ty = self.ident()?;
+        self.expect(Punct::LBrace, "{")?;
+        let mut methods = Vec::new();
+        while self.peek() != Some(&TokenKind::Punct(Punct::RBrace)) {
+            match self.item() {
+                Some(method) => methods.push(method),
+                None => return None,
+            }
+        }
+        self.expect(Punct::RBrace, "}")?;
+        let end = self.previous_end();
+        Some(Item {
+            attrs,
+            kind: ItemKind::Impl(ImplItem { ty, methods }),
             span: Span { start, end },
         })
     }
@@ -217,6 +244,45 @@ impl Parser {
         })
     }
 
+    /// `&self` / `&mut self` / `self` at the head of a parameter list.
+    fn receiver(&mut self) -> Option<Receiver> {
+        let start = self.span().start;
+        let borrow = match self.peek() {
+            Some(TokenKind::Keyword(Keyword::SelfValue)) => None,
+            Some(TokenKind::Punct(Punct::And)) => {
+                // `& self` / `& mut self`; anything else is a parameter type.
+                let mutable = matches!(
+                    self.tokens.get(self.at + 1).map(|t| &t.kind),
+                    Some(TokenKind::Keyword(Keyword::Mut))
+                );
+                let after = if mutable { 2 } else { 1 };
+                if !matches!(
+                    self.tokens.get(self.at + after).map(|t| &t.kind),
+                    Some(TokenKind::Keyword(Keyword::SelfValue))
+                ) {
+                    return None;
+                }
+                self.bump();
+                if mutable {
+                    self.bump();
+                }
+                Some(match mutable {
+                    true => Borrow::Mutable,
+                    false => Borrow::Shared,
+                })
+            }
+            _ => return None,
+        };
+        self.bump();
+        Some(Receiver {
+            borrow,
+            span: Span {
+                start,
+                end: self.previous_end(),
+            },
+        })
+    }
+
     fn param(&mut self) -> Option<Param> {
         let start = self.span().start;
         let name = self.binding_name()?;
@@ -232,6 +298,14 @@ impl Parser {
 
     fn type_name(&mut self) -> Option<TypeName> {
         let start = self.span().start;
+        let borrow = if self.eat_punct(Punct::And) {
+            Some(match self.eat_keyword(Keyword::Mut) {
+                true => Borrow::Mutable,
+                false => Borrow::Shared,
+            })
+        } else {
+            None
+        };
         let name = self.ident()?.name;
         let mut args = Vec::new();
         // `Vec<i32>`. Only types take angle brackets, so there is no ambiguity with
@@ -247,6 +321,7 @@ impl Parser {
         }
         let end = self.previous_end();
         Some(TypeName {
+            borrow,
             name,
             args,
             span: Span { start, end },
@@ -775,6 +850,29 @@ impl Parser {
                 let value = text.clone();
                 self.bump();
                 Some(Expr::Str(StrLit { value, span }))
+            }
+            Some(TokenKind::Punct(Punct::And)) => {
+                self.bump();
+                let borrow = match self.eat_keyword(Keyword::Mut) {
+                    true => Borrow::Mutable,
+                    false => Borrow::Shared,
+                };
+                let place = self.primary()?;
+                Some(Expr::Borrow(BorrowExpr {
+                    borrow,
+                    span: Span {
+                        start: span.start,
+                        end: place.span().end,
+                    },
+                    place: Box::new(place),
+                }))
+            }
+            Some(TokenKind::Keyword(Keyword::SelfValue)) => {
+                self.bump();
+                Some(Expr::Path(Ident {
+                    name: "self".to_owned(),
+                    span,
+                }))
             }
             Some(TokenKind::Punct(Punct::LBracket)) => {
                 self.bump();

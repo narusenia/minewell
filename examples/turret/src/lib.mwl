@@ -22,6 +22,15 @@ struct Turret {
     shots: i32,
 }
 
+// A borrow is a name for a place, not a value that gets copied: `fire` is compiled
+// once per place it is called on, and writes straight into the caller's compound.
+// Look at `turret:turret/fire_main_turret` — the arguments cost no commands at all.
+impl Turret {
+    fn fire(&mut self, power: i32) {
+        self.shots += power;
+    }
+}
+
 #[load]
 fn main() {
     let mut turret = Turret {
@@ -45,7 +54,7 @@ fn main() {
                 }
             }
             Phase::Firing { power } => {
-                turret.shots += power;
+                turret.fire(power);
                 turret.phase = Phase::Idle;
             }
         }
