@@ -278,6 +278,7 @@ fn command(inst: &Inst, ns: &str) -> String {
         Inst::SetValue { path, value } => {
             format!("data modify storage {ns}:mw {path} set value {value}")
         }
+        Inst::GetData { path } => format!("data get storage {ns}:mw {path}"),
         Inst::CopyData { dst, src } => {
             format!("data modify storage {ns}:mw {dst} set from storage {ns}:mw {src}")
         }

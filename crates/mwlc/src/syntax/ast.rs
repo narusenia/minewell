@@ -153,6 +153,16 @@ pub enum Expr {
     Resource(ResourceLit),
     Macro(MacroCall),
     Struct(StructLit),
+    Field(FieldExpr),
+}
+
+/// `p.x`, and `o.inner.a` by nesting. The base is an expression so that the parser
+/// stays simple; HIR is where "only a binding can be addressed" is decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldExpr {
+    pub base: Box<Expr>,
+    pub name: Ident,
+    pub span: Span,
 }
 
 /// `Point { x: 1, y: 2 }`.
@@ -207,6 +217,7 @@ impl Expr {
             Expr::Resource(e) => e.span,
             Expr::Macro(e) => e.span,
             Expr::Struct(e) => e.span,
+            Expr::Field(e) => e.span,
         }
     }
 }
@@ -272,7 +283,8 @@ pub enum BinaryOp {
 pub struct AssignExpr {
     /// `None` for plain `=`; otherwise the arithmetic to apply first.
     pub op: Option<BinaryOp>,
-    pub target: Ident,
+    /// A binding, or a field reached from one. Checked in HIR.
+    pub target: Box<Expr>,
     pub value: Box<Expr>,
     pub span: Span,
 }

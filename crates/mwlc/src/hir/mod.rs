@@ -91,6 +91,19 @@ fn type_name(ty: Type, structs: &[StructDef]) -> String {
     }
 }
 
+/// A value addressed by name: a binding, or a field reached from one.
+///
+/// Composite values live in storage, where "where is it" is a path rather than a
+/// register, and a field is the same path with one more step (spec section 6.18).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Place {
+    pub local: LocalId,
+    /// Field names from the binding outwards; empty for the binding itself.
+    pub fields: Vec<String>,
+    /// The type of the value addressed, which is the innermost field's.
+    pub ty: Type,
+}
+
 /// A `struct` definition: an NBT compound with a known shape (spec section 4.8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructDef {
@@ -224,7 +237,7 @@ pub enum Stmt {
         span: Span,
     },
     Assign {
-        local: LocalId,
+        place: Place,
         /// `None` for `=`; otherwise the arithmetic to apply first.
         op: Option<BinaryOp>,
         value: Expr,
@@ -283,6 +296,8 @@ pub enum ExprKind {
         id: StructId,
         fields: Vec<Expr>,
     },
+    /// Reading a binding's field.
+    Field(Place),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1009,10 +1024,11 @@ impl FnLowering<'_> {
 
     fn assign(&mut self, assign: &ast::AssignExpr) -> Option<Stmt> {
         let value = self.expr(&assign.value)?;
-        let local = self.lookup(&assign.target)?;
-        let declared = self.locals[local.0 as usize].clone();
-        if !declared.mutable {
-            let name = &declared.name;
+        let place = self.place(&assign.target)?;
+        // Mutability is a property of the binding: writing a field writes the binding.
+        let binding = self.locals[place.local.0 as usize].clone();
+        if !binding.mutable {
+            let name = &binding.name;
             self.error(
                 assign.span,
                 format!("'{name}' is not mutable; declare it with 'let mut'"),
@@ -1020,33 +1036,77 @@ impl FnLowering<'_> {
             return None;
         }
         // A compound assignment is the arithmetic, so it inherits arithmetic's rules.
-        if assign.op.is_some() && declared.ty != Type::I32 {
+        if assign.op.is_some() && place.ty != Type::I32 {
             self.error(
                 assign.span,
-                format!(
-                    "compound assignment needs i32, found {}",
-                    self.ty(declared.ty)
-                ),
+                format!("compound assignment needs i32, found {}", self.ty(place.ty)),
             );
             return None;
         }
-        if declared.ty != value.ty {
+        if place.ty != value.ty {
+            let (want, found) = (self.ty(place.ty), self.ty(value.ty));
             self.error(
                 assign.value.span(),
-                format!(
-                    "expected {}, found {}",
-                    self.ty(declared.ty),
-                    self.ty(value.ty)
-                ),
+                format!("expected {want}, found {found}"),
             );
             return None;
         }
         Some(Stmt::Assign {
-            local,
+            place,
             op: assign.op,
             value,
             span: assign.span,
         })
+    }
+
+    /// Resolves `p`, `p.x` or `o.inner.a` to the value it addresses.
+    ///
+    /// Only a binding and its fields can be addressed. A field of something else —
+    /// a call's result, a literal — would have no name to write through, and there is
+    /// no temporary in storage to give it one.
+    fn place(&mut self, expr: &AstExpr) -> Option<Place> {
+        match expr {
+            AstExpr::Path(name) => {
+                let local = self.lookup(name)?;
+                Some(Place {
+                    local,
+                    fields: Vec::new(),
+                    ty: self.locals[local.0 as usize].ty,
+                })
+            }
+            AstExpr::Field(access) => {
+                let base = self.place(&access.base)?;
+                let Type::Struct(id) = base.ty else {
+                    let found = self.ty(base.ty);
+                    self.error(
+                        access.base.span(),
+                        format!("{found} has no fields; only a struct does"),
+                    );
+                    return None;
+                };
+                let def = &self.structs[id.0 as usize];
+                let Some(field) = def.field(&access.name.name) else {
+                    let (ty, name) = (def.name.clone(), &access.name.name);
+                    self.error(
+                        access.name.span,
+                        format!("'{ty}' has no field named '{name}'"),
+                    );
+                    return None;
+                };
+                let ty = field.ty;
+                let mut fields = base.fields;
+                fields.push(access.name.name.clone());
+                Some(Place {
+                    local: base.local,
+                    fields,
+                    ty,
+                })
+            }
+            other => {
+                self.error(other.span(), "expected a binding or one of its fields");
+                None
+            }
+        }
     }
 
     fn expr(&mut self, expr: &AstExpr) -> Option<Expr> {
@@ -1149,6 +1209,14 @@ impl FnLowering<'_> {
                 None
             }
             AstExpr::Struct(lit) => self.struct_lit(lit),
+            AstExpr::Field(_) => {
+                let place = self.place(expr)?;
+                Some(Expr {
+                    ty: place.ty,
+                    kind: ExprKind::Field(place),
+                    span,
+                })
+            }
         }
     }
 
@@ -2251,6 +2319,48 @@ mod tests {
         fn a_struct_declared_twice_is_reported() {
             let errors = lower_err("struct A { x: i32 } struct A { y: i32 }");
             assert!(errors[0].message.contains("already defined"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_field_of_something_that_is_not_a_struct_is_reported() {
+            let errors = lower_err("fn main() { let n = 1; let x = n.field; }");
+            assert!(errors[0].message.contains("has no fields"), "{errors:?}");
+        }
+
+        #[test]
+        fn reading_a_field_that_does_not_exist_is_reported() {
+            let errors = lower_err(
+                "struct Point { x: i32 } fn main() { let p = Point { x: 1 }; let y = p.y; }",
+            );
+            assert!(
+                errors[0].message.contains("no field named 'y'"),
+                "{errors:?}"
+            );
+        }
+
+        #[test]
+        fn writing_a_field_needs_a_mutable_binding() {
+            let errors =
+                lower_err("struct Point { x: i32 } fn main() { let p = Point { x: 1 }; p.x = 2; }");
+            assert!(errors[0].message.contains("not mutable"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_field_of_the_wrong_type_cannot_be_assigned() {
+            let errors = lower_err(
+                "struct Point { x: i32 } \
+                 fn main() { let mut p = Point { x: 1 }; p.x = true; }",
+            );
+            assert!(errors[0].message.contains("expected i32"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_composite_field_cannot_take_arithmetic() {
+            let errors = lower_err(
+                "struct Inner { a: i32 } struct Outer { i: Inner } \
+                 fn main() { let mut o = Outer { i: Inner { a: 1 } }; o.i += 1; }",
+            );
+            assert!(errors[0].message.contains("needs i32"), "{errors:?}");
         }
 
         #[test]

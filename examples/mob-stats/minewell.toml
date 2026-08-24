@@ -1,0 +1,4 @@
+[package]
+name = "mob_stats"
+namespace = "stats"
+description = "Composite values, and where they live"

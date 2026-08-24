@@ -1,0 +1,42 @@
+// Composite values live in storage, not on the scoreboard.
+//
+// A `struct` is an NBT compound under `stats:mw`, at `mw.vars.<function>.<binding>`.
+// Look at the generated commands: building `s` is a single `data modify ... set value`,
+// because every field is known while compiling. Only a field whose value is not known
+// until runtime costs a command of its own.
+//
+// Passing a struct is one command too — the compound is copied from the caller's path
+// to the callee's. Nothing is boxed, nothing is looked up by name at runtime.
+
+struct Stats {
+    health: i32,
+    armour: i32,
+    poisoned: bool,
+}
+
+/// Fields are read one command at a time, straight into the score they are needed in.
+fn effective(s: Stats) -> i32 {
+    let armoured = s.health + s.armour * 2;
+    if s.poisoned {
+        return armoured / 2;
+    }
+    return armoured;
+}
+
+#[load]
+fn main() {
+    let mut s = Stats {
+        health: 20,
+        armour: 5,
+        poisoned: false,
+    };
+
+    // Writing a field is one command; `+=` is three, because the arithmetic has to
+    // happen on the scoreboard and the value makes the round trip.
+    s.armour += 3;
+
+    let score = effective(s);
+    if score >= 30 {
+        raw!("say that one is going to take a while");
+    }
+}

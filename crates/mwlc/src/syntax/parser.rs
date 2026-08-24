@@ -417,20 +417,20 @@ impl Parser {
         self.bump();
         // Right associative: `a = b = c` is `a = (b = c)`.
         let value = self.assign()?;
-        let Expr::Path(target) = lhs else {
+        if !matches!(lhs, Expr::Path(_) | Expr::Field(_)) {
             self.errors.push(SyntaxError::new(
                 op_span,
-                "the left side of an assignment must be a binding",
+                "the left side of an assignment must be a binding or one of its fields",
             ));
             return None;
-        };
+        }
         let span = Span {
-            start: target.span.start,
+            start: lhs.span().start,
             end: value.span().end,
         };
         Some(Expr::Assign(AssignExpr {
             op,
-            target,
+            target: Box::new(lhs),
             value: Box::new(value),
             span,
         }))
@@ -529,7 +529,30 @@ impl Parser {
         }))
     }
 
+    /// A primary expression and the field accesses that follow it.
     fn primary(&mut self) -> Option<Expr> {
+        let mut expr = self.atom()?;
+        while self.peek() == Some(&TokenKind::Punct(Punct::Dot)) {
+            self.bump();
+            let name = self.ident()?;
+            if self.peek() == Some(&TokenKind::Punct(Punct::LParen)) {
+                self.error("methods are not implemented yet");
+                return None;
+            }
+            let span = Span {
+                start: expr.span().start,
+                end: name.span.end,
+            };
+            expr = Expr::Field(FieldExpr {
+                base: Box::new(expr),
+                name,
+                span,
+            });
+        }
+        Some(expr)
+    }
+
+    fn atom(&mut self) -> Option<Expr> {
         let span = self.span();
         match self.peek() {
             Some(TokenKind::Int(value)) => {
@@ -947,6 +970,25 @@ mod tests {
 
     /// Spec section 3.10: in the head of an `if`, a `{` opens the block. Without this
     /// rule `if p { .. }` would have two readings and the parser would pick one.
+    #[test]
+    fn a_field_access_chains() {
+        let file = parse_ok("fn main() { let a = o.inner.a; }");
+        let Stmt::Let(let_stmt) = &fn_item(&file, 0).body.stmts[0] else {
+            panic!("expected a let")
+        };
+        let Expr::Field(outer) = &let_stmt.value else {
+            panic!("expected a field access")
+        };
+        assert_eq!(outer.name.name, "a");
+        assert!(matches!(*outer.base, Expr::Field(_)));
+    }
+
+    #[test]
+    fn a_method_call_says_it_is_not_implemented() {
+        let errors = parse_err("fn main() { p.bump(); }");
+        assert!(errors[0].message.contains("methods"), "{errors:?}");
+    }
+
     #[test]
     fn a_brace_after_a_condition_opens_the_block() {
         let file = parse_ok("fn main() { if p { } }");

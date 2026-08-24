@@ -111,6 +111,8 @@ pub enum Inst {
     SetValue { path: String, value: String },
     /// `data modify storage <ns>:mw <dst> set from storage <ns>:mw <src>`
     CopyData { dst: String, src: String },
+    /// `data get storage <ns>:mw <path>`, whose result is the value there.
+    GetData { path: String },
     /// `execute store result storage <ns>:mw <path> <tag> 1 run <inst>`
     StoreData {
         path: String,
@@ -551,6 +553,16 @@ fn local_path(function: &hir::Function, local: LocalId) -> String {
     )
 }
 
+/// Where a place lives: the binding's path with one step per field (spec section 6.18).
+fn place_path(function: &hir::Function, place: &hir::Place) -> String {
+    let mut path = local_path(function, place.local);
+    for field in &place.fields {
+        path.push('.');
+        path.push_str(field);
+    }
+    path
+}
+
 /// The NBT tag a scalar field is written as (requirements section 4.2).
 fn tag_of(ty: Type) -> &'static str {
     match ty {
@@ -609,9 +621,12 @@ impl<'p> Lowering<'_, 'p> {
                 self.store_struct(&path, value);
                 self.program.initialised.push(*local);
             }
-            hir::Stmt::Assign { local, value, .. } if self.local_ty(*local).is_storage() => {
-                let path = local_path(self.function, *local);
-                self.store_struct(&path, value);
+            // Anything addressed through a field, and any composite, is in storage.
+            hir::Stmt::Assign {
+                place, op, value, ..
+            } if place.ty.is_storage() || !place.fields.is_empty() => {
+                let path = place_path(self.function, place);
+                self.assign_in_storage(&path, place.ty, *op, value);
             }
             hir::Stmt::Let { local, value, .. } => {
                 let dst = self.local(*local);
@@ -621,9 +636,9 @@ impl<'p> Lowering<'_, 'p> {
                 self.program.initialised.push(*local);
             }
             hir::Stmt::Assign {
-                local, op, value, ..
+                place, op, value, ..
             } => {
-                let dst = self.local(*local);
+                let dst = self.local(place.local);
                 self.store(dst, *op, value);
             }
         }
@@ -631,6 +646,47 @@ impl<'p> Lowering<'_, 'p> {
 
     fn local_ty(&self, local: LocalId) -> Type {
         self.function.locals[local.0 as usize].ty
+    }
+
+    /// Writes to something that lives in storage: a whole compound, or one field.
+    ///
+    /// A compound assignment is the one case that costs three commands: the arithmetic
+    /// has to happen on the scoreboard, so the field is read out, changed and written
+    /// back. Vanilla has no arithmetic on storage to shorten this with.
+    fn assign_in_storage(&mut self, path: &str, ty: Type, op: Option<BinaryOp>, value: &hir::Expr) {
+        if ty.is_storage() {
+            self.store_struct(path, value);
+            return;
+        }
+        let src = match op {
+            None => self.expr(value),
+            Some(op) => {
+                let acc = self.temps_next();
+                self.insts.push(Inst::StoreResult {
+                    dst: acc.clone(),
+                    inst: Box::new(Inst::GetData {
+                        path: path.to_owned(),
+                    }),
+                });
+                self.store(acc.clone(), Some(op), value);
+                Value::Reg(acc)
+            }
+        };
+        match src {
+            // A constant needs no register to pass through: `set value` takes it.
+            Value::Const(n) => self.insts.push(Inst::SetValue {
+                path: path.to_owned(),
+                value: match ty {
+                    Type::Bool => format!("{n}b"),
+                    _ => n.to_string(),
+                },
+            }),
+            Value::Reg(src) => self.insts.push(Inst::StoreData {
+                path: path.to_owned(),
+                tag: tag_of(ty),
+                inst: Box::new(Inst::Get { src }),
+            }),
+        }
     }
 
     /// Writes a composite value to `path`.
@@ -649,6 +705,13 @@ impl<'p> Lowering<'_, 'p> {
             }
             hir::ExprKind::Local(local) => {
                 let src = local_path(self.function, *local);
+                self.insts.push(Inst::CopyData {
+                    dst: path.to_owned(),
+                    src,
+                });
+            }
+            hir::ExprKind::Field(place) => {
+                let src = place_path(self.function, place);
                 self.insts.push(Inst::CopyData {
                     dst: path.to_owned(),
                     src,
@@ -762,6 +825,16 @@ impl<'p> Lowering<'_, 'p> {
                     min: Some(0),
                     max: Some(0),
                     negated: false,
+                });
+            }
+            // `execute store result score <dst> run data get ...` names its
+            // destination too, so reading a field needs no temporary in between.
+            hir::ExprKind::Field(place) if !expr.ty.is_storage() => {
+                self.insts.push(Inst::StoreResult {
+                    dst,
+                    inst: Box::new(Inst::GetData {
+                        path: place_path(self.function, place),
+                    }),
                 });
             }
             _ => {
@@ -1234,6 +1307,17 @@ impl<'p> Lowering<'_, 'p> {
             // Composite values live in storage; every path that produces one goes
             // through `store_struct`, which never asks for a register.
             hir::ExprKind::Struct { .. } => unreachable!("a struct is not a register value"),
+            // Reading a scalar out of storage: one command, straight into a register.
+            hir::ExprKind::Field(place) => {
+                let dst = self.temps_next();
+                self.insts.push(Inst::StoreResult {
+                    dst: dst.clone(),
+                    inst: Box::new(Inst::GetData {
+                        path: place_path(self.function, place),
+                    }),
+                });
+                Value::Reg(dst)
+            }
         }
     }
 

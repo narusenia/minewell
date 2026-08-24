@@ -337,8 +337,9 @@ fn print_generated_commands() {
         "fn fact(n: i32) -> i32 { if n <= 1 { return 1; } return n * fact(n - 1); }
          fn main() { let x = fact(3); }",
         "struct Inner { a: i32 } struct Outer { inner: Inner, b: bool }
-         fn take(o: Outer) {}
-         fn main() { let n = 2; let o = Outer { inner: Inner { a: n }, b: true }; take(o); }",
+         fn take(o: Outer) -> i32 { return o.inner.a; }
+         fn main() { let n = 2; let mut o = Outer { inner: Inner { a: n }, b: true };
+                     o.inner.a += 1; let x = take(o); }",
     ] {
         println!("=== {src}");
         let options = mwlc::emit::Options {
@@ -691,7 +692,7 @@ mod control_register {
 /// Composite values. Spec sections 3.10, 4.8 and 6.18: a `struct` is a compound in
 /// storage, so these ask what is in storage rather than what is in a register.
 mod structs {
-    use super::harness::{cost, load, run, stored};
+    use super::harness::{at_path, cost, load, local, run, stored};
     use tinymcf::nbt::NbtValue;
 
     fn compound(fields: &[(&str, NbtValue)]) -> NbtValue {
@@ -786,6 +787,69 @@ mod structs {
             stored(&mc, "take", "p"),
             Some(compound(&[("x", NbtValue::Int(9))]))
         );
+    }
+
+    #[test]
+    fn a_nested_field_is_addressed_by_its_own_path() {
+        let mc = run(
+            "struct Inner { a: i32 } struct Outer { inner: Inner, b: i32 } \
+             fn main() { \
+                 let mut o = Outer { inner: Inner { a: 1 }, b: 2 }; \
+                 o.inner.a = 9; \
+                 let x = o.inner.a; \
+             }",
+        );
+        assert_eq!(
+            at_path(&mc, "mw.vars.main.o.inner.a"),
+            Some(NbtValue::Int(9))
+        );
+        assert_eq!(local(&mc, "main", "x"), Some(9));
+    }
+
+    #[test]
+    fn reading_a_field_costs_one_command() {
+        let mc = run("struct Point { x: i32, y: i32 } \
+             fn main() { let p = Point { x: 4, y: 5 }; let x = p.y; }");
+        assert_eq!(local(&mc, "main", "x"), Some(5));
+        // `execute ... run` is two commands, not one (tinymcf SPEC section 5): the
+        // execute and the `data get` it runs. There is no temporary in between.
+        assert_eq!(cost(&mc), 3, "one to build, two to read into the register");
+    }
+
+    #[test]
+    fn a_compound_assignment_on_a_field_reads_changes_and_writes_back() {
+        // Three commands, and they cannot be fewer: the scoreboard is the only place
+        // arithmetic happens, so the value has to make the round trip.
+        let mc = run("struct Counter { n: i32 } \
+             fn main() { let mut c = Counter { n: 1 }; c.n += 4; }");
+        assert_eq!(at_path(&mc, "mw.vars.main.c.n"), Some(NbtValue::Int(5)));
+        // Three instructions, five commands: both the read and the write-back are
+        // an `execute ... run`.
+        assert_eq!(cost(&mc), 6, "one to build, five for the read-modify-write");
+    }
+
+    #[test]
+    fn a_composite_field_is_copied_whole() {
+        let mc = run("struct Inner { a: i32 } struct Outer { inner: Inner } \
+             fn main() { let o = Outer { inner: Inner { a: 3 } }; let i = o.inner; }");
+        assert_eq!(
+            stored(&mc, "main", "i"),
+            Some(compound(&[("a", NbtValue::Int(3))]))
+        );
+    }
+
+    #[test]
+    fn a_bool_field_can_be_a_condition() {
+        let mc = run("struct Flags { on: bool } \
+             fn main() { let f = Flags { on: true }; let mut x = 0; if f.on { x = 1; } }");
+        assert_eq!(local(&mc, "main", "x"), Some(1));
+    }
+
+    #[test]
+    fn a_field_written_from_another_field() {
+        let mc = run("struct Point { x: i32, y: i32 } \
+             fn main() { let mut p = Point { x: 1, y: 2 }; p.x = p.y; }");
+        assert_eq!(at_path(&mc, "mw.vars.main.p.x"), Some(NbtValue::Int(2)));
     }
 
     #[test]

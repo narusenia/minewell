@@ -313,13 +313,19 @@ struct_item := "struct" IDENT "{" [field_defs] "}"
 field_defs  := field_def {"," field_def} [","]
 field_def   := {ATTRIBUTE} IDENT ":" type
 
-primary     += struct_lit
+primary     += struct_lit | field_access
 struct_lit  := IDENT "{" [field_inits] "}"
 field_inits := field_init {"," field_init} [","]
 field_init  := IDENT ":" expr
+field_access:= primary "." IDENT
+
+assign      := place [assign_op or] | ...
+place       := IDENT {"." IDENT}
 ```
 
 - 構築はフィールドを**全部**書く。省略も既定値も無い（[§4.8](#48-struct--確定m7)）
+- 代入の左辺はフィールドまで辿れる（`o.inner.a = 1;`）。**辿れるのは束縛から始まる名前の連なりだけ** —
+  式の結果のフィールドは書けない。メソッド呼び出し（`p.bump()`）は M7-9
 - **`if` / `while` の条件と `as` / `at` / `for` のセレクタには構造体リテラルを書けない。**
   `if p { .. }` の `{` がブロックなのかリテラルなのか決まらないため。Rust と同じ制限で、
   括弧の中でなら書ける
@@ -452,6 +458,8 @@ Rust では代入式は `()` を返すが、minewell に `()` 型は無い。値
 | 式 | 要求 | 結果 |
 |---|---|---|
 | `S { f: e, .. }` | `S` は `struct`、フィールドが過不足なく、それぞれ同型 | `S` |
+| `e.f` | `e` は `struct` の束縛（またはそのフィールド）、`f` はそのフィールド | `f` の型 |
+| `e.f = v` | 束縛が `mut`、`v` は `f` と同型 | 値を返さない |
 
 - **フィールドは全部初期化する。** 足りない・知らない・同じ名前が 2 度、いずれもエラー。
   NBT は欠けたフィールドを黙って無視するので、省略を許した時点で
@@ -876,3 +884,29 @@ let q = Point { x: n, y: true };     // n は実行時の値
 let q = p;   →  data modify storage <ns>:mw mw.vars.main.q set from storage <ns>:mw mw.vars.main.p
 f(p)         →  data modify storage <ns>:mw mw.vars.f.p    set from storage <ns>:mw mw.vars.main.p
 ```
+
+フィールドの読み書きも 1 コマンド。パスは束縛のパスに `.<フィールド名>` を継ぎ足しただけで、
+ネストしても同じ規則が続く。
+
+```
+let a = o.inner.a;
+→  execute store result score $main.a <ns>.v run data get storage <ns>:mw mw.vars.main.o.inner.a
+
+o.inner.a = 3;
+→  data modify storage <ns>:mw mw.vars.main.o.inner.a set value 3
+
+o.inner.a = n;
+→  execute store result storage <ns>:mw mw.vars.main.o.inner.a int 1 \
+       run scoreboard players get $main.n <ns>.v
+
+o.b = i;              // struct のフィールドどうし
+→  data modify storage <ns>:mw mw.vars.main.o.b set from storage <ns>:mw mw.vars.main.i
+```
+
+**複合代入（`o.a += 1`）だけは 3 命令。** score に読み出し、演算し、書き戻す。
+storage の値に対する算術がバニラに無いため、これは削れない。読み出しと書き戻しは
+どちらも `execute … run` なので、実際に走るのは 5 コマンド
+（[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §5）。
+
+読み出し先が束縛やフィールドなら**テンポラリを経由しない** — `execute store result` は
+書き込み先を自分で持っているため（[§6.4](#64-代入) と同じ理由）。
