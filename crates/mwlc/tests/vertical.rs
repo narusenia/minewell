@@ -340,6 +340,8 @@ fn print_generated_commands() {
          fn take(o: Outer) -> i32 { return o.inner.a; }
          fn main() { let n = 2; let mut o = Outer { inner: Inner { a: n }, b: true };
                      o.inner.a += 1; let x = take(o); }",
+        "fn main() { let mut v = [1, 2, 3]; let i = 2; v[i] = 9; let x = v[i]; v.push(x);
+                     let n = v.len(); }",
         "enum State { Idle, Chasing { target: i32 } }
          fn main() { let mut s = State::Chasing { target: 3 }; let mut x = 0;
                      match s { State::Idle => { x = 1; }
@@ -1139,5 +1141,123 @@ mod matching {
         // Build the value (1), copy it aside (1), the guard that fails (1), and the
         // guard that matches, which is an execute plus the function it runs (2).
         assert_eq!(cost(&mc), 5);
+    }
+}
+
+/// Lists. Spec sections 3.13, 4.11 and 6.21: a `Vec<T>` is an NBT list, and only a
+/// runtime index has to go through a macro function.
+mod vectors {
+    use super::harness::{at_path, cost, load, local, run, stored};
+    use tinymcf::nbt::NbtValue;
+
+    fn list(values: &[NbtValue]) -> NbtValue {
+        NbtValue::List(values.to_vec())
+    }
+
+    #[test]
+    fn a_literal_is_one_command() {
+        let mc = run("fn main() { let v = [1, 2, 3]; }");
+        assert_eq!(
+            stored(&mc, "main", "v"),
+            Some(list(&[
+                NbtValue::Int(1),
+                NbtValue::Int(2),
+                NbtValue::Int(3)
+            ]))
+        );
+        assert_eq!(cost(&mc), 1);
+    }
+
+    #[test]
+    fn an_empty_list_takes_its_type_from_the_annotation() {
+        let mc = run("fn main() { let v: Vec<bool> = []; }");
+        assert_eq!(stored(&mc, "main", "v"), Some(list(&[])));
+    }
+
+    #[test]
+    fn len_reads_the_element_count() {
+        let mc = run("fn main() { let v = [4, 5, 6]; let n = v.len(); }");
+        assert_eq!(local(&mc, "main", "n"), Some(3));
+    }
+
+    #[test]
+    fn push_appends() {
+        let mc = run("fn main() { let mut v = [1]; v.push(2); let x = 7; v.push(x); }");
+        assert_eq!(
+            stored(&mc, "main", "v"),
+            Some(list(&[
+                NbtValue::Int(1),
+                NbtValue::Int(2),
+                NbtValue::Int(7)
+            ]))
+        );
+    }
+
+    #[test]
+    fn a_bool_list_keeps_the_byte_tag() {
+        let mc = run("fn main() { let mut v = [true]; let b = false; v.push(b); }");
+        assert_eq!(
+            stored(&mc, "main", "v"),
+            Some(list(&[NbtValue::Byte(1), NbtValue::Byte(0)]))
+        );
+    }
+
+    #[test]
+    fn a_constant_index_is_part_of_the_path() {
+        let mc = run("fn main() { let mut v = [1, 2, 3]; v[1] = 9; let x = v[1]; }");
+        assert_eq!(local(&mc, "main", "x"), Some(9));
+        assert_eq!(at_path(&mc, "mw.vars.main.v[1]"), Some(NbtValue::Int(9)));
+    }
+
+    /// The task's "test to write first": only a runtime index needs a macro.
+    #[test]
+    fn a_runtime_index_generates_a_macro_function() {
+        let src = "fn main() { let v = [10, 20, 30]; let i = 2; let x = v[i]; }";
+        let mc = run(src);
+        assert_eq!(local(&mc, "main", "x"), Some(30));
+
+        let pack =
+            mwlc::driver::compile(src, "test", &mwlc::emit::Options::default()).expect("compiles");
+        let macros: Vec<&String> = pack
+            .files
+            .iter()
+            .filter(|(path, text)| path.ends_with(".mcfunction") && text.contains("$("))
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(macros.len(), 1, "one macro helper, in its own function");
+        // The promotion must not spread: the caller stays an ordinary function
+        // (requirements section 10.1). Fake player names start with `$` too, so what
+        // makes a function a macro function is a *line* that does.
+        let main = &pack.files["data/test/function/main.mcfunction"];
+        assert!(
+            !main.lines().any(|line| line.starts_with('$')),
+            "the caller must not be a macro function:\n{main}"
+        );
+    }
+
+    #[test]
+    fn a_runtime_index_can_be_written_through() {
+        let mc = run("fn main() { let mut v = [1, 2, 3]; let i = 0; v[i] = 8; }");
+        assert_eq!(at_path(&mc, "mw.vars.main.v[0]"), Some(NbtValue::Int(8)));
+    }
+
+    #[test]
+    fn a_list_of_structs_is_a_list_of_compounds() {
+        let mc = run("struct Point { x: i32 } \
+             fn main() { let mut v = [Point { x: 1 }]; v.push(Point { x: 2 }); \
+                         let p = v[1]; let n = p.x; }");
+        assert_eq!(local(&mc, "main", "n"), Some(2));
+    }
+
+    #[test]
+    fn a_vec_can_be_a_field_and_an_argument() {
+        let mut mc = load(
+            "struct Bag { items: Vec<i32> } \
+             fn take(b: Bag) -> i32 { return b.items.len(); } \
+             fn main() { let b = Bag { items: [1, 2] }; let n = take(b); }",
+        );
+        mc.call("test:main");
+        assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
+        assert_eq!(local(&mc, "main", "n"), Some(2));
     }
 }

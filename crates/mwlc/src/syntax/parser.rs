@@ -208,9 +208,26 @@ impl Parser {
     }
 
     fn type_name(&mut self) -> Option<TypeName> {
-        let span = self.span();
+        let start = self.span().start;
         let name = self.ident()?.name;
-        Some(TypeName { name, span })
+        let mut args = Vec::new();
+        // `Vec<i32>`. Only types take angle brackets, so there is no ambiguity with
+        // the comparison operators here.
+        if self.eat_punct(Punct::Lt) {
+            while self.peek() != Some(&TokenKind::Punct(Punct::Gt)) {
+                args.push(self.type_name()?);
+                if !self.eat_punct(Punct::Comma) {
+                    break;
+                }
+            }
+            self.expect(Punct::Gt, ">")?;
+        }
+        let end = self.previous_end();
+        Some(TypeName {
+            name,
+            args,
+            span: Span { start, end },
+        })
     }
 
     fn eat_punct(&mut self, punct: Punct) -> bool {
@@ -543,10 +560,10 @@ impl Parser {
         self.bump();
         // Right associative: `a = b = c` is `a = (b = c)`.
         let value = self.assign()?;
-        if !matches!(lhs, Expr::Path(_) | Expr::Field(_)) {
+        if !matches!(lhs, Expr::Path(_) | Expr::Field(_) | Expr::Index(_)) {
             self.errors.push(SyntaxError::new(
                 op_span,
-                "the left side of an assignment must be a binding or one of its fields",
+                "the left side of an assignment must be a binding, a field or an element",
             ));
             return None;
         }
@@ -655,27 +672,57 @@ impl Parser {
         }))
     }
 
-    /// A primary expression and the field accesses that follow it.
+    /// A primary expression and the accesses that follow it: fields, indices, methods.
     fn primary(&mut self) -> Option<Expr> {
         let mut expr = self.atom()?;
-        while self.peek() == Some(&TokenKind::Punct(Punct::Dot)) {
-            self.bump();
-            let name = self.ident()?;
-            if self.peek() == Some(&TokenKind::Punct(Punct::LParen)) {
-                self.error("methods are not implemented yet");
-                return None;
+        loop {
+            let start = expr.span().start;
+            match self.peek() {
+                Some(TokenKind::Punct(Punct::Dot)) => {
+                    self.bump();
+                    let name = self.ident()?;
+                    expr = if self.peek() == Some(&TokenKind::Punct(Punct::LParen)) {
+                        let args = self.call_args()?;
+                        Expr::Method(MethodCall {
+                            receiver: Box::new(expr),
+                            name,
+                            args,
+                            span: Span {
+                                start,
+                                end: self.previous_end(),
+                            },
+                        })
+                    } else {
+                        Expr::Field(FieldExpr {
+                            base: Box::new(expr),
+                            name,
+                            span: Span {
+                                start,
+                                end: self.previous_end(),
+                            },
+                        })
+                    };
+                }
+                Some(TokenKind::Punct(Punct::LBracket)) => {
+                    self.bump();
+                    // Inside brackets a struct literal is unambiguous again.
+                    let outer = std::mem::replace(&mut self.no_struct_lit, false);
+                    let index = self.expr();
+                    self.no_struct_lit = outer;
+                    let index = index?;
+                    self.expect(Punct::RBracket, "]")?;
+                    expr = Expr::Index(IndexExpr {
+                        base: Box::new(expr),
+                        index: Box::new(index),
+                        span: Span {
+                            start,
+                            end: self.previous_end(),
+                        },
+                    });
+                }
+                _ => return Some(expr),
             }
-            let span = Span {
-                start: expr.span().start,
-                end: name.span.end,
-            };
-            expr = Expr::Field(FieldExpr {
-                base: Box::new(expr),
-                name,
-                span,
-            });
         }
-        Some(expr)
     }
 
     fn atom(&mut self) -> Option<Expr> {
@@ -705,6 +752,36 @@ impl Parser {
                 let value = text.clone();
                 self.bump();
                 Some(Expr::Str(StrLit { value, span }))
+            }
+            Some(TokenKind::Punct(Punct::LBracket)) => {
+                self.bump();
+                let outer = std::mem::replace(&mut self.no_struct_lit, false);
+                let mut values = Vec::new();
+                let mut failed = false;
+                while self.peek() != Some(&TokenKind::Punct(Punct::RBracket)) {
+                    match self.expr() {
+                        Some(value) => values.push(value),
+                        None => {
+                            failed = true;
+                            break;
+                        }
+                    }
+                    if !self.eat_punct(Punct::Comma) {
+                        break;
+                    }
+                }
+                self.no_struct_lit = outer;
+                if failed {
+                    return None;
+                }
+                self.expect(Punct::RBracket, "]")?;
+                Some(Expr::List(ListLit {
+                    values,
+                    span: Span {
+                        start: span.start,
+                        end: self.previous_end(),
+                    },
+                }))
             }
             Some(TokenKind::Resource(text)) => {
                 let text = text.clone();
@@ -756,15 +833,7 @@ impl Parser {
 
     fn call(&mut self, callee: Ident) -> Option<Expr> {
         let start = callee.span.start;
-        self.bump();
-        let mut args = Vec::new();
-        while self.peek() != Some(&TokenKind::Punct(Punct::RParen)) {
-            args.push(self.expr()?);
-            if !self.eat_punct(Punct::Comma) {
-                break;
-            }
-        }
-        self.expect(Punct::RParen, ")")?;
+        let args = self.call_args()?;
         let end = self.previous_end();
         Some(Expr::Call(CallExpr {
             callee,
@@ -806,6 +875,24 @@ impl Parser {
             fields,
             span: Span { start, end },
         }))
+    }
+
+    /// The bracketed argument list of a call, from the `(` onwards.
+    fn call_args(&mut self) -> Option<Vec<Expr>> {
+        self.expect(Punct::LParen, "(")?;
+        let mut args = Vec::new();
+        while self.peek() != Some(&TokenKind::Punct(Punct::RParen)) {
+            // Arguments are a fresh context: a brace here opens a value, not a block.
+            let outer = std::mem::replace(&mut self.no_struct_lit, false);
+            let arg = self.expr();
+            self.no_struct_lit = outer;
+            args.push(arg?);
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        self.expect(Punct::RParen, ")")?;
+        Some(args)
     }
 
     fn macro_call(&mut self, name: Ident) -> Option<Expr> {
@@ -1131,9 +1218,22 @@ mod tests {
     }
 
     #[test]
-    fn a_method_call_says_it_is_not_implemented() {
-        let errors = parse_err("fn main() { p.bump(); }");
-        assert!(errors[0].message.contains("methods"), "{errors:?}");
+    fn a_method_call_parses() {
+        let file = parse_ok("fn main() { v.push(1); }");
+        let Stmt::Expr(Expr::Method(call)) = &fn_item(&file, 0).body.stmts[0] else {
+            panic!("expected a method call")
+        };
+        assert_eq!(call.name.name, "push");
+        assert_eq!(call.args.len(), 1);
+    }
+
+    #[test]
+    fn an_index_parses() {
+        let file = parse_ok("fn main() { let x = v[i]; }");
+        let Stmt::Let(let_stmt) = &fn_item(&file, 0).body.stmts[0] else {
+            panic!("expected a let")
+        };
+        assert!(matches!(let_stmt.value, Expr::Index(_)));
     }
 
     #[test]

@@ -13,6 +13,7 @@
 //! - **Unknown attributes are errors.** A misspelled `#[tik]` that is quietly ignored
 //!   is the class of silent failure minewell exists to remove.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::schema::{ArgType, Schema};
@@ -38,6 +39,13 @@ pub struct StructOrEnum;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EnumId(pub u32);
 
+/// Identifies one `Vec<T>`, interned by element type.
+///
+/// `Type` is `Copy`, so a type that contains another cannot hold it inline. Interning
+/// keeps the id small and makes `Vec<i32> == Vec<i32>` a comparison of two numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VecId(pub u32);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
     I32,
@@ -54,6 +62,8 @@ pub enum Type {
     Struct(StructId),
     /// A tagged union, also in storage (spec section 4.9).
     Enum(EnumId),
+    /// An NBT list in storage (spec section 4.11).
+    Vec(VecId),
 }
 
 impl Type {
@@ -75,7 +85,7 @@ impl Type {
 
     /// Whether values of this type live in storage rather than on the scoreboard.
     pub fn is_storage(&self) -> bool {
-        matches!(self, Type::Struct(_) | Type::Enum(_))
+        matches!(self, Type::Struct(_) | Type::Enum(_) | Type::Vec(_))
     }
 
     pub fn name(&self) -> &'static str {
@@ -89,6 +99,7 @@ impl Type {
             // that can name the type goes through `Types::name_of` instead.
             Type::Struct(_) => "struct",
             Type::Enum(_) => "enum",
+            Type::Vec(_) => "Vec",
         }
     }
 }
@@ -99,6 +110,9 @@ pub struct Types {
     pub structs: Vec<StructDef>,
     pub enums: Vec<EnumDef>,
     by_name: HashMap<String, Type>,
+    /// Element type per `VecId`. Interned on demand, which is why it is behind a cell:
+    /// a list literal creates its type while the table is only borrowed to read.
+    vecs: RefCell<Vec<Type>>,
 }
 
 impl Types {
@@ -119,8 +133,27 @@ impl Types {
         match ty {
             Type::Struct(id) => self.struct_def(id).name.clone(),
             Type::Enum(id) => self.enum_def(id).name.clone(),
+            Type::Vec(id) => format!("Vec<{}>", self.name_of(self.element(id))),
             other => other.name().to_owned(),
         }
+    }
+
+    /// `Vec<elem>`, interned so that the same list type is the same id.
+    pub fn vec_of(&self, elem: Type) -> Type {
+        let mut vecs = self.vecs.borrow_mut();
+        let index = match vecs.iter().position(|known| *known == elem) {
+            Some(index) => index,
+            None => {
+                vecs.push(elem);
+                vecs.len() - 1
+            }
+        };
+        Type::Vec(VecId(index as u32))
+    }
+
+    /// What a list holds.
+    pub fn element(&self, id: VecId) -> Type {
+        self.vecs.borrow()[id.0 as usize]
     }
 
     /// The fields a composite type holds, across every variant of an `enum`.
@@ -145,12 +178,31 @@ impl Types {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Place {
     pub local: LocalId,
-    /// NBT keys from the binding outwards; empty for the binding itself.
-    pub fields: Vec<String>,
-    /// The type of the value addressed, which is the innermost field's.
+    /// The steps from the binding to the value, in order.
+    pub steps: Vec<Step>,
+    /// The type of the value addressed, which is the innermost step's.
     pub ty: Type,
-    /// The tag it is stored as; `None` for a whole compound.
+    /// The tag it is stored as; `None` for a compound or a list.
     pub tag: Option<NbtTag>,
+}
+
+/// One step of a path: into a field, or into a list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    /// An NBT key.
+    Field(String),
+    /// `v[2]`: known now, so it is part of the path.
+    Index(i32),
+    /// `v[i]`: known only at runtime, so the path has to be built by a macro
+    /// (spec section 6.21). Allowed as the last step only.
+    At(Box<Expr>),
+}
+
+impl Place {
+    /// Whether the whole path is known while compiling.
+    pub fn is_static(&self) -> bool {
+        !self.steps.iter().any(|step| matches!(step, Step::At(_)))
+    }
 }
 
 /// A `struct` definition: an NBT compound with a known shape (spec section 4.8).
@@ -218,7 +270,7 @@ impl NbtTag {
     }
 
     /// The tag a type is written as when nothing says otherwise.
-    fn default_for(ty: Type) -> Option<NbtTag> {
+    pub fn default_for(ty: Type) -> Option<NbtTag> {
         match ty {
             Type::I32 => Some(NbtTag::Int),
             Type::Bool => Some(NbtTag::Byte),
@@ -377,6 +429,12 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
+    /// `v.push(e)`.
+    Push {
+        place: Place,
+        value: Expr,
+        span: Span,
+    },
     Assign {
         place: Place,
         /// `None` for `=`; otherwise the arithmetic to apply first.
@@ -465,6 +523,13 @@ pub enum ExprKind {
         variant: u32,
         fields: Vec<Expr>,
     },
+    /// `[1, 2, 3]`.
+    List {
+        elem: Type,
+        values: Vec<Expr>,
+    },
+    /// `v.len()`.
+    Len(Place),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -953,6 +1018,33 @@ fn resolve_type(
     types: &Types,
     errors: &mut Vec<SyntaxError>,
 ) -> Option<Type> {
+    if written.name == "Vec" {
+        let [elem] = written.args.as_slice() else {
+            errors.push(SyntaxError::new(
+                written.span,
+                "Vec takes one type argument: write 'Vec<i32>'",
+            ));
+            return None;
+        };
+        let elem = resolve_type(elem, types, errors)?;
+        if elem.is_compile_time() {
+            let name = elem.name();
+            errors.push(SyntaxError::new(
+                written.span,
+                format!("a {name} exists only while compiling, so a list cannot hold one"),
+            ));
+            return None;
+        }
+        return Some(types.vec_of(elem));
+    }
+    if !written.args.is_empty() {
+        let name = &written.name;
+        errors.push(SyntaxError::new(
+            written.span,
+            format!("'{name}' does not take type arguments"),
+        ));
+        return None;
+    }
     if let Some(ty) = Type::parse(&written.name) {
         return Some(ty);
     }
@@ -1092,6 +1184,7 @@ impl FnLowering<'_> {
             ast::Stmt::Let(let_stmt) => self.let_stmt(let_stmt),
             ast::Stmt::Expr(AstExpr::Macro(call)) => self.macro_call(call).map(Stmt::Raw),
             ast::Stmt::Expr(AstExpr::Assign(assign)) => self.assign(assign),
+            ast::Stmt::Expr(AstExpr::Method(call)) => self.method(call, true),
             ast::Stmt::Expr(AstExpr::Call(call))
                 if !self.signatures.contains_key(&call.callee.name) =>
             {
@@ -1477,7 +1570,15 @@ impl FnLowering<'_> {
     }
 
     fn let_stmt(&mut self, stmt: &ast::LetStmt) -> Option<Stmt> {
-        let value = self.expr(&stmt.value)?;
+        // The annotation is read first only for a list, which is the one expression
+        // that cannot say what it is on its own.
+        let value = match (&stmt.value, &stmt.ty) {
+            (AstExpr::List(lit), Some(written)) => {
+                let want = self.resolve(written)?;
+                self.list_lit(lit, Some(want))?
+            }
+            _ => self.expr(&stmt.value)?,
+        };
         let ty = match &stmt.ty {
             None => value.ty,
             Some(written) => {
@@ -1551,13 +1652,23 @@ impl FnLowering<'_> {
                 let ty = self.locals[local.0 as usize].ty;
                 Some(Place {
                     local,
-                    fields: Vec::new(),
+                    steps: Vec::new(),
                     ty,
                     tag: NbtTag::default_for(ty),
                 })
             }
             AstExpr::Field(access) => {
                 let base = self.place(&access.base)?;
+                // A macro builds a path that ends at the index it splices in
+                // (spec section 6.21), so nothing can follow one.
+                if !base.is_static() {
+                    self.error(
+                        access.span,
+                        "an index that is only known at runtime has to be the last step; \
+                         read the element into a binding first",
+                    );
+                    return None;
+                }
                 if let Type::Enum(_) = base.ty {
                     let found = self.ty(base.ty);
                     self.error(
@@ -1587,17 +1698,114 @@ impl FnLowering<'_> {
                     return None;
                 };
                 let (ty, tag, key) = (field.ty, field.tag, field.nbt.clone());
-                let mut fields = base.fields;
-                fields.push(key);
+                let mut steps = base.steps;
+                steps.push(Step::Field(key));
                 Some(Place {
                     local: base.local,
-                    fields,
+                    steps,
                     ty,
                     tag,
                 })
             }
+            AstExpr::Index(access) => {
+                let base = self.place(&access.base)?;
+                let Type::Vec(id) = base.ty else {
+                    let found = self.ty(base.ty);
+                    self.error(
+                        access.base.span(),
+                        format!("{found} cannot be indexed; only a Vec can"),
+                    );
+                    return None;
+                };
+                // A macro can splice one index into a path, and the path it builds ends
+                // there (spec section 6.21).
+                if !base.is_static() {
+                    self.error(
+                        access.span,
+                        "an index that is only known at runtime has to be the last step; \
+                         read the element into a binding first",
+                    );
+                    return None;
+                }
+                let index = self.expr(&access.index)?;
+                if index.ty != Type::I32 {
+                    let found = self.ty(index.ty);
+                    self.error(index.span, format!("an index has to be i32, found {found}"));
+                    return None;
+                }
+                let ty = self.types.element(id);
+                let mut steps = base.steps;
+                steps.push(match index.kind {
+                    ExprKind::Int(n) => Step::Index(n),
+                    _ => Step::At(Box::new(index)),
+                });
+                Some(Place {
+                    local: base.local,
+                    steps,
+                    ty,
+                    tag: NbtTag::default_for(ty),
+                })
+            }
             other => {
                 self.error(other.span(), "expected a binding or one of its fields");
+                None
+            }
+        }
+    }
+
+    /// `v.len()` and `v.push(x)`. Methods on user types arrive with `impl`.
+    fn method(&mut self, call: &ast::MethodCall, as_statement: bool) -> Option<Stmt> {
+        let place = self.place(&call.receiver)?;
+        let Type::Vec(id) = place.ty else {
+            let found = self.ty(place.ty);
+            self.error(
+                call.span,
+                format!("{found} has no methods; user-defined methods are not implemented yet"),
+            );
+            return None;
+        };
+        let elem = self.types.element(id);
+        match call.name.name.as_str() {
+            "push" => {
+                if !as_statement {
+                    self.error(call.span, "'push' does not return a value");
+                    return None;
+                }
+                let binding = self.locals[place.local.0 as usize].clone();
+                if !binding.mutable {
+                    let name = &binding.name;
+                    self.error(
+                        call.span,
+                        format!("'{name}' is not mutable; declare it with 'let mut'"),
+                    );
+                    return None;
+                }
+                let [value] = call.args.as_slice() else {
+                    self.error(call.span, "'push' takes one value");
+                    return None;
+                };
+                let value = self.expr(value)?;
+                if value.ty != elem {
+                    let (want, found) = (self.ty(elem), self.ty(value.ty));
+                    self.error(value.span, format!("expected {want}, found {found}"));
+                    return None;
+                }
+                Some(Stmt::Push {
+                    place,
+                    value,
+                    span: call.span,
+                })
+            }
+            "len" => {
+                self.error(call.span, "'len' produces a value; it is not a statement");
+                None
+            }
+            other => {
+                let list = self.ty(place.ty);
+                self.error(
+                    call.name.span,
+                    format!("'{list}' has no method named '{other}'"),
+                );
                 None
             }
         }
@@ -1703,11 +1911,29 @@ impl FnLowering<'_> {
                 None
             }
             AstExpr::Struct(lit) => self.composite_lit(lit),
-            AstExpr::Field(_) => {
+            AstExpr::Field(_) | AstExpr::Index(_) => {
                 let place = self.place(expr)?;
                 Some(Expr {
                     ty: place.ty,
                     kind: ExprKind::Field(place),
+                    span,
+                })
+            }
+            AstExpr::List(lit) => self.list_lit(lit, None),
+            AstExpr::Method(call) => {
+                let place = self.place(&call.receiver)?;
+                if !matches!(place.ty, Type::Vec(_)) || call.name.name != "len" {
+                    // Everything that is not `len` is either a statement or not there.
+                    self.method(call, false);
+                    return None;
+                }
+                if !call.args.is_empty() {
+                    self.error(call.span, "'len' takes no arguments");
+                    return None;
+                }
+                Some(Expr {
+                    kind: ExprKind::Len(place),
+                    ty: Type::I32,
                     span,
                 })
             }
@@ -2090,6 +2316,55 @@ impl FnLowering<'_> {
                 None
             }
         }
+    }
+
+    /// `[1, 2, 3]`. Every element has the same type, which is the list's.
+    ///
+    /// `[]` alone says nothing about what it holds, so it only type-checks where an
+    /// annotation says (spec section 3.13); nothing here infers backwards.
+    fn list_lit(&mut self, lit: &ast::ListLit, want: Option<Type>) -> Option<Expr> {
+        let want_elem = match want {
+            Some(Type::Vec(id)) => Some(self.types.element(id)),
+            _ => None,
+        };
+        let mut values = Vec::new();
+        let mut elem = want_elem;
+        for value in &lit.values {
+            let value = self.expr(value)?;
+            match elem {
+                None => elem = Some(value.ty),
+                Some(elem) if elem != value.ty => {
+                    let (want, found) = (self.ty(elem), self.ty(value.ty));
+                    self.error(
+                        value.span,
+                        format!("every element of a list has the same type: expected {want}, found {found}"),
+                    );
+                    return None;
+                }
+                Some(_) => {}
+            }
+            values.push(value);
+        }
+        let Some(elem) = elem else {
+            self.error(
+                lit.span,
+                "an empty list needs a type: write 'let v: Vec<i32> = [];'",
+            );
+            return None;
+        };
+        if elem.is_compile_time() {
+            let name = elem.name();
+            self.error(
+                lit.span,
+                format!("a {name} exists only while compiling, so a list cannot hold one"),
+            );
+            return None;
+        }
+        Some(Expr {
+            ty: self.types.vec_of(elem),
+            kind: ExprKind::List { elem, values },
+            span: lit.span,
+        })
     }
 
     /// Checks an initialiser list against a declaration: every field, exactly once, at
@@ -3085,6 +3360,77 @@ mod tests {
                              let x = target; }",
             );
             assert!(errors[0].message.contains("not defined"), "{errors:?}");
+        }
+
+        #[test]
+        fn an_empty_list_without_a_type_is_reported() {
+            let errors = lower_err("fn main() { let v = []; }");
+            assert!(errors[0].message.contains("empty list"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_list_of_mixed_types_is_reported() {
+            let errors = lower_err("fn main() { let v = [1, true]; }");
+            assert!(errors[0].message.contains("same type"), "{errors:?}");
+        }
+
+        #[test]
+        fn only_a_list_can_be_indexed() {
+            let errors = lower_err("fn main() { let n = 1; let x = n[0]; }");
+            assert!(errors[0].message.contains("indexed"), "{errors:?}");
+        }
+
+        #[test]
+        fn an_index_has_to_be_a_number() {
+            let errors = lower_err("fn main() { let v = [1]; let x = v[true]; }");
+            assert!(errors[0].message.contains("index"), "{errors:?}");
+        }
+
+        #[test]
+        fn pushing_needs_a_mutable_binding() {
+            let errors = lower_err("fn main() { let v = [1]; v.push(2); }");
+            assert!(errors[0].message.contains("not mutable"), "{errors:?}");
+        }
+
+        #[test]
+        fn pushing_the_wrong_type_is_reported() {
+            let errors = lower_err("fn main() { let mut v = [1]; v.push(true); }");
+            assert!(errors[0].message.contains("expected i32"), "{errors:?}");
+        }
+
+        #[test]
+        fn an_unknown_method_is_reported() {
+            let errors = lower_err("fn main() { let mut v = [1]; v.pop(); }");
+            assert!(
+                errors[0].message.contains("no method named 'pop'"),
+                "{errors:?}"
+            );
+        }
+
+        #[test]
+        fn a_runtime_index_cannot_be_followed_by_a_field() {
+            let errors = lower_err(
+                "struct Point { x: i32 } \
+                 fn main() { let v = [Point { x: 1 }]; let i = 0; let n = v[i].x; }",
+            );
+            assert!(errors[0].message.contains("last step"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_list_cannot_hold_a_compile_time_type() {
+            let errors = lower_err("fn f(v: Vec<selector>) {}");
+            assert!(!errors.is_empty(), "{errors:?}");
+        }
+
+        #[test]
+        fn vec_needs_exactly_one_type_argument() {
+            let errors = lower_err("fn f(v: Vec) {}");
+            assert!(
+                errors[0].message.contains("one type argument"),
+                "{errors:?}"
+            );
+            let errors = lower_err("fn f(v: i32<bool>) {}");
+            assert!(errors[0].message.contains("type arguments"), "{errors:?}");
         }
 
         #[test]

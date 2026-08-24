@@ -13,7 +13,7 @@
 //!
 //! Today every function is one block. Control flow arrives in M3.
 
-use crate::hir::{self, FnId, Hir, LocalId, NbtTag, TAG_KEY, Type, Types};
+use crate::hir::{self, FnId, Hir, LocalId, NbtTag, Step, TAG_KEY, Type, Types};
 use crate::syntax::ast::{BinaryOp, UnaryOp};
 use crate::syntax::lexer::Span;
 
@@ -117,6 +117,16 @@ pub enum Inst {
     CopyData { dst: String, src: String },
     /// `data get storage <ns>:mw <path>`, whose result is the value there.
     GetData { path: String },
+    /// `data modify storage <ns>:mw <path> append value <snbt>`
+    AppendValue { path: String, value: String },
+    /// `data modify storage <ns>:mw <dst> append from storage <ns>:mw <src>`
+    AppendFrom { dst: String, src: String },
+    /// `function <path> with storage <ns>:mw mw.args`
+    CallWithArgs { path: String },
+    /// A macro line: the same command with `$(i)` spliced into a path, which vanilla
+    /// substitutes per call. Only ever the whole body of a generated helper, so macro
+    /// promotion does not spread to the caller (requirements section 10.1).
+    Macro { inst: Box<Inst> },
     /// `execute store result storage <ns>:mw <path> <tag> 1 run <inst>`
     StoreData {
         path: String,
@@ -303,6 +313,15 @@ pub enum Cmp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Slot {
     Score(Reg),
+    Data(String),
+}
+
+/// Where a value to be written into storage came from.
+enum Written {
+    /// Already SNBT: `set value` takes it as it is.
+    Const(String),
+    Reg(Reg),
+    /// A path to copy from, for a composite.
     Data(String),
 }
 
@@ -613,15 +632,41 @@ fn local_path(function: &hir::Function, local: LocalId) -> String {
     )
 }
 
-/// Where a place lives: the binding's path with one step per field (spec section 6.18).
+/// Where a place lives: the binding's path with one step per field or index.
+///
+/// A runtime index is not part of it — that path can only be finished by a macro
+/// (spec section 6.21), so it comes back as the prefix the macro splices into.
 fn place_path(function: &hir::Function, place: &hir::Place) -> String {
     let mut path = local_path(function, place.local);
-    for field in &place.fields {
-        path.push('.');
-        path.push_str(field);
+    for step in &place.steps {
+        match step {
+            Step::Field(name) => {
+                path.push('.');
+                path.push_str(name);
+            }
+            Step::Index(index) => path.push_str(&format!("[{index}]")),
+            // The caller splices the index in; see `runtime_index`.
+            Step::At(_) => break,
+        }
     }
     path
 }
+
+/// The index expression of a place whose last step is only known at runtime.
+fn runtime_index(place: &hir::Place) -> Option<&hir::Expr> {
+    match place.steps.last() {
+        Some(Step::At(index)) => Some(index),
+        _ => None,
+    }
+}
+
+/// The path a macro line writes, with the substitution in place of the index.
+fn spliced(prefix: &str) -> String {
+    format!("{prefix}[$({MACRO_INDEX})]")
+}
+
+/// The argument a macro helper reads its index from, under `mw.args`.
+const MACRO_INDEX: &str = "i";
 
 /// The tag to store a scalar as when nothing named one.
 fn tag_of(tag: Option<NbtTag>) -> &'static str {
@@ -681,12 +726,12 @@ impl<'p> Lowering<'_, 'p> {
                 self.store_struct(&path, value);
                 self.program.initialised.push(*local);
             }
-            // Anything addressed through a field, and any composite, is in storage.
+            hir::Stmt::Push { place, value, .. } => self.push_into(place, value),
+            // Anything addressed through a step, and any composite, is in storage.
             hir::Stmt::Assign {
                 place, op, value, ..
-            } if place.ty.is_storage() || !place.fields.is_empty() => {
-                let path = place_path(self.function, place);
-                self.assign_in_storage(&path, place.ty, place.tag, *op, value);
+            } if place.ty.is_storage() || !place.steps.is_empty() => {
+                self.assign_to_place(place, *op, value)
             }
             hir::Stmt::Let { local, value, .. } => {
                 let dst = self.local(*local);
@@ -706,6 +751,170 @@ impl<'p> Lowering<'_, 'p> {
 
     fn local_ty(&self, local: LocalId) -> Type {
         self.function.locals[local.0 as usize].ty
+    }
+
+    /// Writes through a place, which may need a macro to finish its path.
+    fn assign_to_place(&mut self, place: &hir::Place, op: Option<BinaryOp>, value: &hir::Expr) {
+        let path = place_path(self.function, place);
+        let Some(index) = runtime_index(place) else {
+            self.assign_in_storage(&path, place.ty, place.tag, op, value);
+            return;
+        };
+        // Read-modify-write against a runtime index: read through a macro, do the
+        // arithmetic on the scoreboard, write back through another.
+        let value = match op {
+            None => self.expr_or_copy(place.ty, value),
+            Some(op) => {
+                let acc = self.temps_next();
+                let read = self.macro_helper(
+                    "index",
+                    Inst::ReturnRun {
+                        inst: Box::new(Inst::GetData {
+                            path: spliced(&path),
+                        }),
+                    },
+                );
+                self.write_index_arg(index);
+                self.insts.push(Inst::StoreResult {
+                    dst: acc.clone(),
+                    inst: Box::new(Inst::CallWithArgs { path: read }),
+                });
+                self.store(acc.clone(), Some(op), value);
+                Written::Reg(acc)
+            }
+        };
+        let write = match value {
+            Written::Const(text) => Inst::SetValue {
+                path: spliced(&path),
+                value: text,
+            },
+            Written::Reg(src) => Inst::StoreData {
+                path: spliced(&path),
+                tag: tag_of(place.tag),
+                inst: Box::new(Inst::Get { src }),
+            },
+            Written::Data(src) => Inst::CopyData {
+                dst: spliced(&path),
+                src,
+            },
+        };
+        let helper = self.macro_helper("index", write);
+        self.write_index_arg(index);
+        self.insts.push(Inst::CallWithArgs { path: helper });
+    }
+
+    /// Evaluates a value into whatever a storage write can take: a literal, a register
+    /// or a path to copy from.
+    fn expr_or_copy(&mut self, ty: Type, value: &hir::Expr) -> Written {
+        if !ty.is_storage() {
+            return match self.expr(value) {
+                Value::Const(n) => Written::Const(format!(
+                    "{n}{}",
+                    NbtTag::default_for(ty).map(NbtTag::suffix).unwrap_or("")
+                )),
+                Value::Reg(src) => Written::Reg(src),
+            };
+        }
+        match &value.kind {
+            hir::ExprKind::Local(local) => Written::Data(local_path(self.function, *local)),
+            hir::ExprKind::Field(place) if place.is_static() => {
+                Written::Data(place_path(self.function, place))
+            }
+            // A composite that is not already somewhere: build it aside, then copy.
+            _ => {
+                let temp = self.data_temp();
+                self.store_struct(&temp, value);
+                Written::Data(temp)
+            }
+        }
+    }
+
+    /// Reads a scalar out of storage into `dst`, through a macro if the path needs one.
+    ///
+    /// A list read this way gives its element count, which is what `len` is.
+    fn read_place_into(&mut self, dst: Reg, place: &hir::Place) {
+        let path = place_path(self.function, place);
+        let Some(index) = runtime_index(place) else {
+            self.insts.push(Inst::StoreResult {
+                dst,
+                inst: Box::new(Inst::GetData { path }),
+            });
+            return;
+        };
+        let helper = self.macro_helper(
+            "index",
+            Inst::ReturnRun {
+                inst: Box::new(Inst::GetData {
+                    path: spliced(&path),
+                }),
+            },
+        );
+        self.write_index_arg(index);
+        self.insts.push(Inst::StoreResult {
+            dst,
+            inst: Box::new(Inst::CallWithArgs { path: helper }),
+        });
+    }
+
+    /// Writes the index a macro helper will splice into its path.
+    fn write_index_arg(&mut self, index: &hir::Expr) {
+        let value = self.expr(index);
+        let src = self.materialise(value);
+        self.insts.push(Inst::StoreData {
+            path: format!("mw.args.{MACRO_INDEX}"),
+            tag: "int",
+            inst: Box::new(Inst::Get { src }),
+        });
+    }
+
+    /// A generated function whose whole body is one macro line.
+    fn macro_helper(&mut self, kind: &str, inst: Inst) -> String {
+        let path = format!("{}/{kind}_{}", self.prefix, self.counter);
+        self.counter += 1;
+        self.record(
+            path.clone(),
+            vec![Inst::Macro {
+                inst: Box::new(inst),
+            }],
+            Vec::new(),
+        );
+        path
+    }
+
+    /// `v.push(x)`.
+    fn push_into(&mut self, place: &hir::Place, value: &hir::Expr) {
+        let path = place_path(self.function, place);
+        if runtime_index(place).is_some() {
+            // Two macro calls and a placeholder; nothing needs it yet, and guessing at
+            // the shape would be guessing.
+            self.insts.push(Inst::Raw {
+                text: "# pushing into a list reached by a runtime index is not implemented"
+                    .to_owned(),
+                span: value.span,
+            });
+            return;
+        }
+        let hir::Type::Vec(id) = place.ty else {
+            unreachable!("push is only allowed on a list")
+        };
+        let elem = self.program.types.element(id);
+        let tag = NbtTag::default_for(elem);
+        match self.expr_or_copy(elem, value) {
+            Written::Const(text) => self.insts.push(Inst::AppendValue { path, value: text }),
+            Written::Data(src) => self.insts.push(Inst::AppendFrom { dst: path, src }),
+            // The list has to grow before the value can be stored into its last slot.
+            Written::Reg(src) => {
+                self.insts.push(Inst::AppendValue {
+                    path: path.clone(),
+                    value: format!("0{}", tag.map(NbtTag::suffix).unwrap_or("")),
+                });
+                self.insts.push(Inst::StoreData {
+                    path: format!("{path}[-1]"),
+                    tag: tag_of(tag),
+                    inst: Box::new(Inst::Get { src }),
+                });
+            }
+        }
     }
 
     /// Writes to something that lives in storage: a whole compound, or one field.
@@ -759,7 +968,9 @@ impl<'p> Lowering<'_, 'p> {
     /// that are not get a command of their own (spec section 6.18).
     fn store_struct(&mut self, path: &str, value: &hir::Expr) {
         match &value.kind {
-            hir::ExprKind::Struct { .. } | hir::ExprKind::Enum { .. } => {
+            hir::ExprKind::Struct { .. }
+            | hir::ExprKind::Enum { .. }
+            | hir::ExprKind::List { .. } => {
                 let snbt = self.snbt(value, None);
                 self.insts.push(Inst::SetValue {
                     path: path.to_owned(),
@@ -776,10 +987,23 @@ impl<'p> Lowering<'_, 'p> {
             }
             hir::ExprKind::Field(place) => {
                 let src = place_path(self.function, place);
-                self.insts.push(Inst::CopyData {
-                    dst: path.to_owned(),
-                    src,
-                });
+                match runtime_index(place) {
+                    None => self.insts.push(Inst::CopyData {
+                        dst: path.to_owned(),
+                        src,
+                    }),
+                    Some(index) => {
+                        let helper = self.macro_helper(
+                            "index",
+                            Inst::CopyData {
+                                dst: path.to_owned(),
+                                src: spliced(&src),
+                            },
+                        );
+                        self.write_index_arg(index);
+                        self.insts.push(Inst::CallWithArgs { path: helper });
+                    }
+                }
             }
             other => unreachable!("{other:?} is not a composite value"),
         }
@@ -802,6 +1026,15 @@ impl<'p> Lowering<'_, 'p> {
                     self.compound_body(&def.fields, fields, Vec::new())
                 )
             }
+            hir::ExprKind::List { elem, values } => {
+                let tag = NbtTag::default_for(*elem);
+                let body = values
+                    .iter()
+                    .map(|value| self.snbt(value, tag))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("[{body}]")
+            }
             hir::ExprKind::Enum {
                 id,
                 variant,
@@ -814,7 +1047,8 @@ impl<'p> Lowering<'_, 'p> {
             }
             // Not known now: leave room for the write that follows.
             _ => match value.ty {
-                Type::Struct(_) => "{}".to_owned(),
+                Type::Struct(_) | Type::Enum(_) => "{}".to_owned(),
+                Type::Vec(_) => "[]".to_owned(),
                 _ => format!("0{suffix}"),
             },
         }
@@ -841,6 +1075,30 @@ impl<'p> Lowering<'_, 'p> {
 
     /// Writes the fields `snbt` could only leave a placeholder for.
     fn write_runtime_fields(&mut self, path: &str, value: &hir::Expr) {
+        if let hir::ExprKind::List { elem, values } = &value.kind {
+            let elem = *elem;
+            let tag = NbtTag::default_for(elem);
+            for (index, value) in values.iter().enumerate() {
+                let path = format!("{path}[{index}]");
+                match &value.kind {
+                    hir::ExprKind::Int(_) | hir::ExprKind::Bool(_) => {}
+                    _ if elem.is_storage() => self.store_struct(&path, value),
+                    hir::ExprKind::Struct { .. }
+                    | hir::ExprKind::Enum { .. }
+                    | hir::ExprKind::List { .. } => self.write_runtime_fields(&path, value),
+                    _ => {
+                        let src = self.expr(value);
+                        let src = self.materialise(src);
+                        self.insts.push(Inst::StoreData {
+                            path,
+                            tag: tag_of(tag),
+                            inst: Box::new(Inst::Get { src }),
+                        });
+                    }
+                }
+            }
+            return;
+        }
         let (declared, values) = match &value.kind {
             hir::ExprKind::Struct { id, fields } => {
                 (self.program.types.struct_def(*id).fields.clone(), fields)
@@ -930,13 +1188,8 @@ impl<'p> Lowering<'_, 'p> {
             }
             // `execute store result score <dst> run data get ...` names its
             // destination too, so reading a field needs no temporary in between.
-            hir::ExprKind::Field(place) if !expr.ty.is_storage() => {
-                self.insts.push(Inst::StoreResult {
-                    dst,
-                    inst: Box::new(Inst::GetData {
-                        path: place_path(self.function, place),
-                    }),
-                });
+            hir::ExprKind::Field(place) | hir::ExprKind::Len(place) if !expr.ty.is_storage() => {
+                self.read_place_into(dst, place);
             }
             _ => {
                 let value = self.expr(expr);
@@ -1509,16 +1762,12 @@ impl<'p> Lowering<'_, 'p> {
                 unreachable!("a composite value is not a register value")
             }
             // Reading a scalar out of storage: one command, straight into a register.
-            hir::ExprKind::Field(place) => {
+            hir::ExprKind::Field(place) | hir::ExprKind::Len(place) => {
                 let dst = self.temps_next();
-                self.insts.push(Inst::StoreResult {
-                    dst: dst.clone(),
-                    inst: Box::new(Inst::GetData {
-                        path: place_path(self.function, place),
-                    }),
-                });
+                self.read_place_into(dst.clone(), place);
                 Value::Reg(dst)
             }
+            hir::ExprKind::List { .. } => unreachable!("a list is not a register value"),
         }
     }
 

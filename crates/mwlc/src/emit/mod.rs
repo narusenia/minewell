@@ -289,6 +289,16 @@ fn command(inst: &Inst, ns: &str) -> String {
             format!("data modify storage {ns}:mw {path} set value {value}")
         }
         Inst::GetData { path } => format!("data get storage {ns}:mw {path}"),
+        Inst::AppendValue { path, value } => {
+            format!("data modify storage {ns}:mw {path} append value {value}")
+        }
+        Inst::AppendFrom { dst, src } => {
+            format!("data modify storage {ns}:mw {dst} append from storage {ns}:mw {src}")
+        }
+        Inst::CallWithArgs { path } => format!("function {path} with storage {ns}:mw mw.args"),
+        // The `$` is what makes the line a macro line; vanilla substitutes the
+        // arguments before parsing what follows.
+        Inst::Macro { inst } => format!("${}", command(inst, ns)),
         Inst::CopyData { dst, src } => {
             format!("data modify storage {ns}:mw {dst} set from storage {ns}:mw {src}")
         }

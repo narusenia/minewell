@@ -366,6 +366,23 @@ binds       := IDENT {"," IDENT} [","]
 同じ意味を同じコマンド数で書ける。値を返す構文を先に入れると、テンポラリ経由の
 コピーが 1 つ増えたまま固定されてしまう。
 
+### 3.13 `Vec<T>` — 確定（M7）
+
+```
+type        := IDENT ["<" type {"," type} ">"]
+
+primary     += list_lit | index | method_call
+list_lit    := "[" [expr {"," expr} [","]] "]"
+index       := primary "[" expr "]"
+method_call := primary "." IDENT "(" [args] ")"
+```
+
+- **構築はリストリテラル。** `let v = [1, 2, 3];` / `let mut v: Vec<i32> = [];`
+  - 空リストだけは注釈が要る。要素が無いので型を決める材料が無い（§4.2 のとおり推論はしない）
+  - `Vec::new()` は入れない。`[]` と同じものを 2 通りで書けるようにしても増えるものが無い
+- メソッドは `v.len()` と `v.push(x)` の 2 つ。`impl` の固有メソッドは M7-9
+- 添字は定数でも実行時の値でもよい（コストは違う。[§6.21](#621-vect--確定m7)）
+
 ### 3.5 未定
 
 以降のタスクが、実装の直前に確定させる。
@@ -544,6 +561,25 @@ Rust では代入式は `()` を返すが、minewell に `()` 型は無い。値
   値はコピーで、書き換えても元の compound には戻らない
 - 腕が同じバリアントを 2 度挙げたらエラー
 
+### 4.11 `Vec<T>` — 確定（M7）
+
+`Vec<T>` は storage 上の NBT list。要素は `T` の表現をそのまま並べる。
+
+| 式 | 要求 | 結果 |
+|---|---|---|
+| `[a, b, c]` | 要素が全部同型 | `Vec<その型>` |
+| `[]` | 注釈が `Vec<T>` | `Vec<T>` |
+| `v[e]` | `v: Vec<T>`、`e: i32` | `T` |
+| `v.len()` | `v: Vec<T>` | `i32` |
+| `v.push(e)` | `v` は `mut`、`e: T` | 値を返さない |
+
+- **NBT の list は同型でなければならない。** `Vec<Vec<T>>` も `Vec<struct>` も持てるが、
+  混在した list は作れない — 型が同じであることが構文から保証されている
+- `Vec` は `struct` / `enum` と同じ storage 常駐型。比較・戻り値・算術は同じく不可
+- **範囲外の添字は何も起きない。** バニラの `data` がそう振る舞う。実行時の添字を
+  静的に検査する手段は無く、検査コマンドを毎回吐くのは §0 の原則 3 に反する。
+  debug ビルドでの検査は将来の選択肢として残す
+
 ## 5. 型の表現 — M6 と `struct` の範囲まで確定
 
 | 型 | 置き場所 | 表現 |
@@ -552,6 +588,7 @@ Rust では代入式は `()` を返すが、minewell に `()` 型は無い。値
 | `bool` | scoreboard | `0` または `1` |
 | `struct` | storage | NBT compound（[§6.18](#618-struct-の配置と構築--確定m7)） |
 | `enum` | storage | `tag` を持つ NBT compound |
+| `Vec<T>` | storage | NBT list |
 | `Selector` / `ResourceLocation` / `Pos` | どこにも置かない | コンパイル時のみ |
 
 置き場所は **score / storage / コンパイル時のみ** の 3 分類になる。2 分類（実行時か否か）
@@ -1036,3 +1073,47 @@ match s {
   **1 コマンド**
 - 腕から `break` / `continue` / `return` が出るときは `if` と同じ伝播ガードが付く
   （[§6.10](#610-break--continue--return)）
+
+---
+
+### 6.21 `Vec<T>` — 確定（M7）
+
+置き場所は `struct` と同じ。要素は NBT パスの添字で指す。
+
+| 式 | コマンド |
+|---|---|
+| `let v = [1, 2];` | `data modify storage <ns>:mw <path> set value [1,2]` |
+| `v.len()` | `execute store result score <dst> <ns>.t run data get storage <ns>:mw <path>` |
+| `v.push(3)` | `data modify storage <ns>:mw <path> append value 3` |
+| `v.push(x)` | `append value 0` してから `execute store result storage <ns>:mw <path>[-1] int 1 run …` |
+| `v[0]`（定数） | パスに `[0]` を継ぎ足すだけ。読み書きとも 1 命令 |
+
+**実行時の添字だけがマクロ関数になる**（要件定義 §10.1）。パスの一部が実行時にしか
+決まらないので、文字列としてのコマンドを組み立てる手段がこれしか無い。
+
+```
+let x = v[i];
+→  execute store result storage <ns>:mw mw.args.i int 1 run scoreboard players get $main.i <ns>.v
+   execute store result score $t0 <ns>.t \
+       run function <親>/index_0 with storage <ns>:mw mw.args
+
+<親>/index_0:
+   $return run data get storage <ns>:mw mw.vars.main.v[$(i)]
+```
+
+```
+v[i] = x;
+→  execute store result storage <ns>:mw mw.args.i int 1 run scoreboard players get $main.i <ns>.v
+   function <親>/index_1 with storage <ns>:mw mw.args
+
+<親>/index_1:
+   $execute store result storage <ns>:mw mw.vars.main.v[$(i)] int 1 \
+       run scoreboard players get $main.x <ns>.v
+```
+
+- **マクロ関数に渡すのは添字だけ。** 値のほうは scoreboard に載っていて、
+  フェイクプレイヤー名はコンパイル時に決まっているので、マクロ側から直接読める
+- **マクロ性は呼び出し側に伝染しない**（要件定義 §10.1）。`$` の行は生成した補助関数の
+  中だけにあり、`#[tick]` の関数がマクロ関数になることはない
+- 実行時の添字は**最後の段でだけ**使える。`v[i].field` のように後ろが続く形はエラーにする —
+  マクロ 1 回では書けず、テンポラリを増やして隠すより、束縛に取り出させるほうが読める

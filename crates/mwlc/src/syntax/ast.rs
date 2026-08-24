@@ -179,6 +179,8 @@ pub struct LetStmt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeName {
     pub name: String,
+    /// `Vec<i32>`: the arguments between the angle brackets.
+    pub args: Vec<TypeName>,
     pub span: Span,
 }
 
@@ -198,6 +200,33 @@ pub enum Expr {
     Macro(MacroCall),
     Struct(StructLit),
     Field(FieldExpr),
+    List(ListLit),
+    Index(IndexExpr),
+    Method(MethodCall),
+}
+
+/// `[1, 2, 3]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListLit {
+    pub values: Vec<Expr>,
+    pub span: Span,
+}
+
+/// `v[i]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexExpr {
+    pub base: Box<Expr>,
+    pub index: Box<Expr>,
+    pub span: Span,
+}
+
+/// `v.push(x)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MethodCall {
+    pub receiver: Box<Expr>,
+    pub name: Ident,
+    pub args: Vec<Expr>,
+    pub span: Span,
 }
 
 /// `p.x`, and `o.inner.a` by nesting. The base is an expression so that the parser
@@ -264,6 +293,9 @@ impl Expr {
             Expr::Macro(e) => e.span,
             Expr::Struct(e) => e.span,
             Expr::Field(e) => e.span,
+            Expr::List(e) => e.span,
+            Expr::Index(e) => e.span,
+            Expr::Method(e) => e.span,
         }
     }
 }
