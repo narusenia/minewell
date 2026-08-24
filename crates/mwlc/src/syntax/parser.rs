@@ -132,12 +132,91 @@ impl Parser {
     }
 
     fn stmt(&mut self) -> Option<Stmt> {
-        if self.peek() == Some(&TokenKind::Keyword(Keyword::Let)) {
-            return self.let_stmt().map(Stmt::Let);
+        let attrs = self.attributes();
+        let span = self.span();
+        match self.peek() {
+            Some(TokenKind::Keyword(Keyword::If)) => self.if_stmt(attrs).map(Stmt::If),
+            Some(TokenKind::Keyword(Keyword::While | Keyword::Loop)) => {
+                self.loop_stmt(attrs).map(Stmt::Loop)
+            }
+            _ => {
+                if let Some(attr) = attrs.first() {
+                    self.errors.push(SyntaxError::new(
+                        attr.span,
+                        "attributes here only apply to 'if', 'while' and 'loop'",
+                    ));
+                    return None;
+                }
+                match self.peek() {
+                    Some(TokenKind::Keyword(Keyword::Let)) => self.let_stmt().map(Stmt::Let),
+                    Some(TokenKind::Keyword(Keyword::Break)) => {
+                        self.bump();
+                        self.expect(Punct::Semi, ";")?;
+                        Some(Stmt::Break(span))
+                    }
+                    Some(TokenKind::Keyword(Keyword::Continue)) => {
+                        self.bump();
+                        self.expect(Punct::Semi, ";")?;
+                        Some(Stmt::Continue(span))
+                    }
+                    Some(TokenKind::Keyword(Keyword::Return)) => {
+                        self.bump();
+                        self.expect(Punct::Semi, ";")?;
+                        Some(Stmt::Return(span))
+                    }
+                    _ => {
+                        let expr = self.expr()?;
+                        self.expect(Punct::Semi, ";")?;
+                        Some(Stmt::Expr(expr))
+                    }
+                }
+            }
         }
-        let expr = self.expr()?;
-        self.expect(Punct::Semi, ";")?;
-        Some(Stmt::Expr(expr))
+    }
+
+    fn if_stmt(&mut self, attrs: Vec<Attribute>) -> Option<IfStmt> {
+        let start = self.span().start;
+        self.bump();
+        let cond = self.expr()?;
+        let then = self.block()?;
+        let otherwise = if self.eat_keyword(Keyword::Else) {
+            Some(Box::new(
+                if self.peek() == Some(&TokenKind::Keyword(Keyword::If)) {
+                    Else::If(self.if_stmt(Vec::new())?)
+                } else {
+                    Else::Block(self.block()?)
+                },
+            ))
+        } else {
+            None
+        };
+        let end = self.previous_end();
+        Some(IfStmt {
+            attrs,
+            cond,
+            then,
+            otherwise,
+            span: Span { start, end },
+        })
+    }
+
+    fn loop_stmt(&mut self, attrs: Vec<Attribute>) -> Option<LoopStmt> {
+        let start = self.span().start;
+        let conditional = self.peek() == Some(&TokenKind::Keyword(Keyword::While));
+        self.bump();
+        let cond = if conditional {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        let body = self.block()?;
+        let end = self.previous_end();
+        Some(LoopStmt {
+            attrs,
+            cond,
+            body,
+            span: Span { start, end },
+        })
     }
 
     fn let_stmt(&mut self) -> Option<LetStmt> {
@@ -608,6 +687,22 @@ mod tests {
         let (file, errors) = parse(r#"fn main() { let = 1; raw!("x"); }"#);
         assert_eq!(errors.len(), 1);
         assert_eq!(fn_item(&file, 0).body.stmts.len(), 1);
+    }
+
+    #[test]
+    fn statement_attributes_only_go_where_they_mean_something() {
+        let errors = parse_err("fn main() { #[inline] let x = 1; }");
+        assert!(errors[0].message.contains("only apply to"), "{errors:?}");
+    }
+
+    #[test]
+    fn control_flow_parses() {
+        parse_ok("fn main() { if a { raw!(\"x\"); } }");
+        parse_ok("fn main() { if a { } else { } }");
+        parse_ok("fn main() { if a { } else if b { } else { } }");
+        parse_ok("fn main() { while a { } }");
+        parse_ok("fn main() { loop { break; continue; return; } }");
+        parse_ok("fn main() { #[no_inline] if a { } }");
     }
 
     #[test]

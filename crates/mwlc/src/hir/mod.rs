@@ -74,9 +74,35 @@ pub struct Local {
     pub mutable: bool,
 }
 
+/// Whether a block was asked to be inlined into its guard, or split into its own
+/// function. `Auto` lets the lowering decide (spec section 6.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Inline {
+    Auto,
+    Always,
+    Never,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stmt {
     Raw(RawCommand),
+    If {
+        cond: Expr,
+        then: Vec<Stmt>,
+        otherwise: Option<Vec<Stmt>>,
+        inline: Inline,
+        span: Span,
+    },
+    /// `while` and `loop`; the latter has no condition.
+    Loop {
+        cond: Option<Expr>,
+        body: Vec<Stmt>,
+        inline: Inline,
+        span: Span,
+    },
+    Break(Span),
+    Continue(Span),
+    Return(Span),
     Let {
         local: LocalId,
         value: Expr,
@@ -158,6 +184,7 @@ pub fn lower(file: &SourceFile, namespace: &str) -> (Hir, Vec<SyntaxError>) {
         let mut cx = FnLowering {
             locals: Vec::new(),
             scopes: vec![HashMap::new()],
+            loop_depth: 0,
             errors: &mut errors,
         };
         let attrs = cx.attrs(&item.attrs);
@@ -180,6 +207,9 @@ struct FnLowering<'a> {
     locals: Vec<Local>,
     /// Innermost scope last. A `let` shadows an outer binding of the same name.
     scopes: Vec<HashMap<String, LocalId>>,
+    /// How many loops enclose the statement being lowered. `break` outside one is an
+    /// error, and it is only detectable here.
+    loop_depth: u32,
     errors: &'a mut Vec<SyntaxError>,
 }
 
@@ -226,13 +256,102 @@ impl FnLowering<'_> {
             ast::Stmt::Let(let_stmt) => self.let_stmt(let_stmt),
             ast::Stmt::Expr(AstExpr::Macro(call)) => self.macro_call(call).map(Stmt::Raw),
             ast::Stmt::Expr(AstExpr::Assign(assign)) => self.assign(assign),
-            // Every other expression in M2 is pure, so evaluating one for its effect
-            // is asking for nothing to happen. Say so rather than emit dead commands.
+            // Every other expression is pure, so evaluating one for its effect is
+            // asking for nothing to happen. Say so rather than emit dead commands.
             ast::Stmt::Expr(other) => {
                 self.error(other.span(), "this expression has no effect");
                 None
             }
+            ast::Stmt::If(if_stmt) => self.if_stmt(if_stmt),
+            ast::Stmt::Loop(loop_stmt) => self.loop_stmt(loop_stmt),
+            ast::Stmt::Break(span) => self.jump(*span, "break").map(|()| Stmt::Break(*span)),
+            ast::Stmt::Continue(span) => {
+                self.jump(*span, "continue").map(|()| Stmt::Continue(*span))
+            }
+            ast::Stmt::Return(span) => Some(Stmt::Return(*span)),
         }
+    }
+
+    fn jump(&mut self, span: Span, keyword: &str) -> Option<()> {
+        if self.loop_depth == 0 {
+            self.error(span, format!("'{keyword}' is only allowed inside a loop"));
+            return None;
+        }
+        Some(())
+    }
+
+    fn if_stmt(&mut self, stmt: &ast::IfStmt) -> Option<Stmt> {
+        let cond = self.condition(&stmt.cond)?;
+        let then = self.block(&stmt.then);
+        let otherwise = stmt.otherwise.as_deref().map(|branch| match branch {
+            ast::Else::Block(block) => self.block(block),
+            // `else if` is just an `if` in the else block, so it needs no special case
+            // beyond wrapping it back up as a statement.
+            ast::Else::If(nested) => self.if_stmt(nested).into_iter().collect(),
+        });
+        let inline = self.inline_attr(&stmt.attrs)?;
+        if inline == Inline::Always && !(otherwise.is_none() && then.len() == 1) {
+            self.error(
+                stmt.span,
+                "only a single-statement 'if' with no 'else' can be inlined",
+            );
+            return None;
+        }
+        Some(Stmt::If {
+            cond,
+            then,
+            otherwise,
+            inline,
+            span: stmt.span,
+        })
+    }
+
+    fn loop_stmt(&mut self, stmt: &ast::LoopStmt) -> Option<Stmt> {
+        let cond = match &stmt.cond {
+            Some(cond) => Some(self.condition(cond)?),
+            None => None,
+        };
+        let inline = self.inline_attr(&stmt.attrs)?;
+        if inline == Inline::Always {
+            self.error(stmt.span, "a loop is always its own function");
+            return None;
+        }
+        self.loop_depth += 1;
+        let body = self.block(&stmt.body);
+        self.loop_depth -= 1;
+        Some(Stmt::Loop {
+            cond,
+            body,
+            inline,
+            span: stmt.span,
+        })
+    }
+
+    /// A condition has to be `bool`. There is no truthiness: an `i32` is not a
+    /// condition, because "non-zero is true" would make `if x` and `if x != 0` two
+    /// spellings of one thing and hide the type error in between.
+    fn condition(&mut self, expr: &AstExpr) -> Option<Expr> {
+        let cond = self.expr(expr)?;
+        if cond.ty != Type::Bool {
+            self.error(
+                cond.span,
+                format!("a condition must be bool, found {}", cond.ty.name()),
+            );
+            return None;
+        }
+        Some(cond)
+    }
+
+    fn inline_attr(&mut self, attrs: &[ast::Attribute]) -> Option<Inline> {
+        let mut inline = Inline::Auto;
+        for attr in self.attrs(attrs) {
+            match attr {
+                Attr::Inline => inline = Inline::Always,
+                Attr::NoInline => inline = Inline::Never,
+                _ => return None,
+            }
+        }
+        Some(inline)
     }
 
     fn let_stmt(&mut self, stmt: &ast::LetStmt) -> Option<Stmt> {
@@ -696,6 +815,62 @@ mod tests {
             lower_err("fn main() { 1 + 1; }")[0]
                 .message
                 .contains("no effect")
+        );
+    }
+
+    #[test]
+    fn a_condition_must_be_bool() {
+        // No truthiness: `if x` and `if x != 0` should not be two spellings of one
+        // thing, with the type error hidden in between.
+        assert!(
+            lower_err("fn main() { if 1 { } }")[0]
+                .message
+                .contains("must be bool")
+        );
+        assert!(lower_ok("fn main() { if true { } }").functions.len() == 1);
+    }
+
+    #[test]
+    fn break_and_continue_need_a_loop() {
+        assert!(
+            lower_err("fn main() { break; }")[0]
+                .message
+                .contains("break")
+        );
+        assert!(
+            lower_err("fn main() { continue; }")[0]
+                .message
+                .contains("continue")
+        );
+        assert!(lower_ok("fn main() { loop { break; } }").functions.len() == 1);
+    }
+
+    #[test]
+    fn break_inside_an_if_inside_a_loop_is_fine() {
+        assert!(
+            lower_ok("fn main() { loop { if true { break; } } }")
+                .functions
+                .len()
+                == 1
+        );
+    }
+
+    #[test]
+    fn return_needs_no_loop() {
+        assert!(lower_ok("fn main() { return; }").functions.len() == 1);
+    }
+
+    #[test]
+    fn inline_only_applies_where_it_could_work() {
+        assert!(
+            lower_err("fn main() { #[inline] if true { } else { } }")[0]
+                .message
+                .contains("single-statement")
+        );
+        assert!(
+            lower_err("fn main() { #[inline] while true { } }")[0]
+                .message
+                .contains("always its own function")
         );
     }
 

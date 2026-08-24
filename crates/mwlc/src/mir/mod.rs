@@ -89,7 +89,118 @@ pub enum Inst {
         max: Option<i32>,
         negated: bool,
     },
+    /// `function <path>`
+    Call { path: String },
+    /// `return <value>`
+    Return { value: i32 },
+    /// `execute <cond> run <inst>`. Still one command, so still one instruction.
+    Guarded { cond: Cond, inst: Box<Inst> },
 }
+
+/// A test that can be written straight into an `execute`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cond {
+    /// `if|unless score <lhs> <cmp> <rhs>`
+    Score {
+        lhs: Reg,
+        cmp: Cmp,
+        rhs: Reg,
+        negated: bool,
+    },
+    /// `if|unless score <src> matches <min>..<max>`
+    Matches {
+        src: Reg,
+        min: Option<i32>,
+        max: Option<i32>,
+        negated: bool,
+    },
+}
+
+impl Cond {
+    pub fn negate(self) -> Cond {
+        match self {
+            Cond::Score {
+                lhs,
+                cmp,
+                rhs,
+                negated,
+            } => Cond::Score {
+                lhs,
+                cmp,
+                rhs,
+                negated: !negated,
+            },
+            Cond::Matches {
+                src,
+                min,
+                max,
+                negated,
+            } => Cond::Matches {
+                src,
+                min,
+                max,
+                negated: !negated,
+            },
+        }
+    }
+}
+
+/// What can leave a block other than reaching its end.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Escapes {
+    breaks: bool,
+    continues: bool,
+    returns: bool,
+}
+
+impl Escapes {
+    fn any(&self) -> bool {
+        self.breaks || self.continues || self.returns
+    }
+
+    fn union(self, other: Escapes) -> Escapes {
+        Escapes {
+            breaks: self.breaks || other.breaks,
+            continues: self.continues || other.continues,
+            returns: self.returns || other.returns,
+        }
+    }
+}
+
+/// What can escape this statement list. A loop swallows the `break` and `continue` of
+/// its own body, so only a `return` gets past it.
+fn escapes(stmts: &[hir::Stmt]) -> Escapes {
+    stmts.iter().fold(Escapes::default(), |acc, stmt| {
+        acc.union(match stmt {
+            hir::Stmt::Break(_) => Escapes {
+                breaks: true,
+                ..Escapes::default()
+            },
+            hir::Stmt::Continue(_) => Escapes {
+                continues: true,
+                ..Escapes::default()
+            },
+            hir::Stmt::Return(_) => Escapes {
+                returns: true,
+                ..Escapes::default()
+            },
+            hir::Stmt::If {
+                then, otherwise, ..
+            } => escapes(then).union(otherwise.as_deref().map(escapes).unwrap_or_default()),
+            hir::Stmt::Loop { body, .. } => Escapes {
+                returns: escapes(body).returns,
+                ..Escapes::default()
+            },
+            _ => Escapes::default(),
+        })
+    })
+}
+
+/// The control register's values. See spec section 6.10.
+const CTL_NORMAL: i32 = 0;
+const CTL_BREAK: i32 = 1;
+const CTL_CONTINUE: i32 = 2;
+const CTL_RETURN: i32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
@@ -126,31 +237,32 @@ enum Value {
 
 pub fn lower(hir: &Hir) -> Mir {
     let mut temps = Temps::default();
-    Mir {
-        functions: hir
-            .functions
-            .iter()
-            .map(|f| {
-                let mut cx = Lowering {
-                    function: f,
-                    insts: Vec::new(),
-                    temps: &mut temps,
-                };
-                for stmt in &f.body {
-                    cx.stmt(stmt);
-                }
-                Function {
-                    id: f.id,
-                    path: f.path.clone(),
-                    attrs: f.attrs.clone(),
-                    blocks: vec![Block {
-                        id: BlockId(0),
-                        insts: cx.insts,
-                    }],
-                }
-            })
-            .collect(),
+    let mut functions = Vec::new();
+    for f in &hir.functions {
+        let mut cx = Lowering {
+            function: f,
+            insts: Vec::new(),
+            temps: &mut temps,
+            generated: Vec::new(),
+            prefix: f.path.clone(),
+            counter: 0,
+        };
+        for stmt in &f.body {
+            cx.stmt(stmt);
+        }
+        let (insts, generated) = (cx.insts, cx.generated);
+        functions.push(Function {
+            id: f.id,
+            path: f.path.clone(),
+            attrs: f.attrs.clone(),
+            blocks: vec![Block {
+                id: BlockId(0),
+                insts,
+            }],
+        });
+        functions.extend(generated);
     }
+    Mir { functions }
 }
 
 /// Temporary names, counted across the whole program.
@@ -176,11 +288,27 @@ struct Lowering<'a> {
     function: &'a hir::Function,
     insts: Vec<Inst>,
     temps: &'a mut Temps,
+    /// Functions split out of this one. Named under `prefix`, so the output stays
+    /// walkable (requirements section 12.2).
+    generated: Vec<Function>,
+    prefix: String,
+    counter: u32,
 }
 
 impl Lowering<'_> {
     fn stmt(&mut self, stmt: &hir::Stmt) {
         match stmt {
+            hir::Stmt::Break(_) => self.jump(CTL_BREAK),
+            hir::Stmt::Continue(_) => self.jump(CTL_CONTINUE),
+            hir::Stmt::Return(_) => self.jump(CTL_RETURN),
+            hir::Stmt::If {
+                cond,
+                then,
+                otherwise,
+                inline,
+                ..
+            } => self.if_stmt(cond, then, otherwise.as_deref(), *inline),
+            hir::Stmt::Loop { cond, body, .. } => self.loop_stmt(cond.as_ref(), body),
             hir::Stmt::Raw(raw) => self.insts.push(Inst::Raw {
                 text: raw.text.clone(),
                 span: raw.span,
@@ -253,6 +381,237 @@ impl Lowering<'_> {
             _ => {
                 let value = self.expr(expr);
                 self.copy_into(dst, value);
+            }
+        }
+    }
+
+    /// `break`, `continue` and `return` all leave the same way: record why in the
+    /// control register, then return. Only `return` survives past the enclosing loop.
+    fn jump(&mut self, code: i32) {
+        let ctl = self.ctl();
+        self.insts.push(Inst::Const {
+            dst: ctl,
+            value: code,
+        });
+        self.insts.push(Inst::Return { value: 0 });
+    }
+
+    fn if_stmt(
+        &mut self,
+        cond: &hir::Expr,
+        then: &[hir::Stmt],
+        otherwise: Option<&[hir::Stmt]>,
+        inline: hir::Inline,
+    ) {
+        let escaping = escapes(then).union(otherwise.map(escapes).unwrap_or_default());
+        let cond = self.cond(cond);
+
+        // A single command under a guard needs no function of its own.
+        let inlinable = otherwise.is_none()
+            && then.len() == 1
+            && !escaping.any()
+            && inline != hir::Inline::Never;
+        if inlinable {
+            let before = self.insts.len();
+            self.stmt(&then[0]);
+            if self.insts.len() == before + 1 {
+                let inst = self.insts.pop().expect("just pushed");
+                self.insts.push(Inst::Guarded {
+                    cond,
+                    inst: Box::new(inst),
+                });
+                return;
+            }
+            // The statement needed more than one command after all; undo and split.
+            self.insts.truncate(before);
+        }
+
+        let then_path = self.split("if", then);
+        self.insts.push(Inst::Guarded {
+            cond: cond.clone(),
+            inst: Box::new(Inst::Call { path: then_path }),
+        });
+        if let Some(otherwise) = otherwise {
+            let else_path = self.split("else", otherwise);
+            self.insts.push(Inst::Guarded {
+                cond: cond.negate(),
+                inst: Box::new(Inst::Call { path: else_path }),
+            });
+        }
+        if escaping.any() {
+            self.propagate();
+        }
+    }
+
+    fn loop_stmt(&mut self, cond: Option<&hir::Expr>, body: &[hir::Stmt]) {
+        let escaping = escapes(body);
+        let name = if cond.is_some() { "while" } else { "loop" };
+        let path = format!("{}/{name}_{}", self.prefix, self.counter);
+        self.counter += 1;
+
+        let mut inner = Lowering {
+            function: self.function,
+            insts: Vec::new(),
+            temps: self.temps,
+            generated: Vec::new(),
+            prefix: path.clone(),
+            counter: 0,
+        };
+        if let Some(cond) = cond {
+            let cond = inner.cond(cond);
+            inner.insts.push(Inst::Guarded {
+                cond: cond.negate(),
+                inst: Box::new(Inst::Return { value: 0 }),
+            });
+        }
+        if escaping.continues {
+            // `continue` returns, and a return from the loop function would end the
+            // loop. Give the body its own function so the tail call still happens.
+            let body_path = inner.split("body", body);
+            inner.insts.push(Inst::Call { path: body_path });
+            inner.consume(CTL_CONTINUE);
+            inner.propagate();
+        } else {
+            for stmt in body {
+                inner.stmt(stmt);
+            }
+        }
+        inner.insts.push(Inst::Call { path: path.clone() });
+
+        let generated = std::mem::take(&mut inner.generated);
+        let insts = std::mem::take(&mut inner.insts);
+        self.generated.push(Function {
+            id: self.function.id,
+            path: path.clone(),
+            attrs: Vec::new(),
+            blocks: vec![Block {
+                id: BlockId(0),
+                insts,
+            }],
+        });
+        self.generated.extend(generated);
+
+        self.insts.push(Inst::Call { path });
+        if escaping.breaks {
+            self.consume(CTL_BREAK);
+        }
+        if escaping.returns {
+            self.propagate();
+        }
+    }
+
+    /// Splits a statement list into its own function and returns its path.
+    fn split(&mut self, kind: &str, stmts: &[hir::Stmt]) -> String {
+        let path = format!("{}/{kind}_{}", self.prefix, self.counter);
+        self.counter += 1;
+        let mut inner = Lowering {
+            function: self.function,
+            insts: Vec::new(),
+            temps: self.temps,
+            generated: Vec::new(),
+            prefix: path.clone(),
+            counter: 0,
+        };
+        for stmt in stmts {
+            inner.stmt(stmt);
+        }
+        let generated = std::mem::take(&mut inner.generated);
+        let insts = std::mem::take(&mut inner.insts);
+        self.generated.push(Function {
+            id: self.function.id,
+            path: path.clone(),
+            attrs: Vec::new(),
+            blocks: vec![Block {
+                id: BlockId(0),
+                insts,
+            }],
+        });
+        self.generated.extend(generated);
+        path
+    }
+
+    /// `execute if score $ctl matches 1.. run return 0` — hand the transfer upwards.
+    fn propagate(&mut self) {
+        let ctl = self.ctl();
+        self.insts.push(Inst::Guarded {
+            cond: Cond::Matches {
+                src: ctl,
+                min: Some(CTL_BREAK),
+                max: None,
+                negated: false,
+            },
+            inst: Box::new(Inst::Return { value: 0 }),
+        });
+    }
+
+    /// Clears one control code, because this is the construct it was meant for.
+    fn consume(&mut self, code: i32) {
+        let ctl = self.ctl();
+        self.insts.push(Inst::Guarded {
+            cond: Cond::Matches {
+                src: ctl.clone(),
+                min: Some(code),
+                max: Some(code),
+                negated: false,
+            },
+            inst: Box::new(Inst::Const {
+                dst: ctl,
+                value: CTL_NORMAL,
+            }),
+        });
+    }
+
+    fn ctl(&self) -> Reg {
+        Reg {
+            holder: format!("${}.ctl", self.function.name),
+            kind: RegKind::Var,
+        }
+    }
+
+    /// A condition, written straight into the `execute` where possible.
+    fn cond(&mut self, expr: &hir::Expr) -> Cond {
+        match &expr.kind {
+            hir::ExprKind::Unary(UnaryOp::Not, inner) => self.cond(inner).negate(),
+            hir::ExprKind::Binary(op, lhs, rhs) if is_comparison(*op) => {
+                let lhs = self.expr(lhs);
+                let rhs = self.expr(rhs);
+                if let (Value::Reg(src), Value::Const(n)) = (&lhs, &rhs)
+                    && let Some((min, max, negated)) = range_for(*op, *n)
+                {
+                    return Cond::Matches {
+                        src: src.clone(),
+                        min,
+                        max,
+                        negated,
+                    };
+                }
+                let lhs = self.materialise(lhs);
+                let rhs = self.materialise(rhs);
+                let (cmp, negated) = match op {
+                    BinaryOp::Eq => (Cmp::Eq, false),
+                    BinaryOp::Ne => (Cmp::Eq, true),
+                    BinaryOp::Lt => (Cmp::Lt, false),
+                    BinaryOp::Le => (Cmp::Le, false),
+                    BinaryOp::Gt => (Cmp::Gt, false),
+                    BinaryOp::Ge => (Cmp::Ge, false),
+                    _ => unreachable!("not a comparison"),
+                };
+                Cond::Score {
+                    lhs,
+                    cmp,
+                    rhs,
+                    negated,
+                }
+            }
+            _ => {
+                let value = self.expr(expr);
+                let src = self.materialise(value);
+                Cond::Matches {
+                    src,
+                    min: Some(1),
+                    max: Some(1),
+                    negated: false,
+                }
             }
         }
     }

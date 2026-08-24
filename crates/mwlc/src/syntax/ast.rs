@@ -42,6 +42,35 @@ pub struct Block {
 pub enum Stmt {
     Let(LetStmt),
     Expr(Expr),
+    If(IfStmt),
+    /// `while c { .. }` and `loop { .. }`; the latter has no condition.
+    Loop(LoopStmt),
+    Break(Span),
+    Continue(Span),
+    Return(Span),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IfStmt {
+    pub attrs: Vec<Attribute>,
+    pub cond: Expr,
+    pub then: Block,
+    pub otherwise: Option<Box<Else>>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Else {
+    Block(Block),
+    If(IfStmt),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopStmt {
+    pub attrs: Vec<Attribute>,
+    pub cond: Option<Expr>,
+    pub body: Block,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

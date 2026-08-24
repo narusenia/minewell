@@ -162,3 +162,190 @@ mod expressions {
         assert_eq!(cost(&mc), 2);
     }
 }
+
+/// Control flow, checked by what the program computes rather than by what it emits.
+/// The lowering is in spec section 6.6 onwards; these say it means the right thing.
+mod control_flow {
+    use super::harness::{cost, load, local, run};
+
+    fn value(src: &str) -> i32 {
+        let mc = run(&format!("fn main() {{ {src} }}"));
+        local(&mc, "main", "x").expect("x is set")
+    }
+
+    #[test]
+    fn an_if_runs_only_when_its_condition_holds() {
+        assert_eq!(value("let mut x = 0; if true { x = 1; }"), 1);
+        assert_eq!(value("let mut x = 0; if false { x = 1; }"), 0);
+    }
+
+    #[test]
+    fn an_else_runs_when_the_condition_does_not() {
+        assert_eq!(
+            value("let mut x = 0; if false { x = 1; } else { x = 2; }"),
+            2
+        );
+        assert_eq!(
+            value("let mut x = 0; if true { x = 1; } else { x = 2; }"),
+            1
+        );
+    }
+
+    #[test]
+    fn else_if_chains() {
+        let src = "let n = 2; let mut x = 0;
+                   if n == 1 { x = 10; } else if n == 2 { x = 20; } else { x = 30; }";
+        assert_eq!(value(src), 20);
+    }
+
+    #[test]
+    fn conditions_can_be_comparisons_of_bindings() {
+        assert_eq!(
+            value("let a = 3; let b = 4; let mut x = 0; if a < b { x = 1; }"),
+            1
+        );
+    }
+
+    #[test]
+    fn a_while_loop_runs_until_its_condition_fails() {
+        assert_eq!(value("let mut x = 0; while x < 5 { x += 1; }"), 5);
+    }
+
+    #[test]
+    fn a_while_loop_whose_condition_starts_false_never_runs() {
+        assert_eq!(value("let mut x = 7; while x < 5 { x += 1; }"), 7);
+    }
+
+    #[test]
+    fn break_leaves_the_loop() {
+        assert_eq!(
+            value("let mut x = 0; loop { x += 1; if x == 3 { break; } }"),
+            3
+        );
+    }
+
+    #[test]
+    fn break_leaves_only_the_innermost_loop() {
+        let src = "let mut x = 0; let mut i = 0;
+                   while i < 3 {
+                       i += 1;
+                       let mut j = 0;
+                       loop { j += 1; if j == 2 { break; } }
+                       x += j;
+                   }";
+        assert_eq!(
+            value(src),
+            6,
+            "the inner loop ran twice on each of three passes"
+        );
+    }
+
+    #[test]
+    fn continue_skips_the_rest_of_the_iteration() {
+        let src = "let mut x = 0; let mut i = 0;
+                   while i < 5 {
+                       i += 1;
+                       if i == 3 { continue; }
+                       x += i;
+                   }";
+        assert_eq!(value(src), 12, "1 + 2 + 4 + 5");
+    }
+
+    #[test]
+    fn return_leaves_the_function_from_inside_a_loop() {
+        let src = "let mut x = 0;
+                   while x < 10 {
+                       x += 1;
+                       if x == 4 { return; }
+                   }
+                   x = 99;";
+        assert_eq!(value(src), 4, "the assignment after the loop never ran");
+    }
+
+    #[test]
+    fn return_leaves_the_function_from_inside_a_branch() {
+        let src = "let mut x = 1; if x == 1 { x = 2; return; } x = 3;";
+        assert_eq!(value(src), 2);
+    }
+
+    #[test]
+    fn loops_nest_and_both_conditions_are_respected() {
+        let src = "let mut x = 0; let mut i = 0;
+                   while i < 3 {
+                       let mut j = 0;
+                       while j < 4 { j += 1; x += 1; }
+                       i += 1;
+                   }";
+        assert_eq!(value(src), 12);
+    }
+
+    #[test]
+    fn a_single_statement_if_stays_inline() {
+        // No extra function, and the whole thing is one command.
+        let mc = load(r#"fn main() { let a = 1; if a == 1 { raw!("say hi"); } }"#);
+        let mut mc = mc;
+        mc.call("test:main");
+        // `set`, the `execute`, and the `say` it runs. An `execute ... run` is
+        // charged for both halves, in tinymcf and in the game.
+        assert_eq!(cost(&mc), 3);
+        assert_eq!(mc.effects.len(), 1);
+    }
+
+    #[test]
+    fn no_inline_forces_a_function_even_for_one_statement() {
+        let mut mc = load(r#"fn main() { let a = 1; #[no_inline] if a == 1 { raw!("say hi"); } }"#);
+        mc.call("test:main");
+        // One more than the inline version: `set`, `execute`, `function`, `say`.
+        assert_eq!(cost(&mc), 4);
+        assert_eq!(mc.effects.len(), 1);
+    }
+
+    #[test]
+    fn a_loop_with_no_escapes_costs_nothing_extra_per_iteration() {
+        // `set` and the call that starts it; then three iterations of
+        // (guard, body, tail call); then the guard that fails and the `return` it
+        // runs. Nothing else: no control register, no bookkeeping.
+        let mut mc = load("fn main() { let mut x = 0; while x < 3 { x += 1; } }");
+        mc.call("test:main");
+        assert_eq!(cost(&mc), 2 + 3 * 3 + 2);
+    }
+
+    #[test]
+    fn the_control_register_never_appears_when_nothing_escapes() {
+        // Paying for `break` bookkeeping in a loop that has no `break` would be a tax
+        // on every loop.
+        let mc = load("fn main() { let mut x = 0; while x < 3 { x += 1; } }");
+        assert_eq!(
+            mc.world
+                .scoreboard
+                .get("test.v", "$main.ctl")
+                .expect("objective exists"),
+            None
+        );
+    }
+}
+
+/// Not an assertion: a way to read the generated commands while working on lowering.
+///
+/// `cargo test -p mwlc --test vertical print_generated -- --ignored --nocapture`
+#[test]
+#[ignore = "prints rather than asserting"]
+fn print_generated_commands() {
+    for src in [
+        r#"fn main() { let a = 1; if a == 1 { raw!("say hi"); } }"#,
+        r#"fn main() { let a = 1; #[no_inline] if a == 1 { raw!("say hi"); } }"#,
+        "fn main() { let mut x = 0; while x < 3 { x += 1; } }",
+    ] {
+        println!("=== {src}");
+        let options = mwlc::emit::Options {
+            profile: mwlc::emit::Profile::Release,
+            ..Default::default()
+        };
+        let pack = mwlc::driver::compile(src, "test", &options).unwrap();
+        for (path, text) in &pack.files {
+            if path.ends_with(".mcfunction") && !path.contains("__init") {
+                println!("--- {path}\n{text}");
+            }
+        }
+    }
+}

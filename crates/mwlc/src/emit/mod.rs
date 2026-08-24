@@ -11,7 +11,7 @@ use std::io;
 use std::path::Path;
 
 use crate::hir::Attr;
-use crate::mir::{Cmp, Function, Inst, Mir, Op, Reg, RegKind};
+use crate::mir::{Cmp, Cond, Function, Inst, Mir, Op, Reg, RegKind};
 use crate::syntax::lexer::Span;
 
 /// The datapack layout Minecraft 1.21+ expects. `function` is singular; it was
@@ -244,6 +244,45 @@ fn command(inst: &Inst, ns: &str) -> String {
                 "execute store success score {d} {dobj} {keyword} score {s} {sobj} matches {}",
                 range(*min, *max)
             )
+        }
+        Inst::Call { path } => format!("function {path}"),
+        Inst::Return { value } => format!("return {value}"),
+        Inst::Guarded { cond, inst } => {
+            format!("execute {} run {}", condition(cond, ns), command(inst, ns))
+        }
+    }
+}
+
+/// `if score $a obj matches 1..`, ready to follow an `execute`.
+fn condition(cond: &Cond, ns: &str) -> String {
+    match cond {
+        Cond::Score {
+            lhs,
+            cmp,
+            rhs,
+            negated,
+        } => {
+            let keyword = if *negated { "unless" } else { "if" };
+            let (l, lobj) = (&lhs.holder, objective(ns, lhs));
+            let (r, robj) = (&rhs.holder, objective(ns, rhs));
+            let cmp = match cmp {
+                Cmp::Lt => "<",
+                Cmp::Le => "<=",
+                Cmp::Eq => "=",
+                Cmp::Ge => ">=",
+                Cmp::Gt => ">",
+            };
+            format!("{keyword} score {l} {lobj} {cmp} {r} {robj}")
+        }
+        Cond::Matches {
+            src,
+            min,
+            max,
+            negated,
+        } => {
+            let keyword = if *negated { "unless" } else { "if" };
+            let (s, sobj) = (&src.holder, objective(ns, src));
+            format!("{keyword} score {s} {sobj} matches {}", range(*min, *max))
         }
     }
 }
