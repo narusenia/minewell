@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT
+
+[package]
+name = "mwlc"
+version = "0.0.0"
+description = "The minewell compiler: .mwl to Minecraft datapack"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

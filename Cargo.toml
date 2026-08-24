@@ -2,7 +2,7 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/tinymcf"]
+members = ["crates/mwl", "crates/mwlc", "crates/tinymcf"]
 
 [workspace.package]
 edition = "2024"

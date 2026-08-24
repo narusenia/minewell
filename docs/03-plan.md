@@ -9,7 +9,7 @@
 | # | マイルストーン | 状態 | 進捗 |
 |---|---|---|---|
 | M0 | `tinymcf`（インタプリタ） | **完了**（M0-8b は M5 前まで保留） | 13 / 14 |
-| M1 | Hello World 縦断 | 未着手 | 0 / 9 |
+| M1 | Hello World 縦断 | 進行中 | 1 / 9 |
 | M2 | 値と式 | 未着手 | 0 / 7 |
 | M3 | 制御フロー | 未着手 | 0 / 7 |
 | M4 | 関数と再帰 | 未着手 | 0 / 6 |
@@ -19,7 +19,7 @@
 | M8 | 数値拡張 | 未着手 | 0 / 7 |
 | M9 | 仕上げ | 未着手 | 0 / 9 |
 | — | 横断（CI・文書） | 進行中 | 3 / 6 |
-| | **合計** | | **16 / 89** |
+| | **合計** | | **17 / 89** |
 
 状態は `未着手` / `進行中` / `完了` / `保留`。
 タスクを閉じたらチェックボックスと上表の両方を更新する。
@@ -167,9 +167,10 @@ JDK は M6（`toolchain build-from-jar`）で必要になった時点で `[tools
 
 **完了の判定:** `.mwl` → AST → HIR → MIR → `.mcfunction` → `tinymcf` 実行で `say hi` の記録が取れる。
 
-- [ ] **M1-1** workspace 構成
-  - `crates/tinymcf` / `crates/mwlc` / `crates/mwl`。`mwlc` は `tinymcf` に依存しない
-  - 先に書くテスト: `mwlc` の `Cargo.toml` に `tinymcf` が dependencies として現れないことを検査するテスト
+- [x] **M1-1** workspace 構成
+  - `crates/tinymcf` / `crates/mwlc` / `crates/mwl`
+  - `mwlc/tests/independence.rs` が `[dependencies]` に `tinymcf` が無いことを検査。
+    読み取り側が壊れて素通りしないよう、リーダ自体のテストも置いた
 - [ ] **M1-2** 字句解析（最小）
   - 識別子、キーワード、記号、文字列リテラル、コメント、span 保持
   - 先に書くテスト: span がソースの正しいバイト範囲を指すこと
