@@ -286,6 +286,15 @@ pub enum Expr {
     Range(RangeExpr),
     /// `o?`: the value, or leave the function with nothing (spec section 3.18).
     Try(TryExpr),
+    /// `Mob::of(@s)`: a view of an entity's NBT (spec section 3.19).
+    ViewOf(ViewOfExpr),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewOfExpr {
+    pub ty: Ident,
+    pub selector: Box<Expr>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,6 +405,7 @@ impl Expr {
             Expr::Fix(e) => e.span,
             Expr::Range(e) => e.span,
             Expr::Try(e) => e.span,
+            Expr::ViewOf(e) => e.span,
             Expr::Bool(e) => e.span,
             Expr::Str(e) => e.span,
             Expr::Path(e) => e.span,

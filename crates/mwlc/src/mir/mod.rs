@@ -314,6 +314,23 @@ fn escapes(stmts: &[hir::Stmt]) -> Escapes {
     })
 }
 
+/// The scale a place is read and written with.
+///
+/// A `fix<S>` under a float or double tag holds the **real number**, so the round trip
+/// multiplies and divides by `S`. Under an integer tag it holds the raw units, which
+/// is how the compiler stores its own values (spec section 4.16).
+fn scale_of(place: &hir::Place) -> u32 {
+    scale_from(place.ty, place.tag)
+}
+
+/// As `scale_of`, for a value whose place has already been taken apart.
+fn scale_from(ty: Type, tag: Option<NbtTag>) -> u32 {
+    match (ty, tag) {
+        (Type::Fix(hir::Scale::Const(scale)), Some(NbtTag::Float | NbtTag::Double)) => scale,
+        _ => 1,
+    }
+}
+
 /// The storage path an option is read from, for the ones that are somewhere rather
 /// than in a register.
 fn option_path(function: &hir::Function, expr: &hir::Expr) -> Option<DataRef> {
@@ -1188,7 +1205,7 @@ impl<'p> Lowering<'_, 'p> {
     ///
     /// A list read this way gives its element count, which is what `len` is.
     fn read_place_into(&mut self, dst: Reg, place: &hir::Place) {
-        self.read_place_scaled(dst, place, 1);
+        self.read_place_scaled(dst, place, scale_of(place));
     }
 
     /// The same read, in `scale`ths of a unit (spec section 6.26).
@@ -1331,16 +1348,31 @@ impl<'p> Lowering<'_, 'p> {
                 Value::Reg(acc)
             }
         };
+        // A `fix<S>` under a float or double tag is the real number, so the raw units
+        // are divided by `S` on the way in (spec section 4.16).
+        let scale = scale_from(ty, tag);
+        let suffix = tag.unwrap_or(NbtTag::Int).suffix();
         match src {
             // A constant needs no register to pass through: `set value` takes it.
             Value::Const(n) => self.insts.push(Inst::SetValue {
                 path: path.to_owned(),
-                value: format!("{n}{}", tag.unwrap_or(NbtTag::Int).suffix()),
+                value: match scale {
+                    1 => format!("{n}{suffix}"),
+                    scale => format!("{}{suffix}", f64::from(n) / f64::from(scale)),
+                },
             }),
-            Value::Reg(src) => self.insts.push(Inst::StoreData {
-                path: path.to_owned(),
-                tag: tag_of(tag),
-                inst: Box::new(Inst::Get { src }),
+            Value::Reg(src) => self.insts.push(match scale {
+                1 => Inst::StoreData {
+                    path: path.to_owned(),
+                    tag: tag_of(tag),
+                    inst: Box::new(Inst::Get { src }),
+                },
+                scale => Inst::StoreScaled {
+                    path: path.to_owned(),
+                    tag: tag_of(tag),
+                    scale,
+                    inst: Box::new(Inst::Get { src }),
+                },
             }),
         }
     }
@@ -2034,9 +2066,15 @@ impl<'p> Lowering<'_, 'p> {
                         src: field,
                     });
                 } else {
+                    // The tag decides the scale, the same as any other read
+                    // (spec section 4.16).
+                    let read = match scale_from(binding.ty, binding.tag) {
+                        1 => Inst::GetData { path: field },
+                        scale => Inst::GetScaled { path: field, scale },
+                    };
                     inner.insts.push(Inst::StoreResult {
                         dst,
-                        inst: Box::new(Inst::GetData { path: field }),
+                        inst: Box::new(read),
                     });
                 }
             }

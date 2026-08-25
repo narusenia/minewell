@@ -1071,6 +1071,26 @@ impl Parser {
                             return self.fix_cast(name);
                         }
                         let variant = self.ident()?;
+                        // `Mob::of(@s)`: the one associated function there is
+                        // (spec section 3.19).
+                        if self.peek() == Some(&TokenKind::Punct(Punct::LParen)) {
+                            if variant.name != "of" {
+                                self.error("the only associated function is 'of'");
+                                return None;
+                            }
+                            self.expect(Punct::LParen, "(")?;
+                            let selector = self.expr()?;
+                            self.expect(Punct::RParen, ")")?;
+                            let start = name.span.start;
+                            return Some(Expr::ViewOf(ViewOfExpr {
+                                ty: name,
+                                selector: Box::new(selector),
+                                span: Span {
+                                    start,
+                                    end: self.previous_end(),
+                                },
+                            }));
+                        }
                         if self.peek() == Some(&TokenKind::Punct(Punct::LBrace))
                             && !self.no_struct_lit
                         {

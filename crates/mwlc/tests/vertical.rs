@@ -357,6 +357,12 @@ fn print_generated_commands() {
          fn main() { let mut s = State::Chasing { target: 3 }; let mut x = 0;
                      match s { State::Idle => { x = 1; }
                                State::Chasing { target } => { x = target; } } }",
+        "#[entity] struct Mob { #[nbt(float, rename = \"Health\")] hp: Option<fix<1000>>,
+                                #[nbt(short, rename = \"Fire\")] fire: Option<i32> }
+         #[ctx(entity)]
+         fn hurt() { let mut m = Mob::of(@s);
+                     if let Some(hp) = m.hp { m.fire = Some(100); }
+                     m.hp = None; }",
         "struct Mob { hp: Option<i32> }
          fn twice(m: Mob) -> Option<i32> { let hp = m.hp?; return Some(hp * 2); }
          fn main() { let m = Mob { hp: Some(5) };
@@ -2068,5 +2074,80 @@ mod options {
                          let b: Option<Point> = None; }");
         assert_eq!(at_path(&mc, "mw.vars.main.a.x"), Some(NbtValue::Int(2)));
         assert_eq!(at_path(&mc, "mw.vars.main.b"), None);
+    }
+}
+
+/// Entity NBT through a view: fields that are places on an entity (spec section 6.29).
+mod views {
+    use super::harness::{NS, load, local};
+
+    /// Compiles, spawns one zombie with `nbt`, binds the selector and runs `main`.
+    fn with_zombie(src: &str, nbt: &str) -> tinymcf::Interpreter {
+        let mut mc = load(src);
+        mc.world.spawn("zombie-1", [0.0, 64.0, 0.0]).nbt = tinymcf::snbt::parse(nbt).expect("snbt");
+        mc.world
+            .bind_selector("@e[type=zombie,limit=1]", ["zombie-1"]);
+        mc.call(&format!("{NS}:main"));
+        assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
+        mc
+    }
+
+    #[test]
+    fn a_field_reads_with_the_scale_it_was_declared_with() {
+        let mc = with_zombie(
+            "#[entity] struct Mob { #[nbt(float, rename = \"Health\")] hp: Option<fix<1000>> } \
+             fn main() { let m = Mob::of(@e[type=zombie,limit=1]); \
+                         let mut x = fix::<1000>(0); \
+                         match m.hp { Some(hp) => { x = hp; } None => { x = fix::<1000>(-1); } } }",
+            "{Health:18.5f}",
+        );
+        assert_eq!(local(&mc, "main", "x"), Some(18500));
+    }
+
+    #[test]
+    fn a_missing_field_reads_as_none() {
+        let mc = with_zombie(
+            "#[entity] struct Mob { #[nbt(rename = \"Fire\")] fire: Option<i16> } \
+             fn main() { let m = Mob::of(@e[type=zombie,limit=1]); let mut x = 0; \
+                         if let Some(f) = m.fire { x = 1; } else { x = -1; } }",
+            "{Health:18.5f}",
+        );
+        assert_eq!(local(&mc, "main", "x"), Some(-1));
+    }
+
+    #[test]
+    fn a_field_writes_back_into_the_entity() {
+        let mc = with_zombie(
+            "#[entity] struct Mob { #[nbt(short, rename = \"Fire\")] fire: Option<i32>, \
+                                    #[nbt(float, rename = \"Health\")] hp: Option<fix<1000>> } \
+             fn main() { let mut m = Mob::of(@e[type=zombie,limit=1]); \
+                         m.fire = Some(100); m.hp = None; }",
+            "{Health:18.5f}",
+        );
+        assert_eq!(
+            mc.world.entity("zombie-1").expect("spawned").nbt,
+            tinymcf::snbt::parse("{Fire:100s}").expect("snbt")
+        );
+    }
+
+    #[test]
+    fn a_view_costs_nothing_to_make() {
+        let mc = with_zombie(
+            "#[entity] struct Mob { #[nbt(rename = \"Fire\")] fire: Option<i16> } \
+             fn main() { let m = Mob::of(@e[type=zombie,limit=1]); }",
+            "{}",
+        );
+        assert_eq!(mc.commands_run, 0);
+    }
+
+    #[test]
+    fn a_constant_index_reaches_into_a_list() {
+        let mc = with_zombie(
+            "#[entity] struct Mob { #[nbt(rename = \"Pos\")] pos: Vec<f64> } \
+             fn main() { let m = Mob::of(@e[type=zombie,limit=1]); \
+                         let x = fix::<1000>(m.pos[0]); }",
+            "{Pos:[1.5d,64.0d,0.0d]}",
+        );
+        assert_eq!(local(&mc, "main", "x"), Some(1500));
     }
 }

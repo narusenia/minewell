@@ -829,6 +829,16 @@ pub enum Scrutinee {
     Option(Expr),
 }
 
+impl Scrutinee {
+    /// How the matched value is stored, where that is known.
+    pub fn tag(&self) -> Option<NbtTag> {
+        match self {
+            Scrutinee::Place(place) => place.tag,
+            Scrutinee::Option(_) => None,
+        }
+    }
+}
+
 /// What decides whether an arm runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArmTest {
@@ -849,6 +859,8 @@ pub struct Binding {
     /// is the scrutinee's path itself (spec section 6.28).
     pub nbt: String,
     pub ty: Type,
+    /// How it is stored, which decides the scale a `fix<S>` is read with.
+    pub tag: Option<NbtTag>,
 }
 
 /// A `raw!` command. Interpolation arrives in M9; today the text is literal.
@@ -1171,6 +1183,18 @@ pub fn lower(
             }
         }
         for param in &f.params {
+            if let Some(ty) = resolve_written(&param.ty, &types, &generics, &mut errors)
+                && ty.is_compile_time()
+            {
+                let name = types.name_of(ty);
+                errors.push(SyntaxError::new(
+                    param.ty.span,
+                    format!(
+                        "a {name} exists only while compiling, so it cannot be passed; \
+                         write it where it is used"
+                    ),
+                ));
+            }
             let Some(ty) = resolve_written(&param.ty, &types, &generics, &mut errors) else {
                 params.push(ParamSig {
                     ty: Type::I32,
@@ -1660,6 +1684,15 @@ fn collect_fields(
         let Some(ty) = resolve_written(&field.ty, types, generics, errors) else {
             continue;
         };
+        // A compound holds values, and a compile-time type is not one.
+        if ty.is_compile_time() {
+            let name = types.name_of(ty);
+            errors.push(SyntaxError::new(
+                field.ty.span,
+                format!("a {name} exists only while compiling, so a compound cannot hold one"),
+            ));
+            continue;
+        }
         if fields.iter().any(|f| f.name == field.name.name) {
             let name = &field.name.name;
             errors.push(SyntaxError::new(
@@ -1779,6 +1812,21 @@ fn nbt_attrs(
         }
     }
     (tag, rename)
+}
+
+/// Whether a selector can only ever find one entity (spec section 3.19).
+///
+/// `@s`, `@p` and `@r` are single by definition; `@a` and `@e` need `limit=1` to be.
+fn finds_one(text: &str) -> bool {
+    let (head, body) = match text.split_once('[') {
+        Some((head, body)) => (head.trim(), body),
+        None => (text.trim(), ""),
+    };
+    if matches!(head, "@s" | "@p" | "@r" | "@n") {
+        return true;
+    }
+    body.split(',')
+        .any(|part| part.trim_end_matches(']').replace(' ', "") == "limit=1")
 }
 
 /// Whether a composite type can reach itself through its fields.
@@ -2372,7 +2420,7 @@ impl FnLowering<'_> {
                             );
                             return None;
                         };
-                        bindings.push((bind.name.clone(), field.nbt.clone(), field.ty));
+                        bindings.push((bind.name.clone(), field.nbt.clone(), field.ty, field.tag));
                     }
                     self.arm(
                         ArmTest::Variant(index),
@@ -2442,7 +2490,8 @@ impl FnLowering<'_> {
             let (test, bindings, path) = match &arm.pattern {
                 ast::Pattern::Some { bind, .. } => (
                     ArmTest::Present,
-                    vec![(bind.name.clone(), String::new(), inner)],
+                    // The option's own tag: what it holds is stored as it says.
+                    vec![(bind.name.clone(), String::new(), inner, scrutinee.tag())],
                     "some",
                 ),
                 ast::Pattern::None(_) => (ArmTest::Absent, Vec::new(), "none"),
@@ -2495,17 +2544,18 @@ impl FnLowering<'_> {
     fn arm(
         &mut self,
         test: ArmTest,
-        bindings: Vec<(String, String, Type)>,
+        bindings: Vec<(String, String, Type, Option<NbtTag>)>,
         path: String,
         body: &ast::Block,
     ) -> Arm {
         self.scopes.push(HashMap::new());
         let bindings = bindings
             .into_iter()
-            .map(|(name, nbt, ty)| Binding {
+            .map(|(name, nbt, ty, tag)| Binding {
                 local: self.declare(&name, ty, false),
                 nbt,
                 ty,
+                tag,
             })
             .collect();
         let body = body
@@ -2643,6 +2693,50 @@ impl FnLowering<'_> {
     }
 
     /// A selector expression: a literal, or a name bound to one.
+    /// `Mob::of(@s)`: a name for one entity's NBT (spec section 6.29).
+    fn view_of(&mut self, view: &ast::ViewOfExpr, span: Span) -> Option<Expr> {
+        let Some(Type::View(id)) = self.types.get(&view.ty.name) else {
+            let name = &view.ty.name;
+            self.error(
+                view.ty.span,
+                format!("'{name}' is not a view; declare it with #[entity]"),
+            );
+            return None;
+        };
+        let selector = self.selector(&view.selector)?;
+        // Vanilla's `data` commands take one entity and fail silently on several.
+        // Which entities a selector finds is not knowable here, but how many it may
+        // find is (spec section 3.19).
+        if !finds_one(&selector.text) {
+            let text = &selector.text;
+            self.error(
+                selector.span,
+                format!(
+                    "'{text}' can find more than one entity, and data takes exactly                      one; add 'limit=1' or use '@s', '@p' or '@r'"
+                ),
+            );
+            return None;
+        }
+        if selector.text == "@s" {
+            self.require(Ctx::Entity, selector.span, "a view of '@s'");
+        }
+        Some(Expr {
+            kind: ExprKind::View(Place {
+                root: Root::Entity {
+                    selector: selector.text,
+                },
+                steps: Vec::new(),
+                ty: Type::View(id),
+                tag: None,
+                // Settled by the binding it goes into.
+                mutable: false,
+                via: view.ty.name.clone(),
+            }),
+            ty: Type::View(id),
+            span,
+        })
+    }
+
     fn selector(&mut self, expr: &AstExpr) -> Option<Selector> {
         let value = self.expr(expr)?;
         match value.kind {
@@ -2765,9 +2859,29 @@ impl FnLowering<'_> {
             }
         };
         let local = self.declare(&stmt.name.name, ty, stmt.mutable);
-        // A selector binding is a compile-time alias, not a value in a register.
-        if let ExprKind::Selector(text) = &value.kind {
-            self.selector_aliases.insert(local, text.clone());
+        // A compile-time value has nothing to put anywhere: the binding is a name for
+        // it, and the `let` itself is not a statement at all.
+        match &value.kind {
+            ExprKind::Selector(text) => {
+                self.selector_aliases.insert(local, text.clone());
+                return None;
+            }
+            ExprKind::View(place) => {
+                let mut place = place.clone();
+                place.mutable = stmt.mutable;
+                place.via = stmt.name.name.clone();
+                self.place_aliases.insert(local, place);
+                return None;
+            }
+            _ if value.ty.is_compile_time() => {
+                let found = self.ty(value.ty);
+                self.error(
+                    stmt.value.span(),
+                    format!("a {found} cannot be bound to a name; write it where it is used"),
+                );
+                return None;
+            }
+            _ => {}
         }
         Some(Stmt::Let {
             local,
@@ -2896,11 +3010,13 @@ impl FnLowering<'_> {
                     );
                     return None;
                 }
-                let Type::Struct(id) = base.ty else {
+                // A view's fields are places on an entity, and are declared the same
+                // way a struct's are (spec section 4.20).
+                let (Type::Struct(id) | Type::View(id)) = base.ty else {
                     let found = self.ty(base.ty);
                     self.error(
                         access.base.span(),
-                        format!("{found} has no fields; only a struct does"),
+                        format!("{found} has no fields; only a struct or a view does"),
                     );
                     return None;
                 };
@@ -3395,6 +3511,7 @@ impl FnLowering<'_> {
                     span,
                 })
             }
+            AstExpr::ViewOf(view) => self.view_of(view, span),
             AstExpr::Range(range) => {
                 self.error(
                     range.span,
@@ -6033,6 +6150,70 @@ mod tests {
             // `None` is not a keyword: a binding of that name wins, as any other does.
             let hir = lower_ok("fn main() { let None = 1; let x = None; }");
             assert_eq!(hir.functions[0].locals[1].ty, Type::I32);
+        }
+    }
+
+    /// Views of entity NBT (spec section 4.20).
+    mod views {
+        use super::*;
+
+        #[test]
+        fn a_selector_that_may_find_several_is_reported() {
+            let errors = lower_err(
+                "#[entity] struct Mob { hp: Option<i32> } \
+                 fn main() { let m = Mob::of(@e[type=zombie]); }",
+            );
+            assert!(
+                errors[0].message.contains("more than one entity"),
+                "{errors:?}"
+            );
+            // The same source with a limit is fine, so the check above is what failed.
+            lower_ok(
+                "#[entity] struct Mob { hp: Option<i32> } \
+                 fn main() { let m = Mob::of(@e[type=zombie, limit=1]); }",
+            );
+            lower_ok("#[entity] struct Mob { hp: Option<i32> } fn main() { let m = Mob::of(@p); }");
+        }
+
+        #[test]
+        fn a_view_of_the_executor_needs_a_context() {
+            let errors = lower_err(
+                "#[entity] struct Mob { hp: Option<i32> } fn main() { let m = Mob::of(@s); }",
+            );
+            assert!(errors[0].message.contains("entity context"), "{errors:?}");
+            lower_ok(
+                "#[entity] struct Mob { hp: Option<i32> } \
+                 #[ctx(entity)] fn f() { let m = Mob::of(@s); }",
+            );
+        }
+
+        #[test]
+        fn only_a_view_has_of() {
+            let errors =
+                lower_err("struct Mob { hp: Option<i32> } fn main() { let m = Mob::of(@p); }");
+            assert!(errors[0].message.contains("#[entity]"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_view_is_not_a_value() {
+            // It has no runtime representation, so nothing can hold one.
+            let errors = lower_err(
+                "#[entity] struct Mob { hp: Option<i32> } \
+                 struct Holder { m: Mob }",
+            );
+            assert!(!errors.is_empty(), "{errors:?}");
+            let errors = lower_err("#[entity] struct Mob { hp: Option<i32> } fn take(m: Mob) {}");
+            assert!(!errors.is_empty(), "{errors:?}");
+        }
+
+        #[test]
+        fn a_view_field_is_read_and_written_like_any_other() {
+            let hir = lower_ok(
+                "#[entity] struct Mob { #[nbt(float, rename = \"Health\")] hp: Option<fix<1000>> } \
+                 #[ctx(entity)] fn f() { let mut m = Mob::of(@s); m.hp = Some(fix::<1000>(1500)); }",
+            );
+            // The view binding is a name, not a statement: only the write is left.
+            assert_eq!(hir.functions[0].body.len(), 1);
         }
     }
 }

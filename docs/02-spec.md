@@ -494,9 +494,9 @@ primary     += IDENT "::" "of" "(" expr ")"
 /// エンティティの NBT への窓。値ではなく、パスの束。
 #[entity]
 struct Mob {
-    #[nbt(rename = "Health")] hp: Option<fix<1000>>,
-    #[nbt(rename = "Fire")]   fire: Option<i16>,
-    #[nbt(rename = "Pos")]    pos: Vec<f64>,
+    #[nbt(float, rename = "Health")] hp: Option<fix<1000>>,   // 実数を千分の一で読む
+    #[nbt(short, rename = "Fire")]   fire: Option<i32>,       // Short で書く整数
+    #[nbt(rename = "Pos")]           pos: Vec<f64>,
 }
 
 #[ctx(entity)]
@@ -509,7 +509,9 @@ fn hurt() {
 
 - **`#[entity]` を付けた `struct` は型であって値ではない。** 実行時表現を持たず、
   セレクタと同じ「コンパイル時のみ」の分類に入る（[§5](#5-型の表現--m8-の範囲まで確定)）。
-  束縛にはできるが、渡す・返す・フィールドに持つ・`Vec` に入れることはできない
+  束縛にはできるが、渡す・返す・フィールドに持つ・`Vec` に入れることはできない。
+  **コンパイル時の型はどれもそうで**、`Selector` / `Pos` / `ResourceLocation` も
+  引数とフィールドには書けない
 - **`T::of(セレクタ)` がビューを作る唯一の書き方。** コマンドは 1 つも出ない
 - **セレクタは単一対象でなければならない**（`@s` / `@p` / `@r`、または `limit=1` を持つもの）。
   バニラの `data get entity` は複数一致を黙って失敗させる。これは静的に分かる
@@ -814,6 +816,22 @@ Minecraft が黙って無視するので、型で区別する（要件定義 §4
 - 端数はすべて切り捨て。`data get` は掛けてから floor し、`execute store` は
   掛けてからタグの型へ落とす。バニラの挙動そのままで、補正は入れない
   （[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §4）
+
+**タグが float / double の `fix<S>` は実数を持つ。**
+
+```rust
+struct Ours { pos: fix<1000> }                                 // Int タグ = 生の単位（1500）
+#[entity] struct Mob {
+    #[nbt(float, rename = "Health")] hp: Option<fix<1000>>,    // Float タグ = 実数（18.5f）
+}
+```
+
+- **タグが整数なら生の単位、float / double なら実数。** 読みには `data get <パス> S`、
+  書きには `execute store ... <タグ> 1/S` が自動で入る。どちらも 1 コマンドのまま
+- コンパイラが自分の storage に置く `fix<S>` は既定で Int タグ、つまり生の単位。
+  バニラが書いた実数を読むときだけタグを float / double と宣言する
+- **だから `.as_f64()` を挟まなくてよい。** 宣言が「どう入っているか」を言っているので、
+  変換はその宣言から出る
 - **エンティティ・ブロックの NBT はまだ読めない。** 失敗しうる読み取りであり、
   `Option<T>` を返す stdlib（要件定義 §9）と一緒に入るのが正しい
 
@@ -1743,8 +1761,8 @@ storage のときと**同じ命令で、対象だけが違う**。
 ```rust
 #[entity]
 struct Mob {
-    #[nbt(rename = "Health")] hp: Option<fix<1000>>,
-    #[nbt(rename = "Fire")]   fire: Option<i16>,
+    #[nbt(float, rename = "Health")] hp: Option<fix<1000>>,
+    #[nbt(short, rename = "Fire")]   fire: Option<i32>,
 }
 
 #[ctx(entity)]
