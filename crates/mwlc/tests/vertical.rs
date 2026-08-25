@@ -357,6 +357,9 @@ fn print_generated_commands() {
          fn main() { let mut s = State::Chasing { target: 3 }; let mut x = 0;
                      match s { State::Idle => { x = 1; }
                                State::Chasing { target } => { x = target; } } }",
+        "fn main() { let a = fix::<1000>(1500); let b = fix::<1000>(2000);
+                     let x = a * b; let y = a / b; let z = fix::<100>(a);
+                     let w = fix::<100>(fix::<1000>(1500)); }",
         "struct Acc { total: i32 }
          fn walk(n: i32) -> i32 { let acc = Acc { total: n }; if n <= 0 { return 0; }
                                   let rest = walk(n - 1); return acc.total + rest; }
@@ -1569,5 +1572,101 @@ mod references {
                          bump(&mut a); bump(&mut b); }");
         assert_eq!(at_path(&mc, "mw.vars.main.a.x"), Some(NbtValue::Int(1)));
         assert_eq!(at_path(&mc, "mw.vars.main.b.x"), Some(NbtValue::Int(11)));
+    }
+}
+
+/// Fixed point: an integer with a scale, and the corrections `*` and `/` need to keep
+/// the units right (spec section 6.25).
+mod fixed_point {
+    use super::harness::{cost, local, run};
+
+    fn value(src: &str) -> i32 {
+        let mc = run(&format!("fn main() {{ {src} }}"));
+        local(&mc, "main", "x").expect("x is set")
+    }
+
+    #[test]
+    fn multiplying_two_fixes_corrects_the_scale() {
+        // 1.5 * 2.0 = 3.0, in thousandths throughout.
+        assert_eq!(
+            value("let a = fix::<1000>(1500); let b = fix::<1000>(2000); let x = a * b;"),
+            3000
+        );
+        // 0.5 * 0.5 = 0.25: without the correction this would come out 250000.
+        assert_eq!(
+            value("let a = fix::<1000>(500); let b = fix::<1000>(500); let x = a * b;"),
+            250
+        );
+    }
+
+    #[test]
+    fn dividing_two_fixes_corrects_the_scale() {
+        // 1.5 / 2.0 = 0.75.
+        assert_eq!(
+            value("let a = fix::<1000>(1500); let b = fix::<1000>(2000); let x = a / b;"),
+            750
+        );
+    }
+
+    #[test]
+    fn adding_needs_no_correction() {
+        assert_eq!(
+            value("let a = fix::<1000>(1500); let b = fix::<1000>(2000); let x = a + b;"),
+            3500
+        );
+        assert_eq!(
+            value("let a = fix::<1000>(1500); let b = fix::<1000>(2000); let x = b - a;"),
+            500
+        );
+    }
+
+    #[test]
+    fn an_integer_multiplier_carries_no_scale() {
+        assert_eq!(value("let a = fix::<1000>(1500); let x = a * 2;"), 3000);
+        assert_eq!(value("let a = fix::<1000>(1500); let x = a / 2;"), 750);
+        assert_eq!(value("let a = fix::<1000>(1500); let x = 2 * a;"), 3000);
+    }
+
+    #[test]
+    fn a_cast_between_scales_restates_the_value() {
+        // 1.5 in thousandths is 150 in hundredths.
+        assert_eq!(
+            value("let a = fix::<1000>(1500); let x = fix::<100>(a);"),
+            150
+        );
+        assert_eq!(
+            value("let a = fix::<100>(150); let x = fix::<1000>(a);"),
+            1500
+        );
+    }
+
+    #[test]
+    fn compound_assignment_carries_the_correction() {
+        assert_eq!(
+            value("let mut x = fix::<1000>(1500); let b = fix::<1000>(2000); x *= b;"),
+            3000
+        );
+        assert_eq!(
+            value("let mut x = fix::<1000>(1500); x += fix::<1000>(500);"),
+            2000
+        );
+    }
+
+    #[test]
+    fn a_constant_fix_costs_exactly_one_command() {
+        // The integer is already the value in raw units, so the cast is free
+        // (design principle 1).
+        let mc = run("fn main() { let x = fix::<1000>(1500); }");
+        assert_eq!(cost(&mc), 1);
+    }
+
+    #[test]
+    fn a_generic_function_runs_at_the_scale_it_was_called_with() {
+        let mc = run(
+            "fn double<const S: i32>(x: fix<S>) -> fix<S> { return x * 2; } \
+             fn main() { let a = double(fix::<1000>(1500)); let b = double(fix::<100>(150)); }",
+        );
+        assert_eq!(local(&mc, "main", "a"), Some(3000));
+        assert_eq!(local(&mc, "main", "b"), Some(300));
     }
 }
