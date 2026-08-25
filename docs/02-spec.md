@@ -182,7 +182,7 @@ debug ビルドで生成 mcfunction に埋める `# src/foo.mwl:42` の両方が
 
 ---
 
-## 3. 構文 — M6 と `struct` の範囲まで確定
+## 3. 構文 — M8 の範囲まで確定
 
 M1 は `fn main() { raw!("say hi"); }` を全レイヤ貫通させることだけを目的とする
 （[`03-plan.md`](./03-plan.md) M1）。ここで確定させるのはその範囲に限る。
@@ -471,7 +471,7 @@ range       := or [".." [or]]
 
 ---
 
-## 4. 意味論 — M6 と `struct` の範囲まで確定
+## 4. 意味論 — M8 の範囲まで確定
 
 ### 4.1 名前解決
 
@@ -810,7 +810,7 @@ let m: Mob = nbt!({ Health: 20, name: "bob" });
 - `enum` は書けない。バリアントを選ぶには名前が要り、それは `State::Idle` の仕事
 - コストは 1 コマンド。中身はすべてコンパイル時に決まっている（設計原則 1）
 
-## 5. 型の表現 — M6 と `struct` の範囲まで確定
+## 5. 型の表現 — M8 の範囲まで確定
 
 | 型 | 置き場所 | 表現 |
 |---|---|---|
@@ -830,9 +830,9 @@ let m: Mob = nbt!({ Health: 20, name: "bob" });
 `bool` を scoreboard の 0/1 で持つのは、`execute store success` が 0/1 を書き、
 `execute if score ... matches 1` が読めるため。バニラの真偽値の扱いがそもそもこれ。
 
-`enum` / `Vec<T>` / `String` は M7 の後続タスク、`fix<S>` と NBT 相互運用の数値型は M8。
+残るのは `Option<T>` / `TextComponent` で、どちらも M9。
 
-## 6. lowering — M6 と `struct` の範囲まで確定
+## 6. lowering — M8 の範囲まで確定
 
 各構文から mcfunction への写像。生成コマンド数は `tinymcf` の計測 API で検証する
 （[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §5）。
