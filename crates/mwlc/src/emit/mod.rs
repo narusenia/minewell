@@ -11,7 +11,9 @@ use std::io;
 use std::path::Path;
 
 use crate::hir::{Attr, Ctx};
-use crate::mir::{Cmp, Cond, ExecuteAs, Function, Inst, Mir, Op, Reg, RegKind};
+use crate::mir::{
+    Cmp, Cond, DataRef, DataTarget, ExecuteAs, Function, Inst, Mir, Op, Reg, RegKind,
+};
 use crate::syntax::lexer::Span;
 
 /// The datapack layout Minecraft 1.21+ expects. `function` is singular; it was
@@ -286,29 +288,38 @@ fn command(inst: &Inst, ns: &str) -> String {
             )
         }
         Inst::SetValue { path, value } => {
-            format!("data modify storage {ns}:mw {path} set value {value}")
+            format!("data modify {} set value {value}", target(path, ns))
         }
-        Inst::GetData { path } => format!("data get storage {ns}:mw {path}"),
+        Inst::GetData { path } => format!("data get {}", target(path, ns)),
         Inst::GetScaled { path, scale } => {
-            format!("data get storage {ns}:mw {path} {scale}")
+            format!("data get {} {scale}", target(path, ns))
         }
-        Inst::RemoveData { path } => format!("data remove storage {ns}:mw {path}"),
+        Inst::RemoveData { path } => format!("data remove {}", target(path, ns)),
         Inst::AppendValue { path, value } => {
-            format!("data modify storage {ns}:mw {path} append value {value}")
+            format!("data modify {} append value {value}", target(path, ns))
         }
         Inst::AppendFrom { dst, src } => {
-            format!("data modify storage {ns}:mw {dst} append from storage {ns}:mw {src}")
+            format!(
+                "data modify {} append from {}",
+                target(dst, ns),
+                target(src, ns)
+            )
         }
         Inst::CallWithArgs { path } => format!("function {path} with storage {ns}:mw mw.args"),
         // The `$` is what makes the line a macro line; vanilla substitutes the
         // arguments before parsing what follows.
         Inst::Macro { inst } => format!("${}", command(inst, ns)),
         Inst::CopyData { dst, src } => {
-            format!("data modify storage {ns}:mw {dst} set from storage {ns}:mw {src}")
+            format!(
+                "data modify {} set from {}",
+                target(dst, ns),
+                target(src, ns)
+            )
         }
         Inst::StoreData { path, tag, inst } => {
             format!(
-                "execute store result storage {ns}:mw {path} {tag} 1 run {}",
+                "execute store result {} {tag} 1 run {}",
+                target(path, ns),
                 command(inst, ns)
             )
         }
@@ -322,7 +333,8 @@ fn command(inst: &Inst, ns: &str) -> String {
         } => {
             let factor = 1.0 / f64::from(*scale);
             format!(
-                "execute store result storage {ns}:mw {path} {tag} {factor} run {}",
+                "execute store result {} {tag} {factor} run {}",
+                target(path, ns),
                 command(inst, ns)
             )
         }
@@ -354,7 +366,11 @@ fn command(inst: &Inst, ns: &str) -> String {
                 (start, None) => format!(" {}", start.unwrap_or(0)),
                 (start, Some(end)) => format!(" {} {end}", start.unwrap_or(0)),
             };
-            format!("data modify storage {ns}:mw {dst} set string storage {ns}:mw {src}{bounds}")
+            format!(
+                "data modify {} set string {}{bounds}",
+                target(dst, ns),
+                target(src, ns)
+            )
         }
         Inst::Guarded { cond, inst } => {
             format!("execute {} run {}", condition(cond, ns), command(inst, ns))
@@ -362,7 +378,7 @@ fn command(inst: &Inst, ns: &str) -> String {
         Inst::Otherwise { path, tags, inst } => {
             let clauses = tags
                 .iter()
-                .map(|tag| format!("unless data storage {ns}:mw {path}{{tag:\"{tag}\"}}"))
+                .map(|tag| format!("unless data {}{{tag:\"{tag}\"}}", target(path, ns)))
                 .collect::<Vec<_>>()
                 .join(" ");
             format!("execute {clauses} run {}", command(inst, ns))
@@ -374,6 +390,16 @@ fn command(inst: &Inst, ns: &str) -> String {
             };
             format!("execute {clause} run {}", command(inst, ns))
         }
+    }
+}
+
+/// `storage myns:mw mw.vars.main.x` or `entity @s Health`: where a data command
+/// points, spelled as the command wants it (spec section 6.29).
+fn target(reference: &DataRef, ns: &str) -> String {
+    let path = &reference.path;
+    match &reference.target {
+        DataTarget::Storage => format!("storage {ns}:mw {path}"),
+        DataTarget::Entity(selector) => format!("entity {selector} {path}"),
     }
 }
 
@@ -414,7 +440,7 @@ fn condition(cond: &Cond, ns: &str) -> String {
             negated,
         } => {
             let keyword = if *negated { "unless" } else { "if" };
-            format!("{keyword} data storage {ns}:mw {path}{filter}")
+            format!("{keyword} data {}{filter}", target(path, ns))
         }
     }
 }

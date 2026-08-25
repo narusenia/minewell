@@ -112,20 +112,20 @@ pub enum Inst {
     /// `return <value>`
     Return { value: i32 },
     /// `data modify storage <ns>:mw <path> set value <snbt>`
-    SetValue { path: String, value: String },
+    SetValue { path: DataRef, value: String },
     /// `data modify storage <ns>:mw <dst> set from storage <ns>:mw <src>`
-    CopyData { dst: String, src: String },
-    /// `data get storage <ns>:mw <path>`, whose result is the value there.
-    GetData { path: String },
-    /// `data get storage <ns>:mw <path> <scale>`: the same read, in `scale`ths of a
-    /// unit, which is how a `fix<S>` comes out of storage (spec section 6.26).
-    GetScaled { path: String, scale: u32 },
+    CopyData { dst: DataRef, src: DataRef },
+    /// `data get <target> <path>`, whose result is the value there.
+    GetData { path: DataRef },
+    /// `data get <target> <path> <scale>`: the same read, in `scale`ths of a unit,
+    /// which is how a `fix<S>` comes out of storage (spec section 6.26).
+    GetScaled { path: DataRef, scale: u32 },
     /// `data remove storage <ns>:mw <path>`
-    RemoveData { path: String },
+    RemoveData { path: DataRef },
     /// `data modify storage <ns>:mw <path> append value <snbt>`
-    AppendValue { path: String, value: String },
+    AppendValue { path: DataRef, value: String },
     /// `data modify storage <ns>:mw <dst> append from storage <ns>:mw <src>`
-    AppendFrom { dst: String, src: String },
+    AppendFrom { dst: DataRef, src: DataRef },
     /// `function <path> with storage <ns>:mw mw.args`
     CallWithArgs { path: String },
     /// A macro line: the same command with `$(i)` spliced into a path, which vanilla
@@ -134,14 +134,14 @@ pub enum Inst {
     Macro { inst: Box<Inst> },
     /// `execute store result storage <ns>:mw <path> <tag> 1 run <inst>`
     StoreData {
-        path: String,
+        path: DataRef,
         tag: &'static str,
         inst: Box<Inst>,
     },
     /// The same store, dividing by `scale` on the way in: the register holds
     /// `scale`ths of a unit and storage holds the unit (spec section 6.26).
     StoreScaled {
-        path: String,
+        path: DataRef,
         tag: &'static str,
         scale: u32,
         inst: Box<Inst>,
@@ -155,8 +155,8 @@ pub enum Inst {
     StoreCond { dst: Reg, cond: Cond },
     /// `data modify storage <ns>:mw <dst> set string storage <ns>:mw <src> [a] [b]`
     SetString {
-        dst: String,
-        src: String,
+        dst: DataRef,
+        src: DataRef,
         start: Option<i32>,
         end: Option<i32>,
     },
@@ -165,7 +165,7 @@ pub enum Inst {
     /// A `match`'s `_` arm: run when none of `tags` is the one in `path`. Several
     /// `unless` clauses, but still one command.
     Otherwise {
-        path: String,
+        path: DataRef,
         tags: Vec<String>,
         inst: Box<Inst>,
     },
@@ -198,7 +198,7 @@ pub enum Cond {
     },
     /// `if|unless data storage <ns>:mw <path><filter>`
     Data {
-        path: String,
+        path: DataRef,
         /// An SNBT compound, appended to the path: `{tag:"Idle"}`.
         filter: String,
         negated: bool,
@@ -316,9 +316,9 @@ fn escapes(stmts: &[hir::Stmt]) -> Escapes {
 
 /// The storage path an option is read from, for the ones that are somewhere rather
 /// than in a register.
-fn option_path(function: &hir::Function, expr: &hir::Expr) -> Option<String> {
+fn option_path(function: &hir::Function, expr: &hir::Expr) -> Option<DataRef> {
     match &expr.kind {
-        hir::ExprKind::Local(local) => Some(local_path(function, *local)),
+        hir::ExprKind::Local(local) => Some(local_path(function, *local).into()),
         hir::ExprKind::Field(place) => Some(place_path(function, place)),
         _ => None,
     }
@@ -356,6 +356,48 @@ fn has_try(expr: &hir::Expr) -> bool {
         }
         hir::ExprKind::List { values, .. } => values.iter().any(has_try),
         _ => false,
+    }
+}
+
+/// Where a data command points (spec section 6.29).
+///
+/// Storage is the common case — every local, temporary and argument lives there — so
+/// `DataRef::from` makes one. An entity target names the selector it reads through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataRef {
+    pub target: DataTarget,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataTarget {
+    Storage,
+    /// `entity <selector>`. The selector is compile-time text.
+    Entity(String),
+}
+
+impl DataRef {
+    /// The same target, somewhere else in it.
+    fn with_path(&self, path: String) -> DataRef {
+        DataRef {
+            target: self.target.clone(),
+            path,
+        }
+    }
+}
+
+impl From<String> for DataRef {
+    fn from(path: String) -> DataRef {
+        DataRef {
+            target: DataTarget::Storage,
+            path,
+        }
+    }
+}
+
+impl From<&str> for DataRef {
+    fn from(path: &str) -> DataRef {
+        DataRef::from(path.to_owned())
     }
 }
 
@@ -754,16 +796,24 @@ fn local_path(function: &hir::Function, local: LocalId) -> String {
 ///
 /// A runtime index is not part of it — that path can only be finished by a macro
 /// (spec section 6.21), so it comes back as the prefix the macro splices into.
-fn place_path(function: &hir::Function, place: &hir::Place) -> String {
-    let mut path = match &place.root {
-        hir::Root::Local(local) => local_path(function, *local),
+fn place_path(function: &hir::Function, place: &hir::Place) -> DataRef {
+    let (target, mut path) = match &place.root {
+        hir::Root::Local(local) => (DataTarget::Storage, local_path(function, *local)),
         // A borrowed place belongs to the caller, and says so by name.
-        hir::Root::Lent { owner, local, .. } => format!("mw.vars.{owner}.{local}"),
+        hir::Root::Lent { owner, local, .. } => {
+            (DataTarget::Storage, format!("mw.vars.{owner}.{local}"))
+        }
+        // A view names an entity, and the path is written on the command itself.
+        hir::Root::Entity { selector } => (DataTarget::Entity(selector.clone()), String::new()),
     };
     for step in &place.steps {
         match step {
             Step::Field(name) => {
-                path.push('.');
+                // An entity's path starts at its root compound, so the first field
+                // needs no separator before it.
+                if !path.is_empty() {
+                    path.push('.');
+                }
                 path.push_str(name);
             }
             Step::Index(index) => path.push_str(&format!("[{index}]")),
@@ -771,13 +821,15 @@ fn place_path(function: &hir::Function, place: &hir::Place) -> String {
             Step::At(_) => break,
         }
     }
-    path
+    DataRef { target, path }
 }
 
 /// The register a place names, for a scalar that lives on the scoreboard.
 fn place_reg(function: &hir::Function, place: &hir::Place) -> Reg {
     match &place.root {
         Root::Local(local) => local_reg(function, *local),
+        // A view's fields are in the entity's NBT; none of them is a register.
+        Root::Entity { .. } => unreachable!("a view has no register"),
         Root::Lent { owner, local, .. } => Reg {
             holder: format!("${owner}.{local}"),
             kind: RegKind::Var,
@@ -886,7 +938,7 @@ impl<'p> Lowering<'_, 'p> {
             }),
             hir::Stmt::Let { local, value, .. } if self.local_ty(*local).is_storage() => {
                 let path = local_path(self.function, *local);
-                self.store_struct(&path, value);
+                self.store_struct(&path.into(), value);
                 self.program.initialised.push(*local);
             }
             hir::Stmt::Push { place, value, .. } => self.push_into(place, value),
@@ -933,7 +985,7 @@ impl<'p> Lowering<'_, 'p> {
                     "index",
                     Inst::ReturnRun {
                         inst: Box::new(Inst::GetData {
-                            path: spliced(&path),
+                            path: path.with_path(spliced(&path.path)),
                         }),
                     },
                 );
@@ -948,17 +1000,17 @@ impl<'p> Lowering<'_, 'p> {
         };
         let write = match value {
             Written::Const(text) => Inst::SetValue {
-                path: spliced(&path),
+                path: path.with_path(spliced(&path.path)),
                 value: text,
             },
             Written::Reg(src) => Inst::StoreData {
-                path: spliced(&path),
+                path: path.with_path(spliced(&path.path)),
                 tag: tag_of(place.tag),
                 inst: Box::new(Inst::Get { src }),
             },
             Written::Data(src) => Inst::CopyData {
-                dst: spliced(&path),
-                src,
+                dst: path.with_path(spliced(&path.path)),
+                src: src.into(),
             },
         };
         let helper = self.macro_helper("index", write);
@@ -998,8 +1050,8 @@ impl<'p> Lowering<'_, 'p> {
             Match::Spliced { cond, src } => {
                 let helper = self.macro_helper("streq", Inst::StoreCond { dst, cond });
                 self.insts.push(Inst::CopyData {
-                    dst: format!("mw.args.{MACRO_TEXT}"),
-                    src,
+                    dst: format!("mw.args.{MACRO_TEXT}").into(),
+                    src: src.into(),
                 });
                 self.insts.push(Inst::CallWithArgs { path: helper });
             }
@@ -1024,10 +1076,10 @@ impl<'p> Lowering<'_, 'p> {
             (Written::Data(path), other) | (other, Written::Data(path)) => (path, other),
             _ => unreachable!("a string is never a register"),
         };
-        let (parent, key) = self.filterable(path);
+        let (parent, key) = self.filterable(path.into());
         Ok(match other {
             Written::Const(text) => Match::Here(Cond::Data {
-                path: parent,
+                path: parent.clone(),
                 filter: format!("{{{key}:{text}}}"),
                 negated,
             }),
@@ -1050,27 +1102,29 @@ impl<'p> Lowering<'_, 'p> {
     ///
     /// A path that does not end in a key — an element of a list — is copied into
     /// `mw.tmp` first, which is the same trick `match` uses (spec section 6.20).
-    fn filterable(&mut self, path: String) -> (String, String) {
-        match path.rsplit_once('.') {
-            Some((parent, key)) if !key.ends_with(']') => (parent.to_owned(), key.to_owned()),
+    fn filterable(&mut self, path: DataRef) -> (DataRef, String) {
+        match path.path.rsplit_once('.') {
+            Some((parent, key)) if !key.ends_with(']') => {
+                (path.with_path(parent.to_owned()), key.to_owned())
+            }
             _ => {
                 // A temporary rather than a fixed path: whatever is in storage has to
                 // be saved and restored across recursion, and `data_temp` is what the
                 // save list is built from.
                 let temp = self.data_temp();
                 self.insts.push(Inst::CopyData {
-                    dst: temp.clone(),
+                    dst: temp.clone().into(),
                     src: path,
                 });
                 let (parent, key) = temp.rsplit_once('.').expect("a temp path has a key");
-                (parent.to_owned(), key.to_owned())
+                (DataRef::from(parent.to_owned()), key.to_owned())
             }
         }
     }
 
     /// `a + b` on strings: one macro line, with every literal part already in it
     /// (spec section 6.27).
-    fn concat_into(&mut self, path: &str, lhs: &hir::Expr, rhs: &hir::Expr) {
+    fn concat_into(&mut self, path: &DataRef, lhs: &hir::Expr, rhs: &hir::Expr) {
         let mut spliced = false;
         let mut body = String::new();
         for (side, name) in [(lhs, "a"), (rhs, "b")] {
@@ -1081,8 +1135,8 @@ impl<'p> Lowering<'_, 'p> {
                         unreachable!("a string is a literal or a path")
                     };
                     self.insts.push(Inst::CopyData {
-                        dst: format!("mw.args.{name}"),
-                        src,
+                        dst: format!("mw.args.{name}").into(),
+                        src: src.into(),
                     });
                     body.push_str(&format!("$({name})"));
                     spliced = true;
@@ -1119,12 +1173,12 @@ impl<'p> Lowering<'_, 'p> {
             hir::ExprKind::Str(text) => Written::Const(quoted(text)),
             hir::ExprKind::Local(local) => Written::Data(local_path(self.function, *local)),
             hir::ExprKind::Field(place) if place.is_static() => {
-                Written::Data(place_path(self.function, place))
+                Written::Data(place_path(self.function, place).path)
             }
             // A composite that is not already somewhere: build it aside, then copy.
             _ => {
                 let temp = self.data_temp();
-                self.store_struct(&temp, value);
+                self.store_struct(&temp.clone().into(), value);
                 Written::Data(temp)
             }
         }
@@ -1151,21 +1205,21 @@ impl<'p> Lowering<'_, 'p> {
             return;
         }
         let path = place_path(self.function, place);
-        let read = |path: String| match scale {
+        let read = |path: DataRef| match scale {
             1 => Inst::GetData { path },
             scale => Inst::GetScaled { path, scale },
         };
         let Some(index) = runtime_index(place) else {
             self.insts.push(Inst::StoreResult {
                 dst,
-                inst: Box::new(read(path)),
+                inst: Box::new(read(path.clone())),
             });
             return;
         };
         let helper = self.macro_helper(
             "index",
             Inst::ReturnRun {
-                inst: Box::new(read(spliced(&path))),
+                inst: Box::new(read(path.with_path(spliced(&path.path)))),
             },
         );
         self.write_index_arg(index);
@@ -1180,7 +1234,7 @@ impl<'p> Lowering<'_, 'p> {
         let value = self.expr(index);
         let src = self.materialise(value);
         self.insts.push(Inst::StoreData {
-            path: format!("mw.args.{MACRO_INDEX}"),
+            path: format!("mw.args.{MACRO_INDEX}").into(),
             tag: "int",
             inst: Box::new(Inst::Get { src }),
         });
@@ -1220,7 +1274,10 @@ impl<'p> Lowering<'_, 'p> {
         let tag = NbtTag::default_for(elem);
         match self.expr_or_copy(elem, value) {
             Written::Const(text) => self.insts.push(Inst::AppendValue { path, value: text }),
-            Written::Data(src) => self.insts.push(Inst::AppendFrom { dst: path, src }),
+            Written::Data(src) => self.insts.push(Inst::AppendFrom {
+                dst: path,
+                src: src.into(),
+            }),
             // The list has to grow before the value can be stored into its last slot.
             Written::Reg(src) => {
                 self.insts.push(Inst::AppendValue {
@@ -1228,7 +1285,7 @@ impl<'p> Lowering<'_, 'p> {
                     value: format!("0{}", tag.map(NbtTag::suffix).unwrap_or("")),
                 });
                 self.insts.push(Inst::StoreData {
-                    path: format!("{path}[-1]"),
+                    path: path.with_path(format!("{}[-1]", path.path)),
                     tag: tag_of(tag),
                     inst: Box::new(Inst::Get { src }),
                 });
@@ -1243,7 +1300,7 @@ impl<'p> Lowering<'_, 'p> {
     /// back. Vanilla has no arithmetic on storage to shorten this with.
     fn assign_in_storage(
         &mut self,
-        path: &str,
+        path: &DataRef,
         ty: Type,
         tag: Option<NbtTag>,
         op: Option<BinaryOp>,
@@ -1294,7 +1351,7 @@ impl<'p> Lowering<'_, 'p> {
     /// was just written whole — which is what lets the copy skip its `data remove`.
     fn store_option(
         &mut self,
-        path: &str,
+        path: &DataRef,
         inner: Type,
         tag: Option<NbtTag>,
         value: &hir::Expr,
@@ -1342,7 +1399,7 @@ impl<'p> Lowering<'_, 'p> {
                 match self.expr_or_copy(value.ty, value) {
                     Written::Data(src) => self.insts.push(Inst::CopyData {
                         dst: path.to_owned(),
-                        src,
+                        src: src.into(),
                     }),
                     _ => unreachable!("an option is a path or a value written into one"),
                 }
@@ -1354,7 +1411,7 @@ impl<'p> Lowering<'_, 'p> {
     ///
     /// One `set value` puts everything that is known now in place, and only the fields
     /// that are not get a command of their own (spec section 6.18).
-    fn store_struct(&mut self, path: &str, value: &hir::Expr) {
+    fn store_struct(&mut self, path: &DataRef, value: &hir::Expr) {
         if let Type::Option(id) = value.ty {
             let inner = self.program.types.inner(id);
             let tag = NbtTag::default_for(inner);
@@ -1396,22 +1453,22 @@ impl<'p> Lowering<'_, 'p> {
                 let src = local_path(self.function, *local);
                 self.insts.push(Inst::CopyData {
                     dst: path.to_owned(),
-                    src,
+                    src: src.into(),
                 });
             }
             hir::ExprKind::Field(place) => {
                 let src = place_path(self.function, place);
                 match runtime_index(place) {
                     None => self.insts.push(Inst::CopyData {
-                        dst: path.to_owned(),
+                        dst: path.clone(),
                         src,
                     }),
                     Some(index) => {
                         let helper = self.macro_helper(
                             "index",
                             Inst::CopyData {
-                                dst: path.to_owned(),
-                                src: spliced(&src),
+                                dst: path.clone(),
+                                src: src.with_path(spliced(&src.path)),
                             },
                         );
                         self.write_index_arg(index);
@@ -1525,12 +1582,12 @@ impl<'p> Lowering<'_, 'p> {
     }
 
     /// Writes the fields `snbt` could only leave a placeholder for.
-    fn write_runtime_fields(&mut self, path: &str, value: &hir::Expr) {
+    fn write_runtime_fields(&mut self, path: &DataRef, value: &hir::Expr) {
         if let hir::ExprKind::List { elem, values } = &value.kind {
             let elem = *elem;
             let tag = NbtTag::default_for(elem);
             for (index, value) in values.iter().enumerate() {
-                let path = format!("{path}[{index}]");
+                let path = path.with_path(format!("{}[{index}]", path.path));
                 match &value.kind {
                     hir::ExprKind::Int(_) | hir::ExprKind::Bool(_) => {}
                     _ if elem.is_storage() => self.store_struct(&path, value),
@@ -1567,7 +1624,7 @@ impl<'p> Lowering<'_, 'p> {
             _ => return,
         };
         for (field, value) in declared.iter().zip(values) {
-            let path = format!("{path}.{}", field.nbt);
+            let path = path.with_path(format!("{}.{}", path.path, field.nbt));
             // The key was left out of the compound, so there is nothing to clear.
             if let Type::Option(id) = field.ty {
                 let inner = self.program.types.inner(id);
@@ -1783,12 +1840,12 @@ impl<'p> Lowering<'_, 'p> {
     }
 
     /// Whether a path holds anything, in a register: one command.
-    fn present_at(&mut self, path: &str) -> Reg {
+    fn present_at(&mut self, path: &DataRef) -> Reg {
         let present = self.temps_next();
         self.insts.push(Inst::StoreCond {
             dst: present.clone(),
             cond: Cond::Data {
-                path: path.to_owned(),
+                path: path.clone(),
                 filter: String::new(),
                 negated: false,
             },
@@ -1918,7 +1975,7 @@ impl<'p> Lowering<'_, 'p> {
             // A call: both halves of its outcome are already in registers.
             hir::Scrutinee::Option(value) => {
                 let (held, present) = self.option_parts(value);
-                (String::new(), Some(present), Some(held))
+                (DataRef::from(String::new()), Some(present), Some(held))
             }
             hir::Scrutinee::Place(place) => {
                 let path = place_path(self.function, place);
@@ -1938,9 +1995,9 @@ impl<'p> Lowering<'_, 'p> {
             }
         };
         let tested = match present {
-            Some(_) => String::new(),
+            Some(_) => DataRef::from(String::new()),
             None => {
-                let tested = self.data_temp();
+                let tested: DataRef = self.data_temp().into();
                 self.insts.push(Inst::CopyData {
                     dst: tested.clone(),
                     src: path.clone(),
@@ -1968,11 +2025,14 @@ impl<'p> Lowering<'_, 'p> {
                 }
                 let field = match binding.nbt.is_empty() {
                     true => path.clone(),
-                    false => format!("{path}.{}", binding.nbt),
+                    false => path.with_path(format!("{}.{}", path.path, binding.nbt)),
                 };
                 if binding.ty.is_storage() {
                     let dst = local_path(inner.function, binding.local);
-                    inner.insts.push(Inst::CopyData { dst, src: field });
+                    inner.insts.push(Inst::CopyData {
+                        dst: dst.into(),
+                        src: field,
+                    });
                 } else {
                     inner.insts.push(Inst::StoreResult {
                         dst,
@@ -2134,7 +2194,7 @@ impl<'p> Lowering<'_, 'p> {
         let src = place_path(self.function, source);
         let iter = self.iter_temp();
         self.insts.push(Inst::CopyData {
-            dst: iter.clone(),
+            dst: iter.clone().into(),
             src,
         });
         let path = format!("{}/for_{}", self.prefix, self.counter);
@@ -2145,7 +2205,7 @@ impl<'p> Lowering<'_, 'p> {
         // Nothing left to take: the loop is over.
         inner.insts.push(Inst::Guarded {
             cond: Cond::Data {
-                path: head.clone(),
+                path: head.clone().into(),
                 filter: String::new(),
                 negated: true,
             },
@@ -2155,17 +2215,19 @@ impl<'p> Lowering<'_, 'p> {
         if ty.is_storage() {
             let dst = local_path(inner.function, binding);
             inner.insts.push(Inst::CopyData {
-                dst,
-                src: head.clone(),
+                dst: dst.into(),
+                src: head.clone().into(),
             });
         } else {
             let dst = local_reg(inner.function, binding);
             inner.insts.push(Inst::StoreResult {
                 dst,
-                inst: Box::new(Inst::GetData { path: head.clone() }),
+                inst: Box::new(Inst::GetData {
+                    path: head.clone().into(),
+                }),
             });
         }
-        inner.insts.push(Inst::RemoveData { path: head });
+        inner.insts.push(Inst::RemoveData { path: head.into() });
         // The binding holds a value from here on, so a recursive call has to save it.
         inner.program.initialised.push(binding);
         if escaping.continues {
@@ -2378,7 +2440,7 @@ impl<'p> Lowering<'_, 'p> {
                 Some(value) => self.copy_into(param_reg(callee_fn, *param), value),
                 None => {
                     let path = local_path(callee_fn, *param);
-                    self.store_struct(&path, arg);
+                    self.store_struct(&path.into(), arg);
                 }
             }
         }
@@ -2598,6 +2660,8 @@ impl<'p> Lowering<'_, 'p> {
             | hir::ExprKind::None => {
                 unreachable!("a compound is not a register value")
             }
+            // A view is a name, and names are settled while compiling.
+            hir::ExprKind::View(_) => unreachable!("a view has no runtime value"),
         }
     }
 

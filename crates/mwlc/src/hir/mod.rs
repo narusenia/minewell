@@ -91,6 +91,9 @@ pub enum Type {
     /// Maybe a `T`, and the difference is whether the path exists at all
     /// (spec section 4.19).
     Option(OptionId),
+    /// A view of an entity's NBT: fields that are places rather than values
+    /// (spec section 4.20). Compile-time only, like a selector.
+    View(StructId),
     /// A type parameter, inside a template that has not been instantiated yet
     /// (spec section 4.12). No value ever has this type: instantiation replaces it.
     Param(u32),
@@ -116,7 +119,10 @@ impl Type {
     /// Whether the type exists only while compiling, with nothing to put in a
     /// register at runtime.
     pub fn is_compile_time(&self) -> bool {
-        matches!(self, Type::Selector | Type::Resource | Type::Pos)
+        matches!(
+            self,
+            Type::Selector | Type::Resource | Type::Pos | Type::View(_)
+        )
     }
 
     /// Whether values of this type live in storage rather than on the scoreboard.
@@ -164,6 +170,7 @@ impl Type {
             Type::Enum(_) => "enum",
             Type::Vec(_) => "Vec",
             Type::Option(_) => "Option",
+            Type::View(_) => "view",
             Type::Param(_) => "a type parameter",
         }
     }
@@ -394,7 +401,7 @@ impl Types {
     pub fn name_of(&self, ty: Type) -> String {
         match ty {
             Type::Fix(Scale::Const(scale)) => format!("fix<{scale}>"),
-            Type::Struct(id) => self.struct_def(id).name.clone(),
+            Type::Struct(id) | Type::View(id) => self.struct_def(id).name.clone(),
             Type::Enum(id) => self.enum_def(id).name.clone(),
             Type::Vec(id) => format!("Vec<{}>", self.name_of(self.element(id))),
             Type::Option(id) => format!("Option<{}>", self.name_of(self.inner(id))),
@@ -477,6 +484,9 @@ pub struct Place {
 pub enum Root {
     /// A binding of the function being lowered.
     Local(LocalId),
+    /// An entity's NBT, reached through a view (spec section 6.29). The selector is
+    /// compile-time text, so the whole path is written into the command.
+    Entity { selector: String },
     /// A binding of the caller, lent by reference (spec section 6.24). Borrowing is a
     /// name for someone else's place, so the name of that place is what is carried.
     Lent {
@@ -511,6 +521,7 @@ impl Place {
     pub fn key(&self) -> String {
         let root = match &self.root {
             Root::Local(id) => format!("l{}", id.0),
+            Root::Entity { selector } => format!("e{selector}"),
             Root::Lent {
                 owner,
                 local,
@@ -923,6 +934,9 @@ pub enum ExprKind {
     Some(Box<Expr>),
     /// `o?`: the value, having left the function already if there was none.
     Try(Box<Expr>),
+    /// `Mob::of(@s)`: a name for an entity's NBT. Never lowered — the binding it goes
+    /// into is an alias, and the fields are what get read (spec section 6.29).
+    View(Place),
     /// `None`: nothing at all. Writing it removes the path.
     None,
     /// `nbt!({ hp: 20 })`: a compound written out and checked against the type it is
@@ -1477,7 +1491,13 @@ fn collect_types(file: &SourceFile, errors: &mut Vec<SyntaxError>) -> Types {
                 continue;
             }
             ItemKind::Struct(declared) => {
-                let ty = Type::Struct(StructId(structs.len() as u32));
+                let id = StructId(structs.len() as u32);
+                // `#[entity]` makes the struct a view: its fields are places on an
+                // entity rather than a compound of its own (spec section 4.20).
+                let ty = match has_attr(item, "entity") {
+                    true => Type::View(id),
+                    false => Type::Struct(id),
+                };
                 structs.push((item, declared));
                 (&declared.name, ty)
             }
@@ -1500,7 +1520,9 @@ fn collect_types(file: &SourceFile, errors: &mut Vec<SyntaxError>) -> Types {
     }
 
     for (item, declared) in structs {
-        reject_item_attrs(item, "a struct", errors);
+        if !has_attr(item, "entity") {
+            reject_item_attrs(item, "a struct", errors);
+        }
         let fields = collect_fields(&declared.fields, &types, &[], errors);
         let id = StructId(types.struct_count() as u32);
         types.structs.borrow_mut().push(StructDef {
@@ -1598,6 +1620,15 @@ fn collect_types(file: &SourceFile, errors: &mut Vec<SyntaxError>) -> Types {
         ));
     }
     types
+}
+
+/// Whether an item carries a bare `#[name]`.
+fn has_attr(item: &ast::Item, name: &str) -> bool {
+    item.attrs.iter().any(|attr| {
+        matches!(attr.tokens.first().map(|t| &t.kind),
+            Some(TokenKind::Ident(written)) if written == name)
+            && attr.tokens.len() == 1
+    })
 }
 
 fn reject_item_attrs(item: &ast::Item, what: &str, errors: &mut Vec<SyntaxError>) {
