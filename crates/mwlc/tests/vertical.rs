@@ -357,8 +357,11 @@ fn print_generated_commands() {
          fn main() { let mut s = State::Chasing { target: 3 }; let mut x = 0;
                      match s { State::Idle => { x = 1; }
                                State::Chasing { target } => { x = target; } } }",
-        "fn main() { let a: Option<i32> = Some(7);
-                     match a { Some(v) => {} None => {} } }",
+        "struct Mob { hp: Option<i32> }
+         fn twice(m: Mob) -> Option<i32> { let hp = m.hp?; return Some(hp * 2); }
+         fn main() { let m = Mob { hp: Some(5) };
+                     let o: Option<i32> = twice(m);
+                     if let Some(v) = o { raw!(\"say some\"); } }",
         r#"fn main() { let a = "ab"; let b = a + "cd"; let c = b.slice(1..3);
                       let x = a == "ab"; let y = a == b; let n = b.len(); }"#,
         "struct Mob { pos: f64 }
@@ -2015,6 +2018,47 @@ mod options {
                          match a { Some(v) => { a = None; x = 1; } None => { x = 2; } } }",
         );
         assert_eq!(local(&mc, "main", "x"), Some(1));
+    }
+
+    #[test]
+    fn a_function_can_answer_with_nothing() {
+        let mc = run("struct Mob { hp: Option<i32> } \
+             fn twice(m: Mob) -> Option<i32> { let hp = m.hp?; return Some(hp * 2); } \
+             fn main() { let full = Mob { hp: Some(5) }; let empty = Mob { hp: None }; \
+                         let mut x = 0; let mut y = 0; \
+                         match twice(full) { Some(v) => { x = v; } None => { x = -1; } } \
+                         match twice(empty) { Some(v) => { y = v; } None => { y = -1; } } }");
+        assert_eq!(local(&mc, "main", "x"), Some(10));
+        assert_eq!(local(&mc, "main", "y"), Some(-1));
+    }
+
+    #[test]
+    fn a_question_mark_inside_a_block_still_leaves_the_function() {
+        // The `?` is inside an `if`, which is its own function: leaving it has to
+        // carry the reason out through the control register (spec section 6.10).
+        let mc = run("fn pick(a: Option<i32>, n: i32) -> Option<i32> { \
+                 if n > 0 { let v = a?; return Some(v + 1); } \
+                 return Some(0); \
+             } \
+             fn main() { let none: Option<i32> = None; let some: Option<i32> = Some(4); \
+                         let mut x = 0; let mut y = 0; let mut z = 0; \
+                         match pick(some, 1) { Some(v) => { x = v; } None => { x = -1; } } \
+                         match pick(none, 1) { Some(v) => { y = v; } None => { y = -1; } } \
+                         match pick(none, 0) { Some(v) => { z = v; } None => { z = -1; } } }");
+        assert_eq!(local(&mc, "main", "x"), Some(5));
+        assert_eq!(local(&mc, "main", "y"), Some(-1));
+        assert_eq!(local(&mc, "main", "z"), Some(0));
+    }
+
+    #[test]
+    fn returning_an_option_binding_answers_either_way() {
+        let mc = run("fn pass(a: Option<i32>) -> Option<i32> { return a; } \
+             fn main() { let some: Option<i32> = Some(8); let none: Option<i32> = None; \
+                         let mut x = 0; let mut y = 0; \
+                         match pass(some) { Some(v) => { x = v; } None => { x = -1; } } \
+                         match pass(none) { Some(v) => { y = v; } None => { y = -1; } } }");
+        assert_eq!(local(&mc, "main", "x"), Some(8));
+        assert_eq!(local(&mc, "main", "y"), Some(-1));
     }
 
     #[test]

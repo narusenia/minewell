@@ -284,6 +284,14 @@ pub enum Expr {
     Fix(FixExpr),
     /// `1..3`, which only `slice` takes.
     Range(RangeExpr),
+    /// `o?`: the value, or leave the function with nothing (spec section 3.18).
+    Try(TryExpr),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TryExpr {
+    pub value: Box<Expr>,
+    pub span: Span,
 }
 
 /// `a..b`, with either end able to be left out.
@@ -387,6 +395,7 @@ impl Expr {
             Expr::Int(e) => e.span,
             Expr::Fix(e) => e.span,
             Expr::Range(e) => e.span,
+            Expr::Try(e) => e.span,
             Expr::Bool(e) => e.span,
             Expr::Str(e) => e.span,
             Expr::Path(e) => e.span,

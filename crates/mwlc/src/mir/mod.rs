@@ -146,6 +146,11 @@ pub enum Inst {
         scale: u32,
         inst: Box<Inst>,
     },
+    /// `return fail`: what returning `None` is (spec section 6.28).
+    ReturnFail,
+    /// `execute store success score <ok> store result score <dst> run <inst>`: both
+    /// halves of a call's outcome, which is what an `Option<T>` is made of.
+    StoreBoth { ok: Reg, dst: Reg, inst: Box<Inst> },
     /// `execute store success score <dst> <cond>`: the condition's answer as 0 or 1.
     StoreCond { dst: Reg, cond: Cond },
     /// `data modify storage <ns>:mw <dst> set string storage <ns>:mw <src> [a] [b]`
@@ -264,6 +269,12 @@ impl Escapes {
 /// its own body, so only a `return` gets past it.
 fn escapes(stmts: &[hir::Stmt]) -> Escapes {
     stmts.iter().fold(Escapes::default(), |acc, stmt| {
+        // A `?` leaves the function when it finds nothing, so it escapes the same way
+        // a `return` does (spec section 6.28).
+        let acc = acc.union(Escapes {
+            returns: tries(stmt),
+            ..Escapes::default()
+        });
         acc.union(match stmt {
             hir::Stmt::Break(_) => Escapes {
                 breaks: true,
@@ -303,11 +314,58 @@ fn escapes(stmts: &[hir::Stmt]) -> Escapes {
     })
 }
 
+/// The storage path an option is read from, for the ones that are somewhere rather
+/// than in a register.
+fn option_path(function: &hir::Function, expr: &hir::Expr) -> Option<String> {
+    match &expr.kind {
+        hir::ExprKind::Local(local) => Some(local_path(function, *local)),
+        hir::ExprKind::Field(place) => Some(place_path(function, place)),
+        _ => None,
+    }
+}
+
+/// Whether a statement's own expressions hold a `?`. Nested blocks are walked by
+/// `escapes` itself.
+fn tries(stmt: &hir::Stmt) -> bool {
+    let exprs: Vec<&hir::Expr> = match stmt {
+        hir::Stmt::If { cond, .. } => vec![cond],
+        hir::Stmt::Loop {
+            cond: Some(cond), ..
+        } => vec![cond],
+        hir::Stmt::CallFor { args, .. } => args.iter().collect(),
+        hir::Stmt::Return {
+            value: Some(value), ..
+        }
+        | hir::Stmt::Let { value, .. }
+        | hir::Stmt::Push { value, .. }
+        | hir::Stmt::Assign { value, .. } => vec![value],
+        _ => Vec::new(),
+    };
+    exprs.into_iter().any(has_try)
+}
+
+fn has_try(expr: &hir::Expr) -> bool {
+    match &expr.kind {
+        hir::ExprKind::Try(_) => true,
+        hir::ExprKind::Unary(_, operand) => has_try(operand),
+        hir::ExprKind::Binary(_, lhs, rhs) => has_try(lhs) || has_try(rhs),
+        hir::ExprKind::Some(inner) | hir::ExprKind::AsNbt { value: inner, .. } => has_try(inner),
+        hir::ExprKind::Call { args, .. } => args.iter().any(has_try),
+        hir::ExprKind::Struct { fields, .. } | hir::ExprKind::Enum { fields, .. } => {
+            fields.iter().any(has_try)
+        }
+        hir::ExprKind::List { values, .. } => values.iter().any(has_try),
+        _ => false,
+    }
+}
+
 /// The control register's values. See spec section 6.10.
 const CTL_NORMAL: i32 = 0;
 const CTL_BREAK: i32 = 1;
 const CTL_CONTINUE: i32 = 2;
 const CTL_RETURN: i32 = 3;
+/// A `return None`, or a `?` that found nothing: a return that reports failure.
+const CTL_FAIL: i32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
@@ -344,6 +402,22 @@ enum Slot {
 }
 
 /// Where a value to be written into storage came from.
+/// What a call's outcome is captured into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Capture {
+    Nothing,
+    Result,
+    /// Both halves: an option-returning function puts the value in one and whether
+    /// there was a value in the other.
+    Option,
+}
+
+/// What a call left behind.
+struct Called {
+    value: Reg,
+    present: Option<Reg>,
+}
+
 /// How a string comparison is asked: a condition that can be used where it stands, or
 /// one that has to run inside a macro function first (spec section 6.27).
 enum Match {
@@ -780,7 +854,7 @@ impl<'p> Lowering<'_, 'p> {
             hir::Stmt::Continue(_) => self.jump(CTL_CONTINUE),
             hir::Stmt::Return { value, .. } => self.return_stmt(value.as_ref()),
             hir::Stmt::CallFor { callee, args, .. } => {
-                self.call(*callee, args, false);
+                self.call(*callee, args, Capture::Nothing);
             }
             hir::Stmt::Context {
                 kind,
@@ -1233,6 +1307,30 @@ impl<'p> Lowering<'_, 'p> {
             // Writing the value overwrites whatever was there, so nothing has to be
             // cleared first.
             hir::ExprKind::Some(value) => self.assign_in_storage(path, inner, tag, None, value),
+            // A call answers in two registers, so the option is put together here.
+            hir::ExprKind::Call { callee, args } => {
+                let called = self
+                    .call(*callee, args, Capture::Option)
+                    .expect("a value was wanted");
+                if !fresh {
+                    self.insts.push(Inst::RemoveData {
+                        path: path.to_owned(),
+                    });
+                }
+                self.insts.push(Inst::Guarded {
+                    cond: Cond::Matches {
+                        src: called.present.expect("both halves"),
+                        min: Some(1),
+                        max: Some(1),
+                        negated: false,
+                    },
+                    inst: Box::new(Inst::StoreData {
+                        path: path.to_owned(),
+                        tag: tag_of(tag.or_else(|| NbtTag::default_for(inner))),
+                        inst: Box::new(Inst::Get { src: called.value }),
+                    }),
+                });
+            }
             // Copying another option: `set from` on a path that is not there fails and
             // leaves what was there, so the destination is cleared first.
             _ => {
@@ -1579,6 +1677,14 @@ impl<'p> Lowering<'_, 'p> {
     /// its value in `$<fn>.ret`, raises the control register, and lets the propagation
     /// guards carry it out to the top, where it becomes a real return.
     fn return_stmt(&mut self, value: Option<&hir::Expr>) {
+        // Returning an option is returning both halves of vanilla's call outcome:
+        // the value, and whether there was one (spec section 6.28).
+        if let Some(expr) = value
+            && matches!(expr.ty, Type::Option(_))
+        {
+            self.return_option(expr);
+            return;
+        }
         let value = value.map(|expr| self.expr(expr));
         if self.top_level {
             match value {
@@ -1596,6 +1702,129 @@ impl<'p> Lowering<'_, 'p> {
             self.copy_into(ret, value);
         }
         self.jump(CTL_RETURN);
+    }
+
+    /// `return Some(v)` / `return None` / `return o`.
+    fn return_option(&mut self, expr: &hir::Expr) {
+        match &expr.kind {
+            hir::ExprKind::None => match self.top_level {
+                true => self.insts.push(Inst::ReturnFail),
+                false => self.jump(CTL_FAIL),
+            },
+            hir::ExprKind::Some(inner) => {
+                let value = self.expr(inner);
+                match self.top_level {
+                    true => match value {
+                        Value::Const(n) => self.insts.push(Inst::Return { value: n }),
+                        Value::Reg(src) => self.insts.push(Inst::ReturnRun {
+                            inst: Box::new(Inst::Get { src }),
+                        }),
+                    },
+                    false => {
+                        let ret = self.ret_reg();
+                        self.copy_into(ret, value);
+                        self.jump(CTL_RETURN);
+                    }
+                }
+            }
+            // An option that is only known at runtime: ask, then answer either way.
+            _ => {
+                let (value, present) = self.option_parts(expr);
+                if self.top_level {
+                    self.leave_if_absent(present);
+                    self.insts.push(Inst::ReturnRun {
+                        inst: Box::new(Inst::Get { src: value }),
+                    });
+                    return;
+                }
+                let ret = self.ret_reg();
+                self.copy_into(ret, Value::Reg(value));
+                let ctl = self.ctl();
+                self.insts.push(Inst::Const {
+                    dst: ctl.clone(),
+                    value: CTL_FAIL,
+                });
+                self.insts.push(Inst::Guarded {
+                    cond: Cond::Matches {
+                        src: present,
+                        min: Some(1),
+                        max: Some(1),
+                        negated: false,
+                    },
+                    inst: Box::new(Inst::Const {
+                        dst: ctl,
+                        value: CTL_RETURN,
+                    }),
+                });
+                self.insts.push(Inst::Return { value: 0 });
+            }
+        }
+    }
+
+    /// An option in two registers: what it holds, and whether it holds anything.
+    ///
+    /// A call answers both halves at once (spec section 6.28); a path has to be asked
+    /// twice, and the read of an absent path stores 0 rather than failing to store.
+    fn option_parts(&mut self, expr: &hir::Expr) -> (Reg, Reg) {
+        if let hir::ExprKind::Call { callee, args } = &expr.kind {
+            let called = self
+                .call(*callee, args, Capture::Option)
+                .expect("a value was wanted");
+            return (called.value, called.present.expect("both halves"));
+        }
+        let path = option_path(self.function, expr).expect("an option this can read");
+        let present = self.present_at(&path);
+        let value = self.temps_next();
+        self.insts.push(Inst::StoreResult {
+            dst: value.clone(),
+            inst: Box::new(Inst::GetData { path }),
+        });
+        (value, present)
+    }
+
+    /// Whether a path holds anything, in a register: one command.
+    fn present_at(&mut self, path: &str) -> Reg {
+        let present = self.temps_next();
+        self.insts.push(Inst::StoreCond {
+            dst: present.clone(),
+            cond: Cond::Data {
+                path: path.to_owned(),
+                filter: String::new(),
+                negated: false,
+            },
+        });
+        present
+    }
+
+    /// Leaves the function with nothing when `present` says there was nothing.
+    fn leave_if_absent(&mut self, present: Reg) {
+        let absent = Cond::Matches {
+            src: present,
+            min: Some(0),
+            max: Some(0),
+            negated: false,
+        };
+        if self.top_level {
+            self.insts.push(Inst::Guarded {
+                cond: absent,
+                inst: Box::new(Inst::ReturnFail),
+            });
+            return;
+        }
+        // Inside a generated block a `return` only leaves that block, so the reason
+        // goes in the control register and the guards carry it out (spec section 6.10).
+        let ctl = self.ctl();
+        self.insts.push(Inst::Guarded {
+            cond: absent.clone(),
+            inst: Box::new(Inst::Const {
+                dst: ctl,
+                value: CTL_FAIL,
+            }),
+        });
+        self.insts.push(Inst::Guarded {
+            cond: absent,
+            inst: Box::new(Inst::Return { value: 0 }),
+        });
     }
 
     fn ret_reg(&self) -> Reg {
@@ -1675,30 +1904,39 @@ impl<'p> Lowering<'_, 'p> {
     }
 
     /// One guard per arm. The tags are exclusive, so nothing has to stop the others.
-    fn match_stmt(&mut self, scrutinee: &hir::Place, arms: &[hir::Arm]) {
+    fn match_stmt(&mut self, scrutinee: &hir::Scrutinee, arms: &[hir::Arm]) {
         let escaping = arms
             .iter()
             .fold(Escapes::default(), |acc, arm| acc.union(escapes(&arm.body)));
-        let path = place_path(self.function, scrutinee);
         // Guards run in order, and an arm is free to rewrite what is being matched —
         // a state machine does exactly that. Testing a copy taken on the way in is
         // what keeps exactly one arm running (spec section 6.20).
         //
-        // For an option the copy is one bit — whether the path is there — so it fits
-        // in a register, and `execute store success` puts it there in one command
-        // (spec section 6.28).
-        let present = matches!(scrutinee.ty, Type::Option(_)).then(|| {
-            let reg = self.temps_next();
-            self.insts.push(Inst::StoreCond {
-                dst: reg.clone(),
-                cond: Cond::Data {
-                    path: path.clone(),
-                    filter: String::new(),
-                    negated: false,
-                },
-            });
-            reg
-        });
+        // For an option the copy is one bit — whether there is anything — so it fits
+        // in a register, and one command puts it there (spec section 6.28).
+        let (path, present, held) = match scrutinee {
+            // A call: both halves of its outcome are already in registers.
+            hir::Scrutinee::Option(value) => {
+                let (held, present) = self.option_parts(value);
+                (String::new(), Some(present), Some(held))
+            }
+            hir::Scrutinee::Place(place) => {
+                let path = place_path(self.function, place);
+                let present = matches!(place.ty, Type::Option(_)).then(|| {
+                    let reg = self.temps_next();
+                    self.insts.push(Inst::StoreCond {
+                        dst: reg.clone(),
+                        cond: Cond::Data {
+                            path: path.clone(),
+                            filter: String::new(),
+                            negated: false,
+                        },
+                    });
+                    reg
+                });
+                (path, present, None)
+            }
+        };
         let tested = match present {
             Some(_) => String::new(),
             None => {
@@ -1721,8 +1959,13 @@ impl<'p> Lowering<'_, 'p> {
             // binding, not a path, and the compound is not written back.
             for binding in &arm.bindings {
                 let dst = local_reg(inner.function, binding.local);
-                // An option holds its value at the scrutinee's own path; an enum's
-                // payload is a key under it.
+                // A call's option is already in a register; anything in storage is
+                // read from its path. An option holds its value at the scrutinee's
+                // own path, while an enum's payload is a key under it.
+                if let Some(held) = &held {
+                    inner.copy_into(dst, Value::Reg(held.clone()));
+                    continue;
+                }
                 let field = match binding.nbt.is_empty() {
                     true => path.clone(),
                     false => format!("{path}.{}", binding.nbt),
@@ -1790,8 +2033,11 @@ impl<'p> Lowering<'_, 'p> {
     }
 
     /// The tag string a variant of the matched enum is stored under.
-    fn tag_of_variant(&self, scrutinee: &hir::Place, variant: u32) -> String {
-        let hir::Type::Enum(id) = scrutinee.ty else {
+    fn tag_of_variant(&self, scrutinee: &hir::Scrutinee, variant: u32) -> String {
+        let hir::Scrutinee::Place(place) = scrutinee else {
+            unreachable!("only a place holds an enum")
+        };
+        let hir::Type::Enum(id) = place.ty else {
             unreachable!("only an enum is matched on")
         };
         self.program.types.enum_def(id).variants[variant as usize]
@@ -2031,6 +2277,20 @@ impl<'p> Lowering<'_, 'p> {
             });
             return;
         }
+        // A return that reports failure carries its own code, so the two are told
+        // apart without a second register (spec section 6.28).
+        if matches!(self.function.ret, Some(Type::Option(_))) {
+            let ctl = self.ctl();
+            self.insts.push(Inst::Guarded {
+                cond: Cond::Matches {
+                    src: ctl,
+                    min: Some(CTL_FAIL),
+                    max: Some(CTL_FAIL),
+                    negated: false,
+                },
+                inst: Box::new(Inst::ReturnFail),
+            });
+        }
         // `break` and `continue` cannot reach here: HIR rejects them outside a loop,
         // and a loop consumes its own. Only a `return` is left.
         let inst = match self.function.ret {
@@ -2079,7 +2339,7 @@ impl<'p> Lowering<'_, 'p> {
 
     /// A condition, written straight into the `execute` where possible.
     /// Emits a call, returning where its result landed when one was wanted.
-    fn call(&mut self, callee: FnId, args: &[hir::Expr], want_result: bool) -> Option<Reg> {
+    fn call(&mut self, callee: FnId, args: &[hir::Expr], capture: Capture) -> Option<Called> {
         let recursive = self.program.same_component(self.function.id, callee);
         let callee_fn = &self.program.functions[callee.0 as usize];
 
@@ -2126,11 +2386,31 @@ impl<'p> Lowering<'_, 'p> {
         let call = Inst::Call {
             path: callee_fn.path.clone(),
         };
-        // Allocated after the saves, so restoring cannot clobber it.
-        let result = want_result.then(|| self.program.temps.next());
+        // Allocated after the saves, so restoring cannot clobber them.
+        let result = match capture {
+            Capture::Nothing => None,
+            Capture::Result => Some(Called {
+                value: self.program.temps.next(),
+                present: None,
+            }),
+            // An option-returning function answers in both halves at once: the value
+            // in the result, whether there was one in the success (spec section 6.28).
+            Capture::Option => Some(Called {
+                value: self.program.temps.next(),
+                present: Some(self.program.temps.next()),
+            }),
+        };
         match &result {
-            Some(dst) => self.insts.push(Inst::StoreResult {
-                dst: dst.clone(),
+            Some(Called {
+                value,
+                present: Some(ok),
+            }) => self.insts.push(Inst::StoreBoth {
+                ok: ok.clone(),
+                dst: value.clone(),
+                inst: Box::new(call),
+            }),
+            Some(Called { value, .. }) => self.insts.push(Inst::StoreResult {
+                dst: value.clone(),
                 inst: Box::new(call),
             }),
             None => self.insts.push(call),
@@ -2255,9 +2535,11 @@ impl<'p> Lowering<'_, 'p> {
             hir::ExprKind::Local(local) => Value::Reg(self.local(*local)),
             hir::ExprKind::Unary(op, operand) => self.unary(*op, operand),
             hir::ExprKind::Binary(op, lhs, rhs) => self.binary(*op, lhs, rhs),
-            hir::ExprKind::Call { callee, args } => {
-                Value::Reg(self.call(*callee, args, true).expect("a value was wanted"))
-            }
+            hir::ExprKind::Call { callee, args } => Value::Reg(
+                self.call(*callee, args, Capture::Result)
+                    .expect("a value was wanted")
+                    .value,
+            ),
             // A command as an expression is a command that ran; its value is not
             // captured, so this is the statement form reaching here by mistake.
             hir::ExprKind::Command(text) => {
@@ -2289,6 +2571,23 @@ impl<'p> Lowering<'_, 'p> {
                 let dst = self.temps_next();
                 self.read_place_scaled(dst.clone(), place, *scale);
                 Value::Reg(dst)
+            }
+            hir::ExprKind::Try(inner) => {
+                // Ask first, leave if there was nothing, and only then read: on the
+                // way out the read would be a command spent on a value nobody sees.
+                if let Some(path) = option_path(self.function, inner) {
+                    let present = self.present_at(&path);
+                    self.leave_if_absent(present);
+                    let value = self.temps_next();
+                    self.insts.push(Inst::StoreResult {
+                        dst: value.clone(),
+                        inst: Box::new(Inst::GetData { path }),
+                    });
+                    return Value::Reg(value);
+                }
+                let (value, present) = self.option_parts(inner);
+                self.leave_if_absent(present);
+                Value::Reg(value)
             }
             // The value only means anything once it is in storage, and everything
             // that puts it there goes through `store_struct`.

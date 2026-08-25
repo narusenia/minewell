@@ -327,6 +327,15 @@ fn command(inst: &Inst, ns: &str) -> String {
             )
         }
         Inst::Return { value } => format!("return {value}"),
+        Inst::ReturnFail => "return fail".to_owned(),
+        Inst::StoreBoth { ok, dst, inst } => {
+            let (o, oobj) = (&ok.holder, objective(ns, ok));
+            let (d, dobj) = (&dst.holder, objective(ns, dst));
+            format!(
+                "execute store success score {o} {oobj} store result score {d} {dobj} run {}",
+                command(inst, ns)
+            )
+        }
         Inst::StoreCond { dst, cond } => {
             let (d, dobj) = (&dst.holder, objective(ns, dst));
             format!(

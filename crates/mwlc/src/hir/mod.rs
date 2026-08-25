@@ -745,7 +745,7 @@ pub enum Stmt {
     },
     /// `match`: one arm per variant, each its own guarded block.
     Match {
-        scrutinee: Place,
+        scrutinee: Scrutinee,
         arms: Vec<Arm>,
         span: Span,
     },
@@ -805,6 +805,17 @@ pub struct Arm {
     pub path: String,
     pub bindings: Vec<Binding>,
     pub body: Vec<Stmt>,
+}
+
+/// What is being matched on.
+///
+/// A compound has to be somewhere to be looked at, so an `enum` is always a place. An
+/// option answers in registers as well — a call reports both halves of its outcome —
+/// so it can be matched straight from the call (spec section 6.28).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scrutinee {
+    Place(Place),
+    Option(Expr),
 }
 
 /// What decides whether an arm runs.
@@ -910,6 +921,8 @@ pub enum ExprKind {
     },
     /// `Some(e)`: the value, written where the option lives (spec section 6.28).
     Some(Box<Expr>),
+    /// `o?`: the value, having left the function already if there was none.
+    Try(Box<Expr>),
     /// `None`: nothing at all. Writing it removes the path.
     None,
     /// `nbt!({ hp: 20 })`: a compound written out and checked against the type it is
@@ -1169,10 +1182,26 @@ pub fn lower(
                  caller, and the caller already has that name",
             ));
         }
+        // An option is the one storage type that can come back: vanilla's call
+        // outcome is a value and whether there was one, which is exactly an option
+        // (spec section 6.28). What it holds still has to fit in the value.
+        if let (Some(Type::Option(id)), Some(written)) = (ret, f.ret.as_ref())
+            && types.inner(id).is_storage()
+        {
+            let inner = types.name_of(types.inner(id));
+            errors.push(SyntaxError::new(
+                written.span,
+                format!(
+                    "an Option<{inner}> cannot come back from a function: the value \
+                     half of a call's outcome is a single number"
+                ),
+            ));
+        }
         // Vanilla's function return is a single integer, so there is nowhere for a
         // compound to come back in.
         if let (Some(ty), Some(written)) = (ret, f.ret.as_ref())
             && ty.is_storage()
+            && !matches!(ty, Type::Option(_))
         {
             errors.push(SyntaxError::new(
                 written.span,
@@ -2209,9 +2238,33 @@ impl FnLowering<'_> {
     /// A missing variant is the silent failure this language exists to remove: the
     /// generated guards would simply all fail and the block would do nothing.
     fn match_stmt(&mut self, stmt: &ast::MatchStmt) -> Option<Stmt> {
+        // A call that answers with an option is matched where it stands: there is no
+        // compound to look at, only the two halves of its outcome.
+        if let AstExpr::Call(_) = &stmt.scrutinee {
+            let value = self.expr(&stmt.scrutinee)?;
+            let Type::Option(id) = value.ty else {
+                let found = self.ty(value.ty);
+                self.error(
+                    stmt.scrutinee.span(),
+                    format!("only an enum or an option can be matched on, found {found}"),
+                );
+                return None;
+            };
+            let inner = self.types.inner(id);
+            if inner.is_storage() {
+                let found = self.ty(inner);
+                self.error(
+                    stmt.scrutinee.span(),
+                    format!("a {found} does not fit in a register; bind the option first"),
+                );
+                return None;
+            }
+            return self.option_match(Scrutinee::Option(value), inner, stmt);
+        }
         let scrutinee = self.place(&stmt.scrutinee)?;
         if let Type::Option(id) = scrutinee.ty {
-            return self.option_match(scrutinee, self.types.inner(id), stmt);
+            let inner = self.types.inner(id);
+            return self.option_match(Scrutinee::Place(scrutinee), inner, stmt);
         }
         let Type::Enum(id) = scrutinee.ty else {
             let found = self.ty(scrutinee.ty);
@@ -2329,7 +2382,7 @@ impl FnLowering<'_> {
             return None;
         }
         Some(Stmt::Match {
-            scrutinee,
+            scrutinee: Scrutinee::Place(scrutinee),
             arms,
             span: stmt.span,
         })
@@ -2341,7 +2394,7 @@ impl FnLowering<'_> {
     /// look at, because what says `None` is the absence itself.
     fn option_match(
         &mut self,
-        scrutinee: Place,
+        scrutinee: Scrutinee,
         inner: Type,
         stmt: &ast::MatchStmt,
     ) -> Option<Stmt> {
@@ -3271,6 +3324,43 @@ impl FnLowering<'_> {
                 Some(Expr {
                     ty: place.ty,
                     kind: ExprKind::Field(place),
+                    span,
+                })
+            }
+            AstExpr::Try(try_expr) => {
+                let value = self.expr(&try_expr.value)?;
+                let Type::Option(id) = value.ty else {
+                    let found = self.ty(value.ty);
+                    self.error(span, format!("'?' takes an Option, found {found}"));
+                    return None;
+                };
+                // The value comes out into a register, so it has to be the kind of
+                // thing a register holds (spec section 4.19).
+                let inner = self.types.inner(id);
+                if inner.is_storage() {
+                    let found = self.ty(inner);
+                    self.error(
+                        span,
+                        format!(
+                            "'?' unwraps into a register, and a {found} does not \
+                                 fit in one; match on it instead"
+                        ),
+                    );
+                    return None;
+                }
+                // Leaving with nothing is only a thing a function that can return
+                // nothing can do (spec section 4.19).
+                if !matches!(self.ret, Some(Type::Option(_))) {
+                    self.error(
+                        span,
+                        "'?' leaves the function with nothing, so the function has to \
+                         return an Option",
+                    );
+                    return None;
+                }
+                Some(Expr {
+                    ty: inner,
+                    kind: ExprKind::Try(Box::new(value)),
                     span,
                 })
             }
@@ -5864,6 +5954,45 @@ mod tests {
             );
             assert!(
                 errors[0].message.contains("cannot be reached"),
+                "{errors:?}"
+            );
+        }
+
+        #[test]
+        fn a_question_mark_needs_a_function_that_can_answer_with_nothing() {
+            let errors = lower_err("fn f(a: Option<i32>) -> i32 { let v = a?; return v; }");
+            assert!(errors[0].message.contains("return an Option"), "{errors:?}");
+            lower_ok("fn f(a: Option<i32>) -> Option<i32> { let v = a?; return Some(v); }");
+        }
+
+        #[test]
+        fn a_question_mark_only_takes_an_option() {
+            let errors = lower_err("fn f(a: i32) -> Option<i32> { let v = a?; return Some(v); }");
+            assert!(
+                errors[0].message.contains("'?' takes an Option"),
+                "{errors:?}"
+            );
+        }
+
+        #[test]
+        fn a_question_mark_unwraps_into_a_register() {
+            let errors = lower_err(
+                "struct P { x: i32 } \
+                 fn f(a: Option<P>) -> Option<i32> { let v = a?; return Some(1); }",
+            );
+            assert!(
+                errors[0].message.contains("does not fit in one"),
+                "{errors:?}"
+            );
+        }
+
+        #[test]
+        fn an_option_of_a_compound_cannot_be_returned() {
+            let errors = lower_err("struct P { x: i32 } fn f() -> Option<P> { return None; }");
+            assert!(
+                errors[0]
+                    .message
+                    .contains("cannot come back from a function"),
                 "{errors:?}"
             );
         }

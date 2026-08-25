@@ -946,6 +946,18 @@ impl Parser {
                         },
                     });
                 }
+                // `o?` binds tighter than any operator: it is part of reading the
+                // value, not something done to the value afterwards.
+                Some(TokenKind::Punct(Punct::Question)) => {
+                    self.bump();
+                    expr = Expr::Try(TryExpr {
+                        value: Box::new(expr),
+                        span: Span {
+                            start,
+                            end: self.previous_end(),
+                        },
+                    });
+                }
                 _ => return Some(expr),
             }
         }
