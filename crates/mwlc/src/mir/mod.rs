@@ -1186,6 +1186,11 @@ impl<'p> Lowering<'_, 'p> {
                 });
                 self.write_runtime_fields(path, value);
             }
+            // Already SNBT, and checked while compiling: one `set value`.
+            hir::ExprKind::Nbt(text) => self.insts.push(Inst::SetValue {
+                path: path.to_owned(),
+                value: text.clone(),
+            }),
             hir::ExprKind::Binary(BinaryOp::Add, lhs, rhs) => self.concat_into(path, lhs, rhs),
             hir::ExprKind::Slice { place, start, end } => {
                 let src = place_path(self.function, place);
@@ -1269,6 +1274,7 @@ impl<'p> Lowering<'_, 'p> {
         match &value.kind {
             hir::ExprKind::Int(n) => format!("{n}{suffix}"),
             hir::ExprKind::Str(text) => quoted(text),
+            hir::ExprKind::Nbt(text) => text.clone(),
             hir::ExprKind::Bool(b) => format!("{}{suffix}", i32::from(*b)),
             hir::ExprKind::Struct { id, fields } => {
                 let def = self.program.types.struct_def(*id);
@@ -2108,7 +2114,9 @@ impl<'p> Lowering<'_, 'p> {
             // The value only means anything once it is in storage, and everything
             // that puts it there goes through `store_struct`.
             hir::ExprKind::AsNbt { .. } => unreachable!("an NBT scalar is not a register value"),
-            hir::ExprKind::Slice { .. } => unreachable!("a string is not a register value"),
+            hir::ExprKind::Slice { .. } | hir::ExprKind::Nbt(_) => {
+                unreachable!("a compound is not a register value")
+            }
         }
     }
 

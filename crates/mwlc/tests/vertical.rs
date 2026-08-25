@@ -1851,3 +1851,67 @@ mod strings {
         assert_eq!(local(&mc, "main", "x"), Some(4));
     }
 }
+
+/// `nbt!`, checked against the type it is written into (spec section 4.18).
+mod nbt_literals {
+    use super::harness::{at_path, cost, local, run};
+    use tinymcf::nbt::NbtValue;
+
+    #[test]
+    fn a_literal_compound_is_one_command() {
+        let mc = run(r#"struct Mob { hp: i32, name: String }
+               fn main() { let m: Mob = nbt!({ hp: 20, name: "bob" });
+                           let x = m.hp; }"#);
+        assert_eq!(at_path(&mc, "mw.vars.main.m.hp"), Some(NbtValue::Int(20)));
+        assert_eq!(
+            at_path(&mc, "mw.vars.main.m.name"),
+            Some(NbtValue::String("bob".to_owned()))
+        );
+        assert_eq!(local(&mc, "main", "x"), Some(20));
+        // The compound, then the read into x.
+        assert_eq!(cost(&mc), 1 + 2);
+    }
+
+    #[test]
+    fn the_tag_comes_from_the_field() {
+        let mc = run(
+            r#"struct Mob { #[nbt(short)] shots: i32, alive: bool, weight: f64 }
+               fn main() { let m: Mob = nbt!({ shots: 3, alive: true, weight: 2 }); }"#,
+        );
+        assert_eq!(
+            at_path(&mc, "mw.vars.main.m.shots"),
+            Some(NbtValue::Short(3))
+        );
+        assert_eq!(
+            at_path(&mc, "mw.vars.main.m.alive"),
+            Some(NbtValue::Byte(1))
+        );
+        assert_eq!(
+            at_path(&mc, "mw.vars.main.m.weight"),
+            Some(NbtValue::Double(2.0))
+        );
+    }
+
+    #[test]
+    fn a_renamed_field_is_written_the_way_vanilla_spells_it() {
+        let mc = run(r#"struct Mob { #[nbt(rename = "Health")] hp: i32 }
+               fn main() { let m: Mob = nbt!({ Health: 20 }); }"#);
+        assert_eq!(
+            at_path(&mc, "mw.vars.main.m.Health"),
+            Some(NbtValue::Int(20))
+        );
+    }
+
+    #[test]
+    fn nesting_and_lists_are_checked_too() {
+        let mc = run(r#"struct Inner { a: i32 }
+               struct Outer { inner: Inner, xs: Vec<i32> }
+               fn main() { let o: Outer = nbt!({ inner: { a: 1 }, xs: [1, 2, 3] });
+                           let x = o.xs.len(); }"#);
+        assert_eq!(local(&mc, "main", "x"), Some(3));
+        assert_eq!(
+            at_path(&mc, "mw.vars.main.o.inner.a"),
+            Some(NbtValue::Int(1))
+        );
+    }
+}

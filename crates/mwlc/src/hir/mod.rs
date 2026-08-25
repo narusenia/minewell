@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use crate::schema::{ArgType, Part, Schema};
 use crate::syntax::SyntaxError;
 use crate::syntax::ast::{self, BinaryOp, Expr as AstExpr, ItemKind, SourceFile, UnaryOp};
-use crate::syntax::lexer::{Punct, Span, TokenKind};
+use crate::syntax::lexer::{Keyword, Punct, Span, Token, TokenKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FnId(pub u32);
@@ -862,6 +862,9 @@ pub enum ExprKind {
         value: Box<Expr>,
         scale: u32,
     },
+    /// `nbt!({ hp: 20 })`: a compound written out and checked against the type it is
+    /// going into (spec section 4.18). Already SNBT, so it costs one `set value`.
+    Nbt(String),
     /// `s.slice(1..3)`: a piece of a string, taken by `data modify ... set string`
     /// (spec section 6.27). Both bounds are known while compiling.
     Slice {
@@ -2475,6 +2478,11 @@ impl FnLowering<'_> {
                 let want = self.resolve(written)?;
                 self.list_lit(lit, Some(want))?
             }
+            // `nbt!` is the other one: it is checked against the type it lands in.
+            (AstExpr::Macro(call), Some(written)) if call.name.name == "nbt" => {
+                let want = self.resolve(written)?;
+                self.nbt_lit(call, want)?
+            }
             _ => self.expr(&stmt.value)?,
         };
         let ty = match &stmt.ty {
@@ -2998,6 +3006,14 @@ impl FnLowering<'_> {
                 ty: Type::Pos,
                 span,
             }),
+            AstExpr::Macro(call) if call.name.name == "nbt" => {
+                self.error(
+                    span,
+                    "nbt! has to know what it is being written into: annotate the \
+                     binding, as in 'let m: Mob = nbt!({ .. });'",
+                );
+                None
+            }
             AstExpr::Macro(call) => {
                 let name = &call.name.name;
                 self.error(span, format!("'{name}!' does not produce a value"));
@@ -3511,6 +3527,231 @@ impl FnLowering<'_> {
                 }
             }
         }
+    }
+
+    /// `nbt!({ hp: 20 })`, checked against the type it is being written into
+    /// (spec section 4.18).
+    fn nbt_lit(&mut self, call: &ast::MacroCall, want: Type) -> Option<Expr> {
+        let mut at = 0;
+        let text = self.nbt_value(&call.tokens, &mut at, want, None, call.span)?;
+        if at < call.tokens.len() {
+            self.error(call.tokens[at].span, "nbt! takes one value");
+            return None;
+        }
+        Some(Expr {
+            kind: ExprKind::Nbt(text),
+            ty: want,
+            span: call.span,
+        })
+    }
+
+    /// One SNBT value, rendered as the game spells it.
+    ///
+    /// `want` is what the value has to be, and `tag` the tag the field it lands in
+    /// was declared with, which decides the suffix a number gets.
+    fn nbt_value(
+        &mut self,
+        tokens: &[Token],
+        at: &mut usize,
+        want: Type,
+        tag: Option<NbtTag>,
+        span: Span,
+    ) -> Option<String> {
+        let Some(token) = tokens.get(*at) else {
+            self.error(span, "expected a value");
+            return None;
+        };
+        let span = token.span;
+        match &token.kind {
+            TokenKind::Punct(Punct::LBrace) => self.nbt_compound(tokens, at, want, span),
+            TokenKind::Punct(Punct::LBracket) => self.nbt_list(tokens, at, want, span),
+            TokenKind::Str(text) => {
+                *at += 1;
+                if want != Type::Str {
+                    let want = self.ty(want);
+                    self.error(span, format!("expected {want}, found a string"));
+                    return None;
+                }
+                Some(format!("{text:?}"))
+            }
+            TokenKind::Keyword(k @ (Keyword::True | Keyword::False)) => {
+                let value = i32::from(*k == Keyword::True);
+                *at += 1;
+                if want != Type::Bool {
+                    let want = self.ty(want);
+                    self.error(span, format!("expected {want}, found a bool"));
+                    return None;
+                }
+                Some(format!("{value}b"))
+            }
+            TokenKind::Punct(Punct::Minus) | TokenKind::Int(_) => {
+                self.nbt_number(tokens, at, want, tag, span)
+            }
+            _ => {
+                self.error(span, "expected a value");
+                None
+            }
+        }
+    }
+
+    fn nbt_compound(
+        &mut self,
+        tokens: &[Token],
+        at: &mut usize,
+        want: Type,
+        span: Span,
+    ) -> Option<String> {
+        // An enum is a compound too, but a variant has to be named to be chosen and
+        // `nbt!` names no variant: `State::Idle` is how that is written.
+        let Type::Struct(id) = want else {
+            let want = self.ty(want);
+            self.error(span, format!("expected {want}, found a compound"));
+            return None;
+        };
+        let fields = self.types.struct_def(id).fields;
+        *at += 1;
+        let mut written: Vec<(String, String)> = Vec::new();
+        while !self.eat_punct(tokens, at, Punct::RBrace) {
+            let Some(key) = tokens.get(*at) else {
+                self.error(span, "a compound has to be closed with '}'");
+                return None;
+            };
+            let name = match &key.kind {
+                TokenKind::Ident(name) => name.clone(),
+                TokenKind::Str(name) => name.clone(),
+                _ => {
+                    self.error(key.span, "expected a field name");
+                    return None;
+                }
+            };
+            *at += 1;
+            if !self.eat_punct(tokens, at, Punct::Colon) {
+                self.error(key.span, "expected ':' after a field name");
+                return None;
+            }
+            let Some(field) = fields.iter().find(|field| field.nbt == name) else {
+                let ty = self.ty(want);
+                self.error(
+                    key.span,
+                    format!("'{ty}' has no field written as '{name}' in NBT"),
+                );
+                return None;
+            };
+            let value = self.nbt_value(tokens, at, field.ty, field.tag, key.span)?;
+            if written.iter().any(|(key, _)| *key == name) {
+                self.error(key.span, format!("'{name}' is written twice"));
+                return None;
+            }
+            written.push((name, value));
+            if !self.eat_punct(tokens, at, Punct::Comma) {
+                if !self.eat_punct(tokens, at, Punct::RBrace) {
+                    self.error(key.span, "expected ',' or '}'");
+                    return None;
+                }
+                break;
+            }
+        }
+        // A value has to be whole: a compound with a field missing would leave the
+        // binding holding something the type says cannot happen.
+        if let Some(missing) = fields
+            .iter()
+            .find(|field| !written.iter().any(|(key, _)| *key == field.nbt))
+        {
+            let (ty, name) = (self.ty(want), &missing.nbt);
+            self.error(span, format!("'{ty}' needs a value for '{name}' too"));
+            return None;
+        }
+        let body = fields
+            .iter()
+            .map(|field| {
+                let value = written
+                    .iter()
+                    .find(|(key, _)| *key == field.nbt)
+                    .map(|(_, value)| value.clone())
+                    .expect("every field is written");
+                format!("{}:{value}", field.nbt)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        Some(format!("{{{body}}}"))
+    }
+
+    fn nbt_list(
+        &mut self,
+        tokens: &[Token],
+        at: &mut usize,
+        want: Type,
+        span: Span,
+    ) -> Option<String> {
+        let Type::Vec(id) = want else {
+            let want = self.ty(want);
+            self.error(span, format!("expected {want}, found a list"));
+            return None;
+        };
+        let elem = self.types.element(id);
+        let tag = NbtTag::default_for(elem);
+        *at += 1;
+        let mut values = Vec::new();
+        while !self.eat_punct(tokens, at, Punct::RBracket) {
+            values.push(self.nbt_value(tokens, at, elem, tag, span)?);
+            if !self.eat_punct(tokens, at, Punct::Comma) {
+                if !self.eat_punct(tokens, at, Punct::RBracket) {
+                    self.error(span, "expected ',' or ']'");
+                    return None;
+                }
+                break;
+            }
+        }
+        Some(format!("[{}]", values.join(",")))
+    }
+
+    /// `20`, `-3`: an integer, which takes the suffix of the field it lands in.
+    ///
+    /// The suffix is never written: the field's type already says what tag it is
+    /// stored as, and letting both say it would let them disagree (spec section 4.18).
+    /// There is no decimal form either — the language has no float literal anywhere
+    /// (spec section 2.5), and `nbt!` is not the place to invent one.
+    fn nbt_number(
+        &mut self,
+        tokens: &[Token],
+        at: &mut usize,
+        want: Type,
+        tag: Option<NbtTag>,
+        span: Span,
+    ) -> Option<String> {
+        let negated = self.eat_punct(tokens, at, Punct::Minus);
+        let Some(TokenKind::Int(value)) = tokens.get(*at).map(|t| &t.kind) else {
+            self.error(span, "expected a number");
+            return None;
+        };
+        let value = if negated { -*value } else { *value };
+        *at += 1;
+        let Some(tag) = tag.or_else(|| NbtTag::default_for(want)) else {
+            let want = self.ty(want);
+            self.error(span, format!("expected {want}, found a number"));
+            return None;
+        };
+        if let Some(TokenKind::Ident(_)) = tokens.get(*at).map(|t| &t.kind) {
+            let keyword = tag.keyword();
+            self.error(
+                tokens[*at].span,
+                format!("no suffix here: the field is stored as a {keyword} already"),
+            );
+            return None;
+        }
+        if want == Type::Bool && !(0..=1).contains(&value) {
+            self.error(span, "a bool is 0 or 1; write true or false");
+            return None;
+        }
+        Some(format!("{value}{}", tag.suffix()))
+    }
+
+    fn eat_punct(&self, tokens: &[Token], at: &mut usize, punct: Punct) -> bool {
+        if tokens.get(*at).map(|t| &t.kind) == Some(&TokenKind::Punct(punct)) {
+            *at += 1;
+            return true;
+        }
+        false
     }
 
     /// `pos!(~ ~1 ~)`. Three coordinates, all in the same notation.
@@ -5187,6 +5428,71 @@ mod tests {
         fn an_nbt_scalar_cannot_be_assigned_a_score() {
             let errors = lower_err("struct Mob { pos: f64 } fn main() { let m = Mob { pos: 1 }; }");
             assert!(errors[0].message.contains("expected f64"), "{errors:?}");
+        }
+    }
+
+    /// `nbt!` checked against the type it lands in (spec section 4.18).
+    mod nbt_literals {
+        use super::*;
+
+        #[test]
+        fn a_field_the_type_does_not_have_is_reported() {
+            let errors = lower_err(
+                "struct Mob { hp: i32 } \
+                 fn main() { let m: Mob = nbt!({ hp: 20, rage: 3 }); }",
+            );
+            assert!(
+                errors[0].message.contains("no field written as 'rage'"),
+                "{errors:?}"
+            );
+            // The same literal without the extra field compiles, so the check above
+            // is what failed.
+            lower_ok("struct Mob { hp: i32 } fn main() { let m: Mob = nbt!({ hp: 20 }); }");
+        }
+
+        #[test]
+        fn a_missing_field_is_reported() {
+            let errors = lower_err(
+                "struct Mob { hp: i32, name: String } \
+                 fn main() { let m: Mob = nbt!({ hp: 20 }); }",
+            );
+            assert!(errors[0].message.contains("'name'"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_value_of_the_wrong_shape_is_reported() {
+            let errors =
+                lower_err("struct Mob { hp: i32 } fn main() { let m: Mob = nbt!({ hp: \"a\" }); }");
+            assert!(errors[0].message.contains("expected i32"), "{errors:?}");
+            let errors =
+                lower_err("struct Mob { hp: i32 } fn main() { let m: Mob = nbt!({ hp: [1] }); }");
+            assert!(errors[0].message.contains("expected i32"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_suffix_is_not_written() {
+            let errors = lower_err(
+                "struct Mob { weight: f64 } fn main() { let m: Mob = nbt!({ weight: 2 d }); }",
+            );
+            assert!(errors[0].message.contains("no suffix"), "{errors:?}");
+        }
+
+        #[test]
+        fn nbt_without_a_type_to_check_against_is_reported() {
+            let errors =
+                lower_err("struct Mob { hp: i32 } fn main() { let m = nbt!({ hp: 20 }); }");
+            assert!(
+                errors[0].message.contains("annotate the binding"),
+                "{errors:?}"
+            );
+        }
+
+        #[test]
+        fn a_field_written_twice_is_reported() {
+            let errors = lower_err(
+                "struct Mob { hp: i32 } fn main() { let m: Mob = nbt!({ hp: 1, hp: 2 }); }",
+            );
+            assert!(errors[0].message.contains("twice"), "{errors:?}");
         }
     }
 }
