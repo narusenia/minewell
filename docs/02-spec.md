@@ -483,6 +483,42 @@ primary     += expr "?"
   だから `enum` のバリアントも書けるが、`else` の側は `_` の腕になるので
   網羅性検査は働かない。網羅させたいなら `match` を書く
 
+### 3.19 エンティティ NBT のビュー — 確定（M9）
+
+```
+item        += {ATTRIBUTE} struct_item          // #[entity] を付けたもの
+primary     += IDENT "::" "of" "(" expr ")"
+```
+
+```rust
+/// エンティティの NBT への窓。値ではなく、パスの束。
+#[entity]
+struct Mob {
+    #[nbt(rename = "Health")] hp: Option<fix<1000>>,
+    #[nbt(rename = "Fire")]   fire: Option<i16>,
+    #[nbt(rename = "Pos")]    pos: Vec<f64>,
+}
+
+#[ctx(entity)]
+fn hurt() {
+    let mut m = Mob::of(@s);           // 0 コマンド
+    if let Some(hp) = m.hp { .. }      // data get entity @s Health 1000
+    m.fire = Some(100);                // data modify entity @s Fire set value 100s
+}
+```
+
+- **`#[entity]` を付けた `struct` は型であって値ではない。** 実行時表現を持たず、
+  セレクタと同じ「コンパイル時のみ」の分類に入る（[§5](#5-型の表現--m8-の範囲まで確定)）。
+  束縛にはできるが、渡す・返す・フィールドに持つ・`Vec` に入れることはできない
+- **`T::of(セレクタ)` がビューを作る唯一の書き方。** コマンドは 1 つも出ない
+- **セレクタは単一対象でなければならない**（`@s` / `@p` / `@r`、または `limit=1` を持つもの）。
+  バニラの `data get entity` は複数一致を黙って失敗させる。これは静的に分かる
+- `@s` を使う以上、その関数は `#[ctx(entity)]` を宣言していなければならない（§3.8）
+- **書き込みには `let mut` が要る。** 書き換わるのはエンティティであってビューではないが、
+  「書くつもりがある」ことを宣言させる規則は他の束縛と同じにする
+- ブロックの NBT（`#[block]`）は入れていない。座標のモデルが要り、
+  `positioned` / `if block` を先送りしているのと同じ理由（[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §4.4）
+
 ### 3.5 未定
 
 以降のタスクが、実装の直前に確定させる。
@@ -870,6 +906,30 @@ let m: Mob = nbt!({ Health: 20, name: "bob" });
   中身が compound の `Option` を返すことはできない（戻り値は整数 1 つ）
 - `?` は `Option<T>` を返す関数の中でだけ書ける。`None` なら**その場で関数を抜ける**
 
+### 4.20 ビューの意味論 — 確定（M9）
+
+ビューの**フィールドは場所**であり、値ではない。だから `struct` に足した仕組みが
+そのまま効く — タグは型が決め（[§4.15](#415-nbt-相互運用の数値型--確定m8)）、
+スケールは `fix<S>` が決め（[§4.16](#416-score-と-storage-の往復--確定m8)）、
+欠損は `Option` が持つ（[§4.19](#419-optiont--確定m9)）。**ビューのための新しい規則は無い。**
+
+| 式 | 意味 |
+|---|---|
+| `Mob::of(@s)` | `@s` の NBT を指すビュー。コンパイル時のみ |
+| `m.hp` | `Health` の読み。型は宣言どおり |
+| `m.hp = Some(x)` | `Health` の書き。`None` なら `data remove` |
+| `m.pos[0]` | 定数添字はパスに継ぎ足す。実行時添字はマクロ（[§6.21](#621-vect--確定m7)） |
+| `let m2 = m;` | **エラー。** ビューは別名であって値ではない。もう 1 つ要るなら `Mob::of` を書く |
+
+- **キーの綴りは検査できない。** バニラの NBT にスキーマは無く、`Health` が本当に
+  あるかどうかはコンパイル時に分からない。だから**欠けうるものは `Option` で宣言する**
+  — 宣言が唯一の情報源で、そこを間違えれば検査も間違う
+- **タグとスケールは検査できる。** `Health` を `i32` で読めばバニラは黙って切り捨てるが、
+  `fix<1000>` で宣言してあれば `data get entity @s Health 1000` になる。
+  minewell がここに立つ理由（設計原則 2）
+- **プレイヤーへの書き込みはバニラが拒む。** セレクタが誰に当たるかは静的に分からないので、
+  これは実行時の失敗として残る
+
 ## 5. 型の表現 — M8 の範囲まで確定
 
 | 型 | 置き場所 | 表現 |
@@ -884,6 +944,7 @@ let m: Mob = nbt!({ Health: 20, name: "bob" });
 | `String` | storage | NBT の `String`（[§4.17](#417-string--確定m8)） |
 | `Option<T>` | storage | 中身がそのまま。`None` は**パスが無い**（[§4.19](#419-optiont--確定m9)） |
 | `Selector` / `ResourceLocation` / `Pos` | どこにも置かない | コンパイル時のみ |
+| `#[entity] struct` のビュー | どこにも置かない | コンパイル時のみ（[§4.20](#420-ビューの意味論--確定m9)） |
 
 置き場所は **score / storage / コンパイル時のみ** の 3 分類になる。2 分類（実行時か否か）
 では `struct` が入らない — 実行時の型でありながらレジスタに乗らないため。
@@ -1674,3 +1735,43 @@ find:
   `execute store success score $ok store result score $v run function myns:find`
 - **`?` は早期 return と同じ扱い。** 生成ブロックの中では制御レジスタを立てて伝播する
   （[§6.10](#610-break--continue--return)）。`return` が抱えていた罠と同じもの
+
+### 6.29 エンティティ NBT のビュー — 確定（M9）
+
+storage のときと**同じ命令で、対象だけが違う**。
+
+```rust
+#[entity]
+struct Mob {
+    #[nbt(rename = "Health")] hp: Option<fix<1000>>,
+    #[nbt(rename = "Fire")]   fire: Option<i16>,
+}
+
+#[ctx(entity)]
+fn hurt() {
+    let mut m = Mob::of(@s);
+    if let Some(hp) = m.hp { raw!("say hurt"); }
+    m.fire = Some(100);
+    m.hp = None;
+}
+```
+
+```
+execute store success score $t0 myns.t if data entity @s Health
+execute if score $t0 myns.t matches 1 run function myns:hurt/match_0/some
+execute if score $t0 myns.t matches 0 run function myns:hurt/match_0/other
+data modify entity @s Fire set value 100s
+data remove entity @s Health
+
+hurt/match_0/some:
+  execute store result score $hurt.hp myns.v run data get entity @s Health 1000
+  say hurt
+```
+
+- **`Place` の根に `Entity(セレクタ)` を足す。** 借用（`Root::Lent`、[§6.24](#624-参照の単相化--確定m7)）と
+  同じ「場所の別名」で、値の移動は 1 度も起きない
+- **データ命令は対象を持つ。** `storage <ns>:mw <パス>` か `entity <セレクタ> <パス>` の
+  どちらかを綴るだけで、命令の種類も数も変わらない
+- コスト: ビューの作成は 0、フィールドの読みと書きはそれぞれ 1 コマンド。
+  compound のフィールドは `data modify storage … set from entity @s <パス>` で 1 コマンド
+- **セレクタはコンパイル時の文字列**なので、パスもろとも命令の字面に埋まる（設計原則 1）
