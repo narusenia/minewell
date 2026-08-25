@@ -851,11 +851,18 @@ let m: Mob = nbt!({ Health: 20, name: "bob" });
 |---|---|---|
 | `Some(e)` | `e` は実行時の値 | `Option<その型>` |
 | `None` | 文脈が中身の型を決める | `Option<T>` |
-| `o?` | `o: Option<T>`、関数の戻り値が `Option<U>` | `T` |
+| `o?` | `o: Option<T>`（`T` は score に載る型）、関数の戻り値が `Option<U>` | `T` |
 | `if let Some(x) = o { .. }` | `o: Option<T>` | `x: T` はブロックの中だけ |
 | `match o { Some(x) => .., None => .. }` | 両方の腕が要る | — |
 
 - **`Option<Option<T>>` は書けない。** パスの有無は 1 段しか区別できない
+- **`?` はレジスタに開ける。** だから中身は score に載る型（`i32` / `bool` / `fix<S>`）で
+  なければならない。compound の `Option` は `match` で開ける
+- **`match` と `if let` の対象は場所でなくてよい** — `Option` を返す呼び出しは
+  そのまま書ける（`match find(m) { Some(v) => .. }`）。`enum` が場所を要求するのは
+  compound を照合するからで、`Option` の判定は成功フラグ 1 つだから
+- **欠けうるフィールドは型に書く。** `#[nbt(optional)] hp: i32` ではなく
+  `hp: Option<i32>`。属性と型の両方に書かせると食い違える（[§4.15](#415-nbt-相互運用の数値型--確定m8) と同じ理由）
 - `Option<T>` は storage に置く。中身が score の型（`i32` など）でも同じで、
   「無い」を score で表す方法が無いため
 - **関数の戻り値としての `Option<T>` だけは別**（[§6.28](#628-optiont--確定m9)）。
