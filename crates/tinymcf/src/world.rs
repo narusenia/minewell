@@ -58,6 +58,11 @@ impl World {
         );
     }
 
+    /// An entity's NBT, for a test to arrange or to check.
+    pub fn entity_mut(&mut self, id: &str) -> Option<&mut Entity> {
+        self.entities.get_mut(id)
+    }
+
     pub fn entity(&self, id: &str) -> Option<&Entity> {
         self.entities.get(id)
     }

@@ -760,7 +760,35 @@ impl Interpreter {
     fn read_target(&self, target: &Target) -> Result<NbtValue, ReadError> {
         match target {
             Target::Storage(id) => Ok(self.world.storage(id).clone()),
+            Target::Entity(selector) => {
+                let id = self.one_entity(selector)?;
+                Ok(self
+                    .world
+                    .entity(&id)
+                    .expect("the selector found it")
+                    .nbt
+                    .clone())
+            }
             other => Err(Some(unmodelled(other))),
+        }
+    }
+
+    /// The one entity a data command may point at.
+    ///
+    /// Vanilla refuses `data` on anything but a single entity. Finding nobody is an
+    /// ordinary answer — a condition asking about an entity that is not there is
+    /// false, not wrong — while finding several is the mistake the source language
+    /// rejects before it can happen (SPEC.md section 4.2).
+    fn one_entity(&self, selector: &str) -> Result<String, ReadError> {
+        let found = self
+            .world
+            .resolve(selector, self.context.executor.as_deref());
+        match found.len() {
+            1 => Ok(found.into_iter().next().expect("one")),
+            0 => Err(None),
+            n => Err(Some(format!(
+                "'{selector}' found {n} entities, and data takes exactly one"
+            ))),
         }
     }
 
@@ -771,6 +799,13 @@ impl Interpreter {
     ) -> Outcome {
         match target {
             Target::Storage(id) => f(self.world.storage_mut(id)),
+            Target::Entity(selector) => match self.one_entity(selector) {
+                Err(error) => self.failed_read(error),
+                Ok(id) => {
+                    let entity = self.world.entity_mut(&id).expect("the selector found it");
+                    f(&mut entity.nbt)
+                }
+            },
             other => {
                 let message = unmodelled(other);
                 self.fail(message)
@@ -1167,6 +1202,61 @@ mod data_tests {
     }
 
     #[test]
+    fn entity_data_reads_and_writes_the_entity_it_finds() {
+        let mut it = Interpreter::default();
+        it.world.spawn("zombie-1", [0.0, 64.0, 0.0]).nbt =
+            crate::snbt::parse("{Health:18.0f}").expect("snbt");
+        it.world
+            .bind_selector("@e[type=zombie,limit=1]", ["zombie-1"]);
+
+        let out = it.run_line("data get entity @e[type=zombie,limit=1] Health 1000");
+        assert_eq!(out, Outcome::ok(18000));
+
+        let out = it.run_line("data modify entity @e[type=zombie,limit=1] Fire set value 100s");
+        assert_eq!(out, Outcome::ok(1));
+        assert_eq!(
+            it.world.entity("zombie-1").expect("spawned").nbt,
+            crate::snbt::parse("{Health:18.0f,Fire:100s}").expect("snbt")
+        );
+        assert!(it.diagnostics.is_empty(), "{:?}", it.diagnostics);
+    }
+
+    #[test]
+    fn entity_data_takes_exactly_one_entity() {
+        let mut it = Interpreter::default();
+        it.world.spawn("a", [0.0, 0.0, 0.0]);
+        it.world.spawn("b", [0.0, 0.0, 0.0]);
+        it.world.bind_selector("@e[type=zombie]", ["a", "b"]);
+
+        // Several is the mistake the source language rejects; say so if it gets here.
+        let out = it.run_line("data get entity @e[type=zombie] Health");
+        assert_eq!(out, Outcome::FAILED);
+        assert!(
+            it.diagnostics[0].contains("exactly one"),
+            "{:?}",
+            it.diagnostics
+        );
+
+        // Nobody there is an ordinary answer, the same as a path that is not there.
+        it.diagnostics.clear();
+        let out = it.run_line("data get entity @e[type=creeper] Health");
+        assert_eq!(out, Outcome::FAILED);
+        assert!(it.diagnostics.is_empty(), "{:?}", it.diagnostics);
+    }
+
+    #[test]
+    fn a_condition_about_an_entity_is_just_false_when_there_is_none() {
+        let mut it = Interpreter::default();
+        it.world.spawn("zombie-1", [0.0, 64.0, 0.0]);
+        it.world
+            .bind_selector("@e[type=zombie,limit=1]", ["zombie-1"]);
+
+        let out = it.run_line("execute if data entity @e[type=zombie,limit=1] Health");
+        assert_eq!(out, Outcome::FAILED);
+        assert!(it.diagnostics.is_empty(), "{:?}", it.diagnostics);
+    }
+
+    #[test]
     fn copying_from_a_path_that_is_not_there_says_nothing() {
         // `data modify ... set from <missing>` leaves the target alone and reports
         // failure. That silence is what lets an option be copied.
@@ -1274,18 +1364,15 @@ mod data_tests {
     }
 
     #[test]
-    fn entity_and_block_targets_parse_but_say_they_are_not_modelled() {
-        let (it, out) = run(&["data get entity @s Health"]);
-        assert_eq!(out, Outcome::FAILED);
-        assert!(
-            it.diagnostics[0].contains("not modelled"),
-            "{:?}",
-            it.diagnostics
-        );
-
+    fn block_targets_parse_but_say_they_are_not_modelled() {
         let (it, out) = run(&["data get block 0 0 0 Items"]);
         assert_eq!(out, Outcome::FAILED);
         assert!(it.diagnostics[0].contains("not modelled"));
+
+        // An entity target with no executor finds nobody, which is an answer.
+        let (it, out) = run(&["data get entity @s Health"]);
+        assert_eq!(out, Outcome::FAILED);
+        assert!(it.diagnostics.is_empty(), "{:?}", it.diagnostics);
     }
 }
 

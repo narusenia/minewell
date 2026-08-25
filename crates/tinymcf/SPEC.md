@@ -16,7 +16,8 @@ measurable in a unit test.
 
 Explicit non-goals:
 
-- Being a Minecraft server. There is no world, no entities, no blocks, no ticks.
+- Being a Minecraft server. There is no world and no ticks. An entity is a name, a
+  position and a compound of NBT — enough to be an executor and to be read from.
 - Command coverage for its own sake. Only what a compiler needs to prove its output.
 - Byte-compatible NBT serialisation. The in-memory model and SNBT are the interface.
 
@@ -203,10 +204,23 @@ operation := set value <nbt>
 target    := storage <id> | entity <selector> | block <pos>
 ```
 
-**Only `storage` targets execute.** `entity` and `block` parse, so that a compiler's
-output is still recognised, but running one fails with a diagnostic saying so. There is
-no world here (§1); registering stub entity NBT is deferred to the task that first
-needs it.
+**`storage` and `entity` targets execute; `block` parses and fails with a diagnostic
+saying it is not modelled** — a block target needs a coordinate model, which nothing
+has needed yet (§4.4).
+
+An entity target names **exactly one entity**, as in vanilla. The harness says what a
+selector finds (§4.4), and the entity's NBT is whatever the harness put there:
+
+```rust
+world.spawn("zombie-1", [0.0, 64.0, 0.0]).nbt = snbt::parse("{Health:18.0f}")?;
+world.bind_selector("@e[type=zombie,limit=1]", ["zombie-1"]);
+```
+
+- Finding **nobody** fails and records no diagnostic. It is an ordinary answer, the
+  same as a path that is not there: a condition about an entity that is not there is
+  false, not wrong.
+- Finding **several** fails *with* a diagnostic. Vanilla refuses it too, and a compiler
+  is expected to have rejected the selector before emitting the command.
 
 `data get` with a path returns, scaled by `scale` (default 1.0) and floored:
 
@@ -345,7 +359,7 @@ Substitution renders a value as vanilla does: a string inserts its characters wi
 quotes, an integer or a decimal inserts its number with no tag suffix, and anything
 else inserts its SNBT.
 
-`with entity` and `with block` parse and fail, like every other entity target (§4.2).
+`with entity` and `with block` parse and fail: macro arguments come from storage.
 
 ### 4.6 Side-effecting commands — **done**
 
