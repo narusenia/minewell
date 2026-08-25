@@ -2151,3 +2151,84 @@ mod views {
         assert_eq!(local(&mc, "main", "x"), Some(1500));
     }
 }
+
+/// Checks that only a debug build carries (spec section 6.30).
+mod checks {
+    use super::harness::{NS, load_with, local, run};
+    use mwlc::emit::Profile;
+
+    fn run_in(src: &str, profile: Profile) -> tinymcf::Interpreter {
+        let mut mc = load_with(src, profile);
+        mc.call(&format!("{NS}:main"));
+        mc
+    }
+
+    #[test]
+    fn a_failing_assertion_says_where_it_was() {
+        let mc = run_in(
+            r#"fn main() { let hp = 0; debug_assert!(hp > 0, "hp went negative"); }"#,
+            Profile::Debug,
+        );
+        let said: Vec<&str> = mc
+            .effects
+            .iter()
+            .filter(|e| e.name == "tellraw")
+            .map(|e| e.args.as_str())
+            .collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("hp went negative"), "{said:?}");
+        assert!(said[0].contains("test.mwl:1"), "{said:?}");
+    }
+
+    #[test]
+    fn an_assertion_that_holds_says_nothing() {
+        let mc = run_in(
+            r#"fn main() { let hp = 5; debug_assert!(hp > 0, "hp went negative"); }"#,
+            Profile::Debug,
+        );
+        assert!(mc.effects.is_empty(), "{:?}", mc.effects);
+    }
+
+    #[test]
+    fn a_release_build_spends_nothing_on_a_check() {
+        // Not "no tellraw in the output": no commands at all. The condition is not
+        // evaluated either.
+        let mc = run_in(
+            r#"fn main() { let hp = 0; debug_assert!(hp > 0, "hp went negative"); }"#,
+            Profile::Release,
+        );
+        assert!(mc.effects.is_empty(), "{:?}", mc.effects);
+        assert_eq!(mc.commands_run, 1, "only the `let` should be left");
+    }
+
+    #[test]
+    fn expect_reads_the_value_and_reports_when_there_is_none() {
+        let mc = run(r#"struct Mob { hp: Option<i32> }
+               fn main() { let full = Mob { hp: Some(7) }; let empty = Mob { hp: None };
+                           let x = full.hp.expect("always there");
+                           let y = empty.hp.expect("gone"); }"#);
+        assert_eq!(local(&mc, "main", "x"), Some(7));
+        let said: Vec<&str> = mc
+            .effects
+            .iter()
+            .filter(|e| e.name == "tellraw")
+            .map(|e| e.args.as_str())
+            .collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("gone"), "{said:?}");
+    }
+
+    #[test]
+    fn a_release_expect_just_reads() {
+        let mc = run_in(
+            r#"struct Mob { hp: Option<i32> }
+               fn main() { let m = Mob { hp: Some(7) };
+                           let x = m.hp.expect("always there"); }"#,
+            Profile::Release,
+        );
+        assert!(mc.effects.is_empty(), "{:?}", mc.effects);
+        assert_eq!(local(&mc, "main", "x"), Some(7));
+        // `set value` for the compound, the read, and the copy into `x`.
+        assert_eq!(mc.commands_run, 1 + 2 + 1);
+    }
+}

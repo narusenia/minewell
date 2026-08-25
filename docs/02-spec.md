@@ -521,6 +521,25 @@ fn hurt() {
 - ブロックの NBT（`#[block]`）は入れていない。座標のモデルが要り、
   `positioned` / `if block` を先送りしているのと同じ理由（[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §4.4）
 
+### 3.20 `debug_assert!` と `expect` — 確定（M9）
+
+```
+stmt        += assert_stmt
+assert_stmt := "debug_assert" "!" "(" expr ["," STRING] ")" ";"
+primary     += expr "." "expect" "(" STRING ")"
+```
+
+```rust
+debug_assert!(hp > 0, "hp went negative");
+let v = maybe?.expect("the arena always has a keeper");
+```
+
+- **メッセージはリテラルだけ。** 実行時の値を混ぜるのは `text!` の仕事（[§10.3](#103-text-の仕様)）で、
+  そこまで待つ
+- `expect` は `Option<T>` にだけ書ける。値を返し、**無かったときに報告する**
+- **release では消える。** 文そのものが lowering されないので、条件のために
+  取るはずだったテンポラリも生まれない（要件定義 §15）
+
 ### 3.5 未定
 
 以降のタスクが、実装の直前に確定させる。
@@ -947,6 +966,22 @@ let m: Mob = nbt!({ Health: 20, name: "bob" });
   minewell がここに立つ理由（設計原則 2）
 - **プレイヤーへの書き込みはバニラが拒む。** セレクタが誰に当たるかは静的に分からないので、
   これは実行時の失敗として残る
+
+### 4.21 `debug_assert!` と `expect` の意味論 — 確定（M9）
+
+| 式 | debug | release |
+|---|---|---|
+| `debug_assert!(c)` | `c` が偽なら `tellraw @a` で報告 | 何も出ない |
+| `debug_assert!(c, "m")` | 同上、`m` を添えて | 何も出ない |
+| `o.expect("m")` | `o` の中身。無ければ報告 | `o` の中身。検査は無い |
+
+- `debug_assert!` の条件は `bool`
+- `expect` の受け手は `Option<T>`、結果は `T`。**中身は score に載る型に限る**
+  （`?` と同じ理由。[§4.19](#419-optiont--確定m9)）
+- **報告は場所を含む**（`src/arena.mwl:42`）。debug ビルドが行番号コメントを入れるのと
+  同じ仕組みで、span から作る（要件定義 §15）
+- **止まらない。** バニラに「実行を中断する」手段は無く、`return` で抜けても
+  呼び出し元は進む。報告するだけで、値はそのまま流れる
 
 ## 5. 型の表現 — M8 の範囲まで確定
 
@@ -1793,3 +1828,24 @@ hurt/match_0/some:
 - コスト: ビューの作成は 0、フィールドの読みと書きはそれぞれ 1 コマンド。
   compound のフィールドは `data modify storage … set from entity @s <パス>` で 1 コマンド
 - **セレクタはコンパイル時の文字列**なので、パスもろとも命令の字面に埋まる（設計原則 1）
+
+### 6.30 `debug_assert!` と `expect` — 確定（M9）
+
+```rust
+fn hurt(hp: i32) {
+    debug_assert!(hp > 0, "hp went negative");
+}
+```
+
+```
+execute unless score $hurt.hp myns.v matches 1.. run tellraw @a \
+    {"text":"minewell: src/arena.mwl:2 hp went negative","color":"red"}
+```
+
+- **条件はそのまま `execute unless`。** `if` の条件と同じ lowering を使い、
+  否定して 1 つのガードにする（[§6.7](#67-条件)）
+- `o.expect("m")` は `?`（[§6.28](#628-optiont--確定m9)）から早期 return を抜いたもの:
+  在るかを 1 コマンドで聞き、debug ならその答えが 0 のときに報告し、値を読む
+- **release では文ごと消える。** MIR に降りる前に落とすので、条件の評価も
+  テンポラリの確保も起きない。「release 出力に assert 由来のコマンドが無い」は
+  出力を grep するのではなく、**コマンド数が 0 であること**で確かめられる

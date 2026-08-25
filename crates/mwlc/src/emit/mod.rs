@@ -170,7 +170,7 @@ fn function_body(function: &Function, options: &Options, namespace: &str) -> Str
             {
                 out.push_str(&comment);
             }
-            out.push_str(&command(inst, namespace));
+            out.push_str(&command(inst, namespace, options));
             out.push('\n');
         }
     }
@@ -179,7 +179,7 @@ fn function_body(function: &Function, options: &Options, namespace: &str) -> Str
 
 /// One instruction, one command. This is what makes a function's cost countable
 /// before it is written out.
-fn command(inst: &Inst, ns: &str) -> String {
+fn command(inst: &Inst, ns: &str, options: &Options) -> String {
     match inst {
         Inst::Raw { text, .. } => text.clone(),
         Inst::Const { dst, value } => {
@@ -255,14 +255,14 @@ fn command(inst: &Inst, ns: &str) -> String {
             let (d, dobj) = (&dst.holder, objective(ns, dst));
             format!(
                 "execute store result score {d} {dobj} run {}",
-                command(inst, ns)
+                command(inst, ns, options)
             )
         }
         Inst::Get { src } => {
             let (s, sobj) = (&src.holder, objective(ns, src));
             format!("scoreboard players get {s} {sobj}")
         }
-        Inst::ReturnRun { inst } => format!("return run {}", command(inst, ns)),
+        Inst::ReturnRun { inst } => format!("return run {}", command(inst, ns, options)),
         Inst::PushFrame => format!("data modify storage {ns}:mw mw.stack append value {{}}"),
         Inst::PopFrame => format!("data remove storage {ns}:mw mw.stack[-1]"),
         Inst::Save { reg, slot } => {
@@ -308,7 +308,7 @@ fn command(inst: &Inst, ns: &str) -> String {
         Inst::CallWithArgs { path } => format!("function {path} with storage {ns}:mw mw.args"),
         // The `$` is what makes the line a macro line; vanilla substitutes the
         // arguments before parsing what follows.
-        Inst::Macro { inst } => format!("${}", command(inst, ns)),
+        Inst::Macro { inst } => format!("${}", command(inst, ns, options)),
         Inst::CopyData { dst, src } => {
             format!(
                 "data modify {} set from {}",
@@ -320,7 +320,7 @@ fn command(inst: &Inst, ns: &str) -> String {
             format!(
                 "execute store result {} {tag} 1 run {}",
                 target(path, ns),
-                command(inst, ns)
+                command(inst, ns, options)
             )
         }
         // The register holds `scale`ths of a unit, so storage takes the reciprocal.
@@ -335,17 +335,29 @@ fn command(inst: &Inst, ns: &str) -> String {
             format!(
                 "execute store result {} {tag} {factor} run {}",
                 target(path, ns),
-                command(inst, ns)
+                command(inst, ns, options)
             )
         }
         Inst::Return { value } => format!("return {value}"),
         Inst::ReturnFail => "return fail".to_owned(),
+        // The location comes from the span, the same way the source comments do
+        // (spec section 6.30).
+        Inst::Report { message, span } => {
+            let at = match source_at(options, *span) {
+                Some(at) => format!("{at} "),
+                None => String::new(),
+            };
+            format!(
+                "tellraw @a {{\"text\":\"minewell: {at}{}\",\"color\":\"red\"}}",
+                escape_json(message)
+            )
+        }
         Inst::StoreBoth { ok, dst, inst } => {
             let (o, oobj) = (&ok.holder, objective(ns, ok));
             let (d, dobj) = (&dst.holder, objective(ns, dst));
             format!(
                 "execute store success score {o} {oobj} store result score {d} {dobj} run {}",
-                command(inst, ns)
+                command(inst, ns, options)
             )
         }
         Inst::StoreCond { dst, cond } => {
@@ -373,7 +385,11 @@ fn command(inst: &Inst, ns: &str) -> String {
             )
         }
         Inst::Guarded { cond, inst } => {
-            format!("execute {} run {}", condition(cond, ns), command(inst, ns))
+            format!(
+                "execute {} run {}",
+                condition(cond, ns),
+                command(inst, ns, options)
+            )
         }
         Inst::Otherwise { path, tags, inst } => {
             let clauses = tags
@@ -381,14 +397,14 @@ fn command(inst: &Inst, ns: &str) -> String {
                 .map(|tag| format!("unless data {}{{tag:\"{tag}\"}}", target(path, ns)))
                 .collect::<Vec<_>>()
                 .join(" ");
-            format!("execute {clauses} run {}", command(inst, ns))
+            format!("execute {clauses} run {}", command(inst, ns, options))
         }
         Inst::Context { clause, inst } => {
             let clause = match clause {
                 ExecuteAs::As(selector) => format!("as {selector}"),
                 ExecuteAs::At(selector) => format!("at {selector}"),
             };
-            format!("execute {clause} run {}", command(inst, ns))
+            format!("execute {clause} run {}", command(inst, ns, options))
         }
     }
 }
@@ -492,6 +508,13 @@ fn source_comment(options: &Options, span: Span) -> Option<String> {
     Some(format!("# {}:{line}\n", source.path))
 }
 
+/// `src/arena.mwl:42`, when the build was given its source.
+fn source_at(options: &Options, span: Span) -> Option<String> {
+    let source = options.source.as_ref()?;
+    let line = line_of(&source.text, span.start);
+    Some(format!("{}:{line}", source.path))
+}
+
 fn line_of(text: &str, offset: usize) -> usize {
     text[..offset.min(text.len())]
         .bytes()
@@ -519,7 +542,10 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         let (hir, errors) = crate::hir::lower(&file, "myns", None);
         assert!(errors.is_empty(), "{errors:?}");
-        emit(&crate::mir::lower(&hir), options)
+        emit(
+            &crate::mir::lower(&hir, options.profile == Profile::Debug),
+            options,
+        )
     }
 
     fn release() -> Options {

@@ -786,6 +786,13 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
+    /// `debug_assert!(c, "m")`: nothing at all in a release build
+    /// (spec section 6.30).
+    Assert {
+        cond: Expr,
+        message: Option<String>,
+        span: Span,
+    },
     /// `v.push(e)`.
     Push {
         place: Place,
@@ -946,6 +953,11 @@ pub enum ExprKind {
     Some(Box<Expr>),
     /// `o?`: the value, having left the function already if there was none.
     Try(Box<Expr>),
+    /// `o.expect("m")`: the value, and in a debug build a report when there was none.
+    Expect {
+        value: Box<Expr>,
+        message: String,
+    },
     /// `Mob::of(@s)`: a name for an entity's NBT. Never lowered — the binding it goes
     /// into is an alias, and the fields are what get read (spec section 6.29).
     View(Place),
@@ -2211,6 +2223,14 @@ impl FnLowering<'_> {
     fn stmt(&mut self, stmt: &ast::Stmt) -> Option<Stmt> {
         match stmt {
             ast::Stmt::Let(let_stmt) => self.let_stmt(let_stmt),
+            ast::Stmt::Expr(AstExpr::Assert(assert)) => {
+                let cond = self.condition(&assert.cond)?;
+                Some(Stmt::Assert {
+                    cond,
+                    message: assert.message.clone(),
+                    span: assert.span,
+                })
+            }
             ast::Stmt::Expr(AstExpr::Macro(call)) => self.macro_call(call).map(Stmt::Raw),
             ast::Stmt::Expr(AstExpr::Assign(assign)) => self.assign(assign),
             ast::Stmt::Expr(AstExpr::Method(call)) => self.method(call, true),
@@ -3227,6 +3247,40 @@ impl FnLowering<'_> {
         if let Some(target) = Type::parse(call.name.name.strip_prefix("as_").unwrap_or("")) {
             return Some(MethodOutcome::Value(self.convert(place, target, call)?));
         }
+        // `expect` unwraps an option and, in a debug build, says so when there was
+        // nothing to unwrap (spec section 4.21).
+        if let Type::Option(id) = place.ty
+            && call.name.name == "expect"
+        {
+            let inner = self.types.inner(id);
+            let [ast::Expr::Str(message)] = call.args.as_slice() else {
+                self.error(call.span, "'expect' takes one message, as a string literal");
+                return None;
+            };
+            if inner.is_storage() {
+                let found = self.ty(inner);
+                self.error(
+                    call.span,
+                    format!(
+                        "'expect' unwraps into a register, and a {found} does not fit \
+                             in one; match on it instead"
+                    ),
+                );
+                return None;
+            }
+            return Some(MethodOutcome::Value(Expr {
+                kind: ExprKind::Expect {
+                    value: Box::new(Expr {
+                        ty: place.ty,
+                        kind: ExprKind::Field(place),
+                        span: call.span,
+                    }),
+                    message: message.value.clone(),
+                },
+                ty: inner,
+                span: call.span,
+            }));
+        }
         if place.ty == Type::Str {
             return self.string_method(place, call).map(MethodOutcome::Value);
         }
@@ -3510,6 +3564,10 @@ impl FnLowering<'_> {
                     kind: ExprKind::Try(Box::new(value)),
                     span,
                 })
+            }
+            AstExpr::Assert(_) => {
+                self.error(span, "'debug_assert!' is a statement and produces no value");
+                None
             }
             AstExpr::ViewOf(view) => self.view_of(view, span),
             AstExpr::Range(range) => {

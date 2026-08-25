@@ -227,7 +227,8 @@ pub fn compile_into(
         return Err(report);
     }
 
-    let pack = emit::emit(&crate::mir::lower(&hir), options);
+    let debug = options.profile == Profile::Debug;
+    let pack = emit::emit(&crate::mir::lower(&hir, debug), options);
     let unresolved = unresolved_references(&hir, &pack, existing);
     if let Some(report) = Report::of(shown, text, unresolved) {
         return Err(report);

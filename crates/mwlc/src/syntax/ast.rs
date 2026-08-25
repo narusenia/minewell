@@ -288,6 +288,16 @@ pub enum Expr {
     Try(TryExpr),
     /// `Mob::of(@s)`: a view of an entity's NBT (spec section 3.19).
     ViewOf(ViewOfExpr),
+    /// `debug_assert!(c, "m")`: a check that only debug builds carry
+    /// (spec section 3.20).
+    Assert(AssertExpr),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertExpr {
+    pub cond: Box<Expr>,
+    pub message: Option<String>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -406,6 +416,7 @@ impl Expr {
             Expr::Range(e) => e.span,
             Expr::Try(e) => e.span,
             Expr::ViewOf(e) => e.span,
+            Expr::Assert(e) => e.span,
             Expr::Bool(e) => e.span,
             Expr::Str(e) => e.span,
             Expr::Path(e) => e.span,

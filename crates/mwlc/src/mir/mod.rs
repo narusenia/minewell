@@ -146,6 +146,9 @@ pub enum Inst {
         scale: u32,
         inst: Box<Inst>,
     },
+    /// `tellraw @a` naming where it came from: what a check says when it fails
+    /// (spec section 6.30). Only debug builds ever hold one.
+    Report { message: String, span: Span },
     /// `return fail`: what returning `None` is (spec section 6.28).
     ReturnFail,
     /// `execute store success score <ok> store result score <dst> run <inst>`: both
@@ -502,9 +505,13 @@ enum Value {
     Reg(Reg),
 }
 
-pub fn lower(hir: &Hir) -> Mir {
+/// `debug` says whether the checks that exist only to catch mistakes are lowered at
+/// all: `debug_assert!` and `expect` (requirements section 15). A release build drops
+/// the statement rather than the command, so nothing is spent on evaluating it either.
+pub fn lower(hir: &Hir, debug: bool) -> Mir {
     let components = strongly_connected(hir);
     let mut program = Program {
+        debug,
         functions: &hir.functions,
         types: &hir.types,
         components,
@@ -606,6 +613,8 @@ impl Temps {
 
 /// State shared by every block of one program.
 struct Program<'a> {
+    /// Whether the build carries its checks (spec section 6.30).
+    debug: bool,
     functions: &'a [hir::Function],
     types: &'a Types,
     /// Which strongly connected component each function belongs to. Two functions in
@@ -958,6 +967,26 @@ impl<'p> Lowering<'_, 'p> {
                 self.store_struct(&path.into(), value);
                 self.program.initialised.push(*local);
             }
+            // A check the release build does not carry is not lowered at all: the
+            // condition is never evaluated, so no temporary is taken for it.
+            hir::Stmt::Assert {
+                cond,
+                message,
+                span,
+            } if self.program.debug => {
+                let cond = self.cond(cond).negate();
+                let message = message
+                    .clone()
+                    .unwrap_or_else(|| "assertion failed".to_owned());
+                self.insts.push(Inst::Guarded {
+                    cond,
+                    inst: Box::new(Inst::Report {
+                        message,
+                        span: *span,
+                    }),
+                });
+            }
+            hir::Stmt::Assert { .. } => {}
             hir::Stmt::Push { place, value, .. } => self.push_into(place, value),
             // Anything addressed through a step, and any composite, is in storage.
             hir::Stmt::Assign {
@@ -2670,6 +2699,31 @@ impl<'p> Lowering<'_, 'p> {
             hir::ExprKind::ReadScaled { place, scale } => {
                 let dst = self.temps_next();
                 self.read_place_scaled(dst.clone(), place, *scale);
+                Value::Reg(dst)
+            }
+            // `expect` is `?` without the leaving: ask, say so in a debug build, read.
+            hir::ExprKind::Expect { value, message } => {
+                let path = option_path(self.function, value).expect("an option this can read");
+                if self.program.debug {
+                    let present = self.present_at(&path);
+                    self.insts.push(Inst::Guarded {
+                        cond: Cond::Matches {
+                            src: present,
+                            min: Some(0),
+                            max: Some(0),
+                            negated: false,
+                        },
+                        inst: Box::new(Inst::Report {
+                            message: message.clone(),
+                            span: expr.span,
+                        }),
+                    });
+                }
+                let dst = self.temps_next();
+                self.insts.push(Inst::StoreResult {
+                    dst: dst.clone(),
+                    inst: Box::new(Inst::GetData { path }),
+                });
                 Value::Reg(dst)
             }
             hir::ExprKind::Try(inner) => {

@@ -7,7 +7,7 @@
 //! are for reviewing the shape of output; this is for deciding whether it is right.
 
 use mwlc::driver;
-use mwlc::emit::{Options, Source};
+use mwlc::emit::{Options, Profile, Source};
 use tinymcf::Interpreter;
 use tinymcf::nbt::NbtValue;
 use tinymcf::path::NbtPath;
@@ -20,7 +20,13 @@ pub const NS: &str = "test";
 /// Compiles in debug profile on purpose: the source-line comments it inserts must not
 /// change what the pack does, and running it here is what proves that.
 pub fn load(src: &str) -> Interpreter {
+    load_with(src, Profile::Debug)
+}
+
+/// The same, in the profile named: a release build carries no checks.
+pub fn load_with(src: &str, profile: Profile) -> Interpreter {
     let options = Options {
+        profile,
         source: Some(Source {
             path: "test.mwl".to_owned(),
             text: src.to_owned(),

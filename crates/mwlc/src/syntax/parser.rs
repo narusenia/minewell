@@ -1208,6 +1208,35 @@ impl Parser {
     fn macro_call(&mut self, name: Ident) -> Option<Expr> {
         let start = name.span.start;
         self.expect(Punct::Bang, "!")?;
+        // `debug_assert!` takes an expression, not a token soup: it is a check
+        // written in the language (spec section 3.20).
+        if name.name == "debug_assert" {
+            self.expect(Punct::LParen, "(")?;
+            let cond = self.expr()?;
+            let message = match self.eat_punct(Punct::Comma) {
+                false => None,
+                true => match self.peek() {
+                    Some(TokenKind::Str(text)) => {
+                        let text = text.clone();
+                        self.bump();
+                        Some(text)
+                    }
+                    _ => {
+                        self.error("a message is a string literal");
+                        return None;
+                    }
+                },
+            };
+            self.expect(Punct::RParen, ")")?;
+            return Some(Expr::Assert(AssertExpr {
+                cond: Box::new(cond),
+                message,
+                span: Span {
+                    start,
+                    end: self.previous_end(),
+                },
+            }));
+        }
         let open = match self.peek() {
             Some(TokenKind::Punct(p @ (Punct::LParen | Punct::LBracket | Punct::LBrace))) => *p,
             _ => {
