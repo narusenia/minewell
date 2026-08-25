@@ -210,20 +210,32 @@ impl Parser {
         })
     }
 
-    /// `<T, U>` after a name. Empty when there are none.
-    fn generics(&mut self) -> Option<Vec<Ident>> {
-        let mut names = Vec::new();
+    /// `<T, const S: i32>` after a name. Empty when there are none.
+    fn generics(&mut self) -> Option<Vec<GenericParam>> {
+        let mut params = Vec::new();
         if !self.eat_punct(Punct::Lt) {
-            return Some(names);
+            return Some(params);
         }
         while self.peek() != Some(&TokenKind::Punct(Punct::Gt)) {
-            names.push(self.ident()?);
+            let is_const = self.eat_keyword(Keyword::Const);
+            let name = self.ident()?;
+            // A const parameter is always a scale, so `i32` is the only type it can
+            // have (spec section 3.16). Written out anyway, to read as Rust does.
+            if is_const {
+                self.expect(Punct::Colon, ":")?;
+                let ty = self.ident()?;
+                if ty.name != "i32" {
+                    self.error("a const parameter is a scale, so its type is i32");
+                    return None;
+                }
+            }
+            params.push(GenericParam { name, is_const });
             if !self.eat_punct(Punct::Comma) {
                 break;
             }
         }
         self.expect(Punct::Gt, ">")?;
-        Some(names)
+        Some(params)
     }
 
     fn field_def(&mut self) -> Option<FieldDef> {
@@ -305,9 +317,14 @@ impl Parser {
         };
         let name = self.ident()?.name;
         let mut args = Vec::new();
+        let mut scale = None;
         // `Vec<i32>`. Only types take angle brackets, so there is no ambiguity with
         // the comparison operators here.
-        if self.eat_punct(Punct::Lt) {
+        if name == "fix" {
+            self.expect(Punct::Lt, "<")?;
+            scale = Some(self.scale_arg()?);
+            self.expect(Punct::Gt, ">")?;
+        } else if self.eat_punct(Punct::Lt) {
             while self.peek() != Some(&TokenKind::Punct(Punct::Gt)) {
                 args.push(self.type_name()?);
                 if !self.eat_punct(Punct::Comma) {
@@ -321,8 +338,26 @@ impl Parser {
             borrow,
             name,
             args,
+            scale,
             span: Span { start, end },
         })
+    }
+
+    /// The `1000` of `fix<1000>`, or the name of a const parameter.
+    fn scale_arg(&mut self) -> Option<ScaleArg> {
+        let span = self.span();
+        match self.peek() {
+            Some(TokenKind::Int(value)) => {
+                let value = *value;
+                self.bump();
+                Some(ScaleArg::Int(IntLit { value, span }))
+            }
+            Some(TokenKind::Ident(_)) => Some(ScaleArg::Param(self.ident()?)),
+            _ => {
+                self.error("a scale is an integer, as in 'fix<1000>'");
+                None
+            }
+        }
     }
 
     fn eat_punct(&mut self, punct: Punct) -> bool {
@@ -922,6 +957,11 @@ impl Parser {
                     // `State::Idle`, with or without a payload.
                     Some(TokenKind::Punct(Punct::ColonColon)) => {
                         self.bump();
+                        // `fix::<1000>(1500)`. Angle brackets after `::` are the one
+                        // turbofish the language has (spec section 3.16).
+                        if self.peek() == Some(&TokenKind::Punct(Punct::Lt)) {
+                            return self.fix_cast(name);
+                        }
                         let variant = self.ident()?;
                         if self.peek() == Some(&TokenKind::Punct(Punct::LBrace))
                             && !self.no_struct_lit
@@ -947,6 +987,30 @@ impl Parser {
                 None
             }
         }
+    }
+
+    /// `fix::<1000>(1500)`, from the `<` onwards.
+    fn fix_cast(&mut self, name: Ident) -> Option<Expr> {
+        if name.name != "fix" {
+            // Type arguments are never written at a call: they follow from the
+            // arguments (spec section 3.14).
+            self.error("only 'fix' takes an argument in angle brackets here");
+            return None;
+        }
+        self.expect(Punct::Lt, "<")?;
+        let scale = self.scale_arg()?;
+        self.expect(Punct::Gt, ">")?;
+        self.expect(Punct::LParen, "(")?;
+        let value = self.expr()?;
+        self.expect(Punct::RParen, ")")?;
+        Some(Expr::Fix(FixExpr {
+            scale,
+            value: Box::new(value),
+            span: Span {
+                start: name.span.start,
+                end: self.previous_end(),
+            },
+        }))
     }
 
     fn call(&mut self, callee: Ident) -> Option<Expr> {

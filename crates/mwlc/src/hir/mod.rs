@@ -46,10 +46,20 @@ pub struct EnumId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VecId(pub u32);
 
+/// The scale of a `fix<S>`: a number, or the const parameter that will become one
+/// (spec section 3.16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Scale {
+    Const(u32),
+    Param(u32),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Type {
     I32,
     Bool,
+    /// Fixed point: an integer on the scoreboard, holding `S`ths of a unit.
+    Fix(Scale),
     /// A compile-time selector. It has no runtime representation: the only thing that
     /// can be done with one is hand it to `as`, `at` or `for`.
     Selector,
@@ -95,6 +105,8 @@ impl Type {
         match self {
             Type::I32 => "i32",
             Type::Bool => "bool",
+            // Only where the scale cannot be spelled; `Types::name_of` writes it out.
+            Type::Fix(_) => "fix",
             Type::Selector => "selector",
             Type::Resource => "ResourceLocation",
             Type::Pos => "Pos",
@@ -123,11 +135,31 @@ pub struct Types {
     vecs: RefCell<Vec<Type>>,
 }
 
+/// A generic parameter as declared: its name, and whether it stands for a scale
+/// rather than a type (spec section 3.16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenericDef {
+    pub name: String,
+    pub is_const: bool,
+}
+
+impl GenericDef {
+    fn collect(params: &[ast::GenericParam]) -> Vec<GenericDef> {
+        params
+            .iter()
+            .map(|param| GenericDef {
+                name: param.name.name.clone(),
+                is_const: param.is_const,
+            })
+            .collect()
+    }
+}
+
 /// A generic `struct`, whose field types may mention `Type::Param`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructTemplate {
     pub name: String,
-    pub generics: Vec<String>,
+    pub generics: Vec<GenericDef>,
     pub fields: Vec<Field>,
     pub span: Span,
 }
@@ -202,6 +234,12 @@ impl Types {
     /// Replaces the type parameters in `ty` with `args`.
     pub fn substitute(&self, ty: Type, args: &[Type]) -> Type {
         match ty {
+            // A const argument travels as the `fix` it stands for, so the scale is
+            // already in hand (spec section 6.25).
+            Type::Fix(Scale::Param(index)) => args
+                .get(index as usize)
+                .copied()
+                .unwrap_or(Type::Fix(Scale::Const(1))),
             Type::Param(index) => args
                 .get(index as usize)
                 .copied()
@@ -228,7 +266,7 @@ impl Types {
 
     fn mentions_param(&self, ty: Type) -> bool {
         match ty {
-            Type::Param(_) => true,
+            Type::Param(_) | Type::Fix(Scale::Param(_)) => true,
             Type::Vec(id) => self.mentions_param(self.element(id)),
             Type::Struct(id) => match self.struct_def(id).from {
                 Some((_, args)) => args.iter().any(|t| self.mentions_param(*t)),
@@ -244,6 +282,17 @@ impl Types {
     /// argument's type, and anything else is a mismatch.
     pub fn unify(&self, declared: Type, actual: Type, args: &mut [Option<Type>]) -> bool {
         match (declared, actual) {
+            // `fix<S>` against `fix<1000>` binds the scale, which rides in the
+            // argument list as the fix type itself (spec section 6.25).
+            (Type::Fix(Scale::Param(index)), Type::Fix(Scale::Const(_))) => {
+                match args[index as usize] {
+                    Some(known) => known == actual,
+                    None => {
+                        args[index as usize] = Some(actual);
+                        true
+                    }
+                }
+            }
             (Type::Param(index), actual) => match args[index as usize] {
                 Some(known) => known == actual,
                 None => {
@@ -270,6 +319,7 @@ impl Types {
     pub fn mangle(&self, ty: Type) -> String {
         match ty {
             Type::Vec(id) => format!("vec_{}", self.mangle(self.element(id))),
+            Type::Fix(Scale::Const(scale)) => format!("fix_{scale}"),
             Type::Struct(_) | Type::Enum(_) => self
                 .name_of(ty)
                 .chars()
@@ -288,6 +338,7 @@ impl Types {
     /// A type as a diagnostic should spell it, which for a user type is its own name.
     pub fn name_of(&self, ty: Type) -> String {
         match ty {
+            Type::Fix(Scale::Const(scale)) => format!("fix<{scale}>"),
             Type::Struct(id) => self.struct_def(id).name.clone(),
             Type::Enum(id) => self.enum_def(id).name.clone(),
             Type::Vec(id) => format!("Vec<{}>", self.name_of(self.element(id))),
@@ -474,7 +525,7 @@ impl NbtTag {
     /// The tag a type is written as when nothing says otherwise.
     pub fn default_for(ty: Type) -> Option<NbtTag> {
         match ty {
-            Type::I32 => Some(NbtTag::Int),
+            Type::I32 | Type::Fix(_) => Some(NbtTag::Int),
             Type::Bool => Some(NbtTag::Byte),
             _ => None,
         }
@@ -805,8 +856,8 @@ struct Signature {
     /// The id of the one function this name means, or `None` for a template: a
     /// generic function has an id per set of type arguments, not one of its own.
     id: Option<FnId>,
-    /// Type parameter names, empty for an ordinary function.
-    generics: Vec<String>,
+    /// Type and const parameters, empty for an ordinary function.
+    generics: Vec<GenericDef>,
     /// Parameters, which for a template may mention `Type::Param`.
     params: Vec<ParamSig>,
     ret: Option<Type>,
@@ -951,7 +1002,7 @@ pub fn lower(
             ));
             continue;
         }
-        let generics: Vec<String> = f.generics.iter().map(|g| g.name.clone()).collect();
+        let generics = GenericDef::collect(&f.generics);
         let mut params: Vec<ParamSig> = Vec::new();
         // The receiver is the first parameter, with the type the impl block names.
         if let Some(receiver) = f.receiver {
@@ -1073,7 +1124,7 @@ pub fn lower(
         let type_params: HashMap<String, Type> = signature
             .generics
             .iter()
-            .cloned()
+            .map(|param| param.name.clone())
             .zip(pending.args.iter().copied())
             .collect();
         let instance = Signature {
@@ -1308,11 +1359,7 @@ fn collect_types(file: &SourceFile, errors: &mut Vec<SyntaxError>) -> Types {
     // are in scope only here.
     for (item, declared) in templates {
         reject_item_attrs(item, "a struct", errors);
-        let generics: Vec<String> = declared
-            .generics
-            .iter()
-            .map(|name| name.name.clone())
-            .collect();
+        let generics = GenericDef::collect(&declared.generics);
         let fields = collect_fields(&declared.fields, &types, &generics, errors);
         types.templates.push(StructTemplate {
             name: declared.name.name.clone(),
@@ -1410,7 +1457,7 @@ fn reject_item_attrs(item: &ast::Item, what: &str, errors: &mut Vec<SyntaxError>
 fn collect_fields(
     declared: &[ast::FieldDef],
     types: &Types,
-    generics: &[String],
+    generics: &[GenericDef],
     errors: &mut Vec<SyntaxError>,
 ) -> Vec<Field> {
     let mut fields: Vec<Field> = Vec::new();
@@ -1578,6 +1625,84 @@ fn declared_ctx(attrs: &[ast::Attribute]) -> Vec<Ctx> {
     kinds
 }
 
+/// An arithmetic node, with the scale correction `*` and `/` need on a fix
+/// (spec section 6.25). Everything else is the plain operator.
+fn combine(op: BinaryOp, lhs: Expr, rhs: Expr, ty: Type, span: Span) -> Expr {
+    let plain = |lhs: Expr, rhs: Expr| Expr {
+        kind: ExprKind::Binary(op, Box::new(lhs), Box::new(rhs)),
+        ty,
+        span,
+    };
+    let (BinaryOp::Mul | BinaryOp::Div, Type::Fix(Scale::Const(scale)), Type::Fix(_)) =
+        (op, lhs.ty, rhs.ty)
+    else {
+        return plain(lhs, rhs);
+    };
+    // Multiply first in both cases: dividing first would throw away the digits the
+    // scale exists to keep.
+    match op {
+        BinaryOp::Mul => by_const(BinaryOp::Div, plain(lhs, rhs), scale, ty, span),
+        _ => plain(by_const(BinaryOp::Mul, lhs, scale, ty, span), rhs),
+    }
+}
+
+/// `value * n` or `value / n`, where `n` is a scale rather than a value.
+fn by_const(op: BinaryOp, value: Expr, n: u32, ty: Type, span: Span) -> Expr {
+    let scale = Expr {
+        kind: ExprKind::Int(n as i32),
+        ty: Type::I32,
+        span,
+    };
+    Expr {
+        kind: ExprKind::Binary(op, Box::new(value), Box::new(scale)),
+        ty,
+        span,
+    }
+}
+
+/// The `1000` of `fix<1000>`, or the const parameter that will become one.
+fn resolve_scale(
+    written: &ast::ScaleArg,
+    generics: &[GenericDef],
+    errors: &mut Vec<SyntaxError>,
+) -> Option<Scale> {
+    match written {
+        ast::ScaleArg::Int(lit) => match lit.value >= 1 {
+            true => Some(Scale::Const(lit.value as u32)),
+            // A scale of zero would divide by zero, and a negative one flips the sign
+            // of every value silently.
+            false => {
+                errors.push(SyntaxError::new(
+                    lit.span,
+                    "a scale is 1 or more: 'fix<1000>' counts thousandths",
+                ));
+                None
+            }
+        },
+        ast::ScaleArg::Param(name) => {
+            match generics.iter().position(|param| param.name == name.name) {
+                Some(index) if generics[index].is_const => Some(Scale::Param(index as u32)),
+                Some(_) => {
+                    let name = &name.name;
+                    errors.push(SyntaxError::new(
+                        written.span(),
+                        format!("'{name}' is a type parameter; a scale needs 'const {name}: i32'"),
+                    ));
+                    None
+                }
+                None => {
+                    let name = &name.name;
+                    errors.push(SyntaxError::new(
+                        written.span(),
+                        format!("unknown scale '{name}'; write a number or a const parameter"),
+                    ));
+                    None
+                }
+            }
+        }
+    }
+}
+
 fn resolve_type(
     written: &ast::TypeName,
     types: &Types,
@@ -1590,10 +1715,22 @@ fn resolve_type(
 fn resolve_written(
     written: &ast::TypeName,
     types: &Types,
-    generics: &[String],
+    generics: &[GenericDef],
     errors: &mut Vec<SyntaxError>,
 ) -> Option<Type> {
-    if let Some(index) = generics.iter().position(|name| *name == written.name) {
+    if written.name == "fix" {
+        let scale = written.scale.as_ref().expect("the parser requires a scale");
+        return resolve_scale(scale, generics, errors).map(Type::Fix);
+    }
+    if let Some(index) = generics.iter().position(|param| param.name == written.name) {
+        if generics[index].is_const {
+            let name = &written.name;
+            errors.push(SyntaxError::new(
+                written.span,
+                format!("'{name}' is a const parameter: it is a scale, not a type"),
+            ));
+            return None;
+        }
         if !written.args.is_empty() {
             let name = &written.name;
             errors.push(SyntaxError::new(
@@ -2297,12 +2434,47 @@ impl FnLowering<'_> {
             return None;
         }
         // A compound assignment is the arithmetic, so it inherits arithmetic's rules.
-        if assign.op.is_some() && place.ty != Type::I32 {
-            self.error(
-                assign.span,
-                format!("compound assignment needs i32, found {}", self.ty(place.ty)),
-            );
-            return None;
+        if let Some(op) = assign.op {
+            let ok = match (place.ty, value.ty) {
+                (Type::I32, Type::I32) => true,
+                (Type::Fix(_), Type::I32) => matches!(op, BinaryOp::Mul | BinaryOp::Div),
+                (Type::Fix(_), _) => place.ty == value.ty,
+                _ => false,
+            };
+            if !ok {
+                let message = match matches!(place.ty, Type::I32 | Type::Fix(_)) {
+                    // The place is the problem: nothing else takes arithmetic.
+                    false => format!("compound assignment needs i32, found {}", self.ty(place.ty)),
+                    true => format!(
+                        "expected {}, found {}",
+                        self.ty(place.ty),
+                        self.ty(value.ty)
+                    ),
+                };
+                self.error(assign.span, message);
+                return None;
+            }
+            // A scale correction is a second command, and `operation` has room for
+            // one. `a *= b` on a fix becomes `a = a * b` (spec section 6.25).
+            if matches!(op, BinaryOp::Mul | BinaryOp::Div)
+                && matches!(place.ty, Type::Fix(_))
+                && place.ty == value.ty
+            {
+                let target = self.expr(&assign.target)?;
+                let value = combine(op, target, value, place.ty, assign.span);
+                return Some(Stmt::Assign {
+                    place,
+                    op: None,
+                    value,
+                    span: assign.span,
+                });
+            }
+            return Some(Stmt::Assign {
+                place,
+                op: assign.op,
+                value,
+                span: assign.span,
+            });
         }
         if place.ty != value.ty {
             let (want, found) = (self.ty(place.ty), self.ty(value.ty));
@@ -2569,6 +2741,8 @@ impl FnLowering<'_> {
             AstExpr::Unary(unary) => {
                 let operand = self.expr(&unary.operand)?;
                 let want = match unary.op {
+                    // Negation is the same command whatever the scale is.
+                    UnaryOp::Neg if matches!(operand.ty, Type::Fix(_)) => operand.ty,
                     UnaryOp::Neg => Type::I32,
                     UnaryOp::Not => Type::Bool,
                 };
@@ -2589,12 +2763,9 @@ impl FnLowering<'_> {
                 let lhs = self.expr(&binary.lhs)?;
                 let rhs = self.expr(&binary.rhs)?;
                 let ty = self.binary_type(binary.op, &lhs, &rhs, span)?;
-                Some(Expr {
-                    kind: ExprKind::Binary(binary.op, Box::new(lhs), Box::new(rhs)),
-                    ty,
-                    span,
-                })
+                Some(combine(binary.op, lhs, rhs, ty, span))
             }
+            AstExpr::Fix(cast) => self.fix_cast(cast, span),
             // Spec section 4.3: assignment is a statement. There is no `()` type for
             // it to produce, and inventing one to make this legal buys nothing.
             AstExpr::Assign(_) => {
@@ -2674,6 +2845,81 @@ impl FnLowering<'_> {
         }
     }
 
+    /// `fix::<S>(e)`: the raw units of an `i32`, or another fix restated at `S`.
+    fn fix_cast(&mut self, cast: &ast::FixExpr, span: Span) -> Option<Expr> {
+        let scale = self.scale(&cast.scale)?;
+        let value = self.expr(&cast.value)?;
+        let ty = Type::Fix(Scale::Const(scale));
+        match value.ty {
+            // The integer is already the value in raw units, so nothing runs.
+            Type::I32 => Some(Expr { ty, ..value }),
+            Type::Fix(Scale::Const(from)) if from == scale => Some(value),
+            Type::Fix(Scale::Const(from)) => {
+                let up = by_const(BinaryOp::Mul, value, scale, ty, span);
+                Some(by_const(BinaryOp::Div, up, from, ty, span))
+            }
+            other => {
+                let found = self.ty(other);
+                self.error(
+                    span,
+                    format!("'fix::<{scale}>' takes an i32 or another fix, found {found}"),
+                );
+                None
+            }
+        }
+    }
+
+    /// The scale a `fix<S>` was written with. Inside an instance a const parameter is
+    /// already a number, which is what the argument list carries (spec section 6.25).
+    fn scale(&mut self, written: &ast::ScaleArg) -> Option<u32> {
+        if let ast::ScaleArg::Param(name) = written
+            && let Some(Type::Fix(Scale::Const(scale))) = self.type_params.get(&name.name).copied()
+        {
+            return Some(scale);
+        }
+        match resolve_scale(written, &[], self.errors)? {
+            Scale::Const(scale) => Some(scale),
+            // Only reachable in a template, and templates are never lowered.
+            Scale::Param(_) => None,
+        }
+    }
+
+    /// Typing for an operator with a fix on either side (spec section 4.14).
+    fn fix_binary_type(
+        &mut self,
+        op: BinaryOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        span: Span,
+    ) -> Option<Type> {
+        use BinaryOp::*;
+        // An integer multiplier has no scale of its own, so it needs no correction
+        // and mixes freely. Only `*` and `/` take one: what `+ 1` should add is not
+        // decidable from the spelling.
+        match (op, lhs.ty, rhs.ty) {
+            (Mul | Div, Type::Fix(_), Type::I32) => return Some(lhs.ty),
+            (Mul, Type::I32, Type::Fix(_)) => return Some(rhs.ty),
+            _ => {}
+        }
+        if lhs.ty != rhs.ty {
+            let (a, b) = (self.ty(lhs.ty), self.ty(rhs.ty));
+            self.error(
+                span,
+                format!("cannot mix {a} with {b}; convert one of them with 'fix::<S>(x)'"),
+            );
+            return None;
+        }
+        match op {
+            Add | Sub | Mul | Div | Rem => Some(lhs.ty),
+            Lt | Le | Gt | Ge | Eq | Ne => Some(Type::Bool),
+            And | Or => {
+                let found = self.ty(lhs.ty);
+                self.error(span, format!("this operator needs bool, found {found}"));
+                None
+            }
+        }
+    }
+
     fn binary_type(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr, span: Span) -> Option<Type> {
         use BinaryOp::*;
         for side in [lhs, rhs] {
@@ -2691,6 +2937,11 @@ impl FnLowering<'_> {
                 );
                 return None;
             }
+        }
+        // A fix is an integer with a scale attached, and the scale decides which
+        // operands go together (spec section 4.14).
+        if matches!(lhs.ty, Type::Fix(_)) || matches!(rhs.ty, Type::Fix(_)) {
+            return self.fix_binary_type(op, lhs, rhs, span);
         }
         let (want, result) = match op {
             Add | Sub | Mul | Div | Rem => (Some(Type::I32), Type::I32),
@@ -2943,7 +3194,7 @@ impl FnLowering<'_> {
                 .iter()
                 .zip(&bound)
                 .filter(|(_, known)| known.is_none())
-                .map(|(name, _)| name.as_str())
+                .map(|(param, _)| param.name.as_str())
                 .collect();
             let list = unknown.join(", ");
             self.error(
@@ -3138,6 +3389,13 @@ impl FnLowering<'_> {
             );
             return None;
         }
+        // The scale may be a const parameter, which this instance already knows.
+        if written.name == "fix" {
+            let written = written.scale.as_ref().expect("the parser requires a scale");
+            return self
+                .scale(written)
+                .map(|scale| Type::Fix(Scale::Const(scale)));
+        }
         // Inside an instance, a type parameter is already a concrete type.
         if let Some(ty) = self.type_params.get(&written.name).copied() {
             if !written.args.is_empty() {
@@ -3300,7 +3558,7 @@ impl FnLowering<'_> {
                 .iter()
                 .zip(&args)
                 .filter(|(_, bound)| bound.is_none())
-                .map(|(name, _)| name.as_str())
+                .map(|(param, _)| param.name.as_str())
                 .collect();
             let (name, list) = (&template.name, unknown.join(", "));
             self.error(
@@ -4495,6 +4753,122 @@ mod tests {
             );
             assert_eq!(hir.types.struct_count(), 1);
             assert_eq!(hir.types.struct_def(StructId(0)).fields[0].name, "x");
+        }
+    }
+
+    /// `fix<S>` and the const parameter that carries its scale (spec section 4.14).
+    mod fixed_point {
+        use super::*;
+
+        fn ty_of_let(src: &str) -> Type {
+            let hir = lower_ok(src);
+            hir.functions[0].locals[0].ty
+        }
+
+        #[test]
+        fn two_scales_do_not_mix() {
+            let errors = lower_err(
+                "fn main() { let a = fix::<100>(1); let b = fix::<1000>(1); let c = a + b; }",
+            );
+            assert!(
+                errors[0]
+                    .message
+                    .contains("cannot mix fix<100> with fix<1000>"),
+                "{errors:?}"
+            );
+            // The same source with one scale is fine, so the check above is the
+            // thing that failed.
+            lower_ok("fn main() { let a = fix::<100>(1); let b = fix::<100>(1); let c = a + b; }");
+        }
+
+        #[test]
+        fn a_cast_from_an_integer_is_free() {
+            let hir = lower_ok("fn main() { let a = fix::<1000>(1500); }");
+            let Stmt::Let { value, .. } = &hir.functions[0].body[0] else {
+                panic!("expected a let");
+            };
+            assert_eq!(value.ty, Type::Fix(Scale::Const(1000)));
+            // Raw units: the integer is the value, so no arithmetic is left behind.
+            assert_eq!(value.kind, ExprKind::Int(1500));
+        }
+
+        #[test]
+        fn an_integer_is_not_a_fix() {
+            let errors = lower_err("fn main() { let a: fix<1000> = 1; }");
+            assert!(
+                errors[0].message.contains("expected fix<1000>"),
+                "{errors:?}"
+            );
+            let errors = lower_err("fn main() { let a = fix::<1000>(1) + 1; }");
+            assert!(errors[0].message.contains("cannot mix"), "{errors:?}");
+        }
+
+        #[test]
+        fn an_integer_multiplier_needs_no_conversion() {
+            assert_eq!(
+                ty_of_let("fn main() { let a = fix::<1000>(1500) * 2; }"),
+                Type::Fix(Scale::Const(1000))
+            );
+            assert_eq!(
+                ty_of_let("fn main() { let a = fix::<1000>(1500) / 2; }"),
+                Type::Fix(Scale::Const(1000))
+            );
+            // Dividing by a fix is not the same thing, and has no correction that
+            // keeps the units right.
+            let errors = lower_err("fn main() { let a = 2 / fix::<1000>(1500); }");
+            assert!(errors[0].message.contains("cannot mix"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_scale_is_one_or_more() {
+            let errors = lower_err("fn main() { let a = fix::<0>(1); }");
+            assert!(errors[0].message.contains("1 or more"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_cast_between_scales_is_allowed() {
+            assert_eq!(
+                ty_of_let("fn main() { let a = fix::<100>(fix::<1000>(1500)); }"),
+                Type::Fix(Scale::Const(100))
+            );
+        }
+
+        #[test]
+        fn a_const_parameter_takes_the_scale_of_the_argument() {
+            let hir = lower_ok(
+                "fn half<const S: i32>(x: fix<S>) -> fix<S> { return x / 2; } \
+                 fn main() { let a = half(fix::<1000>(1500)); }",
+            );
+            let names: Vec<&str> = hir.functions.iter().map(|f| f.name.as_str()).collect();
+            assert!(names.contains(&"half_fix_1000"), "{names:?}");
+            assert_eq!(hir.functions[0].locals[0].ty, Type::Fix(Scale::Const(1000)));
+        }
+
+        #[test]
+        fn one_instance_per_scale() {
+            let hir = lower_ok(
+                "fn id<const S: i32>(x: fix<S>) -> fix<S> { return x; } \
+                 fn main() { let a = id(fix::<100>(1)); let b = id(fix::<1000>(1)); \
+                             let c = id(fix::<100>(2)); }",
+            );
+            let instances = hir
+                .functions
+                .iter()
+                .filter(|f| f.name.starts_with("id_"))
+                .count();
+            assert_eq!(instances, 2);
+        }
+
+        #[test]
+        fn a_const_parameter_is_not_a_type() {
+            let errors = lower_err("fn f<const S: i32>(x: S) {}");
+            assert!(errors[0].message.contains("const parameter"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_type_parameter_is_not_a_scale() {
+            let errors = lower_err("fn f<T>(x: fix<T>) {}");
+            assert!(errors[0].message.contains("const T: i32"), "{errors:?}");
         }
     }
 }

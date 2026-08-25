@@ -56,7 +56,7 @@ pub struct ImplItem {
 pub struct StructItem {
     pub name: Ident,
     /// Type parameters, monomorphised at every use (spec section 3.14).
-    pub generics: Vec<Ident>,
+    pub generics: Vec<GenericParam>,
     pub fields: Vec<FieldDef>,
 }
 
@@ -72,7 +72,7 @@ pub struct FieldDef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FnItem {
     pub name: Ident,
-    pub generics: Vec<Ident>,
+    pub generics: Vec<GenericParam>,
     /// The receiver, for a method: `&self`, `&mut self` or `self`.
     pub receiver: Option<Receiver>,
     pub params: Vec<Param>,
@@ -196,6 +196,33 @@ pub struct LetStmt {
 }
 
 /// A written type. Resolved to a real type in HIR.
+/// A generic parameter as written: a type, or a `const` one that stands for a scale
+/// (spec section 3.16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenericParam {
+    pub name: Ident,
+    /// `<const S: i32>`. A const parameter is only ever a scale, so it has no type of
+    /// its own to carry.
+    pub is_const: bool,
+}
+
+/// `fix<1000>` / `fix<S>`: the scale of a fixed-point type, and the only const
+/// argument the language has (spec section 3.16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScaleArg {
+    Int(IntLit),
+    Param(Ident),
+}
+
+impl ScaleArg {
+    pub fn span(&self) -> Span {
+        match self {
+            ScaleArg::Int(lit) => lit.span,
+            ScaleArg::Param(name) => name.span,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeName {
     /// `&T` / `&mut T`: compile-time only, and legal on a parameter alone.
@@ -203,6 +230,8 @@ pub struct TypeName {
     pub name: String,
     /// `Vec<i32>`: the arguments between the angle brackets.
     pub args: Vec<TypeName>,
+    /// `fix<1000>`: the scale, for the one type that takes a const argument.
+    pub scale: Option<ScaleArg>,
     pub span: Span,
 }
 
@@ -235,6 +264,16 @@ pub enum Expr {
     Method(MethodCall),
     /// `&p` / `&mut p`, which only an argument can be.
     Borrow(BorrowExpr),
+    /// `fix::<1000>(1500)`.
+    Fix(FixExpr),
+}
+
+/// `fix::<S>(e)`: the only way to make a fixed-point value (spec section 3.16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixExpr {
+    pub scale: ScaleArg,
+    pub value: Box<Expr>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,6 +359,7 @@ impl Expr {
     pub fn span(&self) -> Span {
         match self {
             Expr::Int(e) => e.span,
+            Expr::Fix(e) => e.span,
             Expr::Bool(e) => e.span,
             Expr::Str(e) => e.span,
             Expr::Path(e) => e.span,
