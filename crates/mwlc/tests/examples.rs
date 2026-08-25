@@ -101,6 +101,20 @@ fn the_arena_example_does_what_it_says() {
         effects.iter().any(|(name, _)| *name == "tellraw"),
         "{effects:?}"
     );
+
+    // The load function is where the fixed-point arithmetic and the nbt! literal are.
+    // A radius of 8 gives an area of about 201.088, which is over the threshold, and
+    // the name matches the literal it is compared against.
+    mc.effects.clear();
+    mc.call("arena:setup");
+    let said: Vec<&str> = mc
+        .effects
+        .iter()
+        .filter(|e| e.name == "say")
+        .map(|e| e.args.as_str())
+        .collect();
+    assert!(said.contains(&"a big arena"), "{said:?}");
+    assert!(said.contains(&"the pit is open"), "{said:?}");
 }
 
 #[test]

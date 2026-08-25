@@ -64,6 +64,25 @@ fn classify(tally: &Tally, out: &mut Threat) {
     out = Threat::Rising { seen: tally.seen };
 }
 
+/// The arena itself, written the way vanilla writes it: a `Double` radius and a
+/// string. `nbt!` is checked against this type, so a key that is not a field here is
+/// a compile error rather than data Minecraft quietly ignores.
+struct Arena {
+    #[nbt(rename = "Radius")]
+    radius: f64,
+    name: String,
+}
+
+/// Roughly `pi * r * r`, in thousandths.
+///
+/// `fix<1000>` is an integer on the scoreboard whose type says what it counts. The
+/// scale correction on `*` is inserted by the compiler; mixing `fix<100>` with
+/// `fix<1000>` would not compile.
+fn area(r: fix<1000>) -> fix<1000> {
+    let pi = fix::<1000>(3142);
+    return pi * r * r;
+}
+
 /// Generic, and monomorphised per element type: `total_i32` is the only instance this
 /// pack contains, because it is the only one anything asks for.
 fn total<T>(v: Vec<T>) -> i32 {
@@ -129,5 +148,18 @@ fn setup() {
     let count = total(rewards);
     if count == 3 {
         say("arena online");
+    }
+
+    // The compound is written once, whole. Reading `Radius` into a `fix<1000>` is
+    // one `data get ... 1000`: storage keeps the real number, the scoreboard keeps
+    // thousandths of it.
+    let arena: Arena = nbt!({ Radius: 8, name: "pit" });
+    let size = area(fix::<1000>(arena.radius));
+    if size > fix::<1000>(200000) {
+        say("a big arena");
+    }
+    // Comparing against a literal is one `execute if data`: no macro, no copy.
+    if arena.name == "pit" {
+        say("the pit is open");
     }
 }
