@@ -60,6 +60,14 @@ pub enum Type {
     Bool,
     /// Fixed point: an integer on the scoreboard, holding `S`ths of a unit.
     Fix(Scale),
+    /// The NBT interop scalars. They live in storage, hold what vanilla wrote, and
+    /// have no arithmetic: `Byte(1)` and `Int(1)` are different values to the game,
+    /// and only a type can keep them apart (requirements section 4.1).
+    I8,
+    I16,
+    I64,
+    F32,
+    F64,
     /// A compile-time selector. It has no runtime representation: the only thing that
     /// can be done with one is hand it to `as`, `at` or `for`.
     Selector,
@@ -83,6 +91,11 @@ impl Type {
     fn parse(name: &str) -> Option<Type> {
         match name {
             "i32" => Some(Type::I32),
+            "i8" => Some(Type::I8),
+            "i16" => Some(Type::I16),
+            "i64" => Some(Type::I64),
+            "f32" => Some(Type::F32),
+            "f64" => Some(Type::F64),
             "bool" => Some(Type::Bool),
             // Deliberately not spellable in a type annotation: a selector is inferred
             // from the literal, never declared.
@@ -98,13 +111,31 @@ impl Type {
 
     /// Whether values of this type live in storage rather than on the scoreboard.
     pub fn is_storage(&self) -> bool {
+        self.is_compound() || self.is_nbt_scalar()
+    }
+
+    /// Whether this is a structure in storage, rather than one value in it.
+    pub fn is_compound(&self) -> bool {
         matches!(self, Type::Struct(_) | Type::Enum(_) | Type::Vec(_))
+    }
+
+    /// Whether this is one of the types that exists to match an NBT tag exactly.
+    pub fn is_nbt_scalar(&self) -> bool {
+        matches!(
+            self,
+            Type::I8 | Type::I16 | Type::I64 | Type::F32 | Type::F64
+        )
     }
 
     pub fn name(&self) -> &'static str {
         match self {
             Type::I32 => "i32",
             Type::Bool => "bool",
+            Type::I8 => "i8",
+            Type::I16 => "i16",
+            Type::I64 => "i64",
+            Type::F32 => "f32",
+            Type::F64 => "f64",
             // Only where the scale cannot be spelled; `Types::name_of` writes it out.
             Type::Fix(_) => "fix",
             Type::Selector => "selector",
@@ -489,6 +520,8 @@ pub enum NbtTag {
     Short,
     Int,
     Long,
+    Float,
+    Double,
 }
 
 impl NbtTag {
@@ -498,6 +531,8 @@ impl NbtTag {
             "short" => NbtTag::Short,
             "int" => NbtTag::Int,
             "long" => NbtTag::Long,
+            "float" => NbtTag::Float,
+            "double" => NbtTag::Double,
             _ => return None,
         })
     }
@@ -509,6 +544,8 @@ impl NbtTag {
             NbtTag::Short => "short",
             NbtTag::Int => "int",
             NbtTag::Long => "long",
+            NbtTag::Float => "float",
+            NbtTag::Double => "double",
         }
     }
 
@@ -519,6 +556,8 @@ impl NbtTag {
             NbtTag::Short => "s",
             NbtTag::Int => "",
             NbtTag::Long => "L",
+            NbtTag::Float => "f",
+            NbtTag::Double => "d",
         }
     }
 
@@ -526,7 +565,11 @@ impl NbtTag {
     pub fn default_for(ty: Type) -> Option<NbtTag> {
         match ty {
             Type::I32 | Type::Fix(_) => Some(NbtTag::Int),
-            Type::Bool => Some(NbtTag::Byte),
+            Type::Bool | Type::I8 => Some(NbtTag::Byte),
+            Type::I16 => Some(NbtTag::Short),
+            Type::I64 => Some(NbtTag::Long),
+            Type::F32 => Some(NbtTag::Float),
+            Type::F64 => Some(NbtTag::Double),
             _ => None,
         }
     }
@@ -1559,10 +1602,17 @@ fn nbt_attrs(
                     token.span,
                     "a bool is stored as a byte; vanilla has no other boolean tag",
                 )),
-                Some(_) if ty.is_storage() => errors.push(SyntaxError::new(
+                Some(_) if ty.is_compound() => errors.push(SyntaxError::new(
                     token.span,
                     "a struct field is a compound, so it has no scalar tag",
                 )),
+                Some(_) if ty.is_nbt_scalar() => {
+                    let name = ty.name();
+                    errors.push(SyntaxError::new(
+                        token.span,
+                        format!("an {name} is already a tag: it is stored the one way                                  vanilla writes it, so there is nothing to choose here"),
+                    ))
+                }
                 Some(chosen) => tag = Some(chosen),
                 None => {
                     let option = option.clone();
@@ -1570,7 +1620,7 @@ fn nbt_attrs(
                         token.span,
                         format!(
                             "unknown nbt option '{option}'; expected byte, short, int, \
-                             long or rename"
+                             long, float, double or rename"
                         ),
                     ));
                 }
@@ -1586,7 +1636,7 @@ fn contains_itself(types: &Types, start: Type) -> bool {
     let mut seen: Vec<Type> = Vec::new();
     while let Some(ty) = stack.pop() {
         for field in types.fields(ty) {
-            if !field.ty.is_storage() {
+            if !field.ty.is_compound() {
                 continue;
             }
             if field.ty == start {
@@ -2927,9 +2977,22 @@ impl FnLowering<'_> {
                 self.error(span, format!("a {} has no runtime value", side.ty.name()));
                 return None;
             }
+            // The NBT scalars carry what vanilla wrote and nothing else: the
+            // scoreboard has no arithmetic for them (requirements section 4.1).
+            if side.ty.is_nbt_scalar() {
+                let name = side.ty.name();
+                self.error(
+                    span,
+                    format!(
+                        "an {name} is for NBT interop and has no arithmetic; read it \
+                         into a fix first, as in 'fix::<1000>(x)'"
+                    ),
+                );
+                return None;
+            }
             // Two compounds cannot be compared or combined: `execute if data` matches
             // against a literal, never against another path (spec section 4.8).
-            if side.ty.is_storage() {
+            if side.ty.is_compound() {
                 let name = self.ty(side.ty);
                 self.error(
                     span,
@@ -4869,6 +4932,43 @@ mod tests {
         fn a_type_parameter_is_not_a_scale() {
             let errors = lower_err("fn f<T>(x: fix<T>) {}");
             assert!(errors[0].message.contains("const T: i32"), "{errors:?}");
+        }
+    }
+
+    /// The types that exist to match an NBT tag exactly (spec section 4.15).
+    mod nbt_scalars {
+        use super::*;
+
+        #[test]
+        fn an_nbt_scalar_has_no_arithmetic() {
+            let errors = lower_err("fn f(a: f64, b: f64) { let c = a + b; }");
+            assert!(errors[0].message.contains("fix::<1000>(x)"), "{errors:?}");
+            let errors = lower_err("fn f(a: i64, b: i64) { let c = a < b; }");
+            assert!(errors[0].message.contains("no arithmetic"), "{errors:?}");
+        }
+
+        #[test]
+        fn an_nbt_scalar_takes_its_tag_from_its_type() {
+            let hir = lower_ok("struct Mob { hp: f32, age: i64, flag: i8 }");
+            let def = hir.types.struct_def(StructId(0));
+            assert_eq!(def.fields[0].tag, Some(NbtTag::Float));
+            assert_eq!(def.fields[1].tag, Some(NbtTag::Long));
+            assert_eq!(def.fields[2].tag, Some(NbtTag::Byte));
+        }
+
+        #[test]
+        fn an_nbt_scalar_cannot_be_given_a_tag() {
+            let errors = lower_err("struct Mob { #[nbt(byte)] hp: f64 }");
+            assert!(errors[0].message.contains("already a tag"), "{errors:?}");
+            // An i32 still chooses, which is why both spellings exist.
+            lower_ok("struct Mob { #[nbt(byte)] hp: i32 }");
+        }
+
+        #[test]
+        fn a_float_tag_can_be_asked_for_by_name() {
+            let hir = lower_ok("struct Mob { #[nbt(double)] hp: i32 }");
+            let def = hir.types.struct_def(StructId(0));
+            assert_eq!(def.fields[0].tag, Some(NbtTag::Double));
         }
     }
 }
