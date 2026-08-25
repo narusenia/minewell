@@ -718,6 +718,29 @@ Minecraft が黙って無視するので、型で区別する（要件定義 §4
 - 比較もできない。`==` は両辺を score に載せるか compound を丸ごと照合するかのどちらかで、
   どちらも「タグを保つ」という存在理由と噛み合わない
 
+### 4.16 score と storage の往復 — 確定（M8）
+
+置き場所の違う値どうしをやり取りするとき、コンパイラは `execute store` か
+`data get` を 1 コマンド挿入する（要件定義 §3.1）。M7 まではそれが `i32` と `bool` の
+フィールドで動いていた。M8 で足すのは**スケール**、つまり `fix<S>` と実数タグの対応。
+
+| 書き方 | 向き | 型 |
+|---|---|---|
+| `fix::<S>(d)` | storage → score | `d` が `f32` / `f64` / `i8` / `i16` / `i64` → `fix<S>` |
+| `d.as_i32()` | storage → score | 同上 → `i32` |
+| `x.as_f32()` / `x.as_f64()` | score → storage | `x: fix<S>` または `i32` |
+| `n.as_i8()` / `as_i16()` / `as_i64()` | score → storage | `n: i32` |
+
+- **`fix<S>` から整数タグへの変換は無い。** 生の単位と丸めた値のどちらを書くのか
+  字面から決まらない。`i8` / `i16` / `i64` が要るなら `i32` を経由する
+- **受け手は場所でなければならない。** `a.as_f64()` の `a` は束縛かフィールドで、
+  式の結果ではない。変換は `data` コマンドのパスとして書かれるため
+- 端数はすべて切り捨て。`data get` は掛けてから floor し、`execute store` は
+  掛けてからタグの型へ落とす。バニラの挙動そのままで、補正は入れない
+  （[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §4）
+- **エンティティ・ブロックの NBT はまだ読めない。** 失敗しうる読み取りであり、
+  `Option<T>` を返す stdlib（要件定義 §9）と一緒に入るのが正しい
+
 ## 5. 型の表現 — M6 と `struct` の範囲まで確定
 
 | 型 | 置き場所 | 表現 |
@@ -1365,3 +1388,33 @@ scoreboard players operation $t0 myns.t /= $t1 myns.t
 - const パラメータを持つ関数は型引数と同じ表で単相化する（[§6.23](#623-単相化--確定m7)）。
   実体の名前にはスケールが綴られる: `fn scale<const S: i32>(x: fix<S>)` を
   `fix<1000>` で呼ぶと `myns:scale_fix_1000`
+
+### 6.26 score と storage の往復 — 確定（M8）
+
+読みは `data get` の scale 引数、書きは `execute store` の倍率。どちらも 1 コマンド。
+
+```rust
+struct Mob { pos: f64 }
+
+fn main() {
+    let a = fix::<1000>(1500);        // 1.5
+    let m = Mob { pos: a.as_f64() };
+    let x = fix::<1000>(m.pos);       // 1500 に戻る
+}
+```
+
+```
+scoreboard players set $main.a myns.v 1500
+data modify storage myns:mw mw.vars.main.m set value {pos:0d}
+execute store result storage myns:mw mw.vars.main.m.pos double 0.001 \
+    run scoreboard players get $main.a myns.v
+execute store result score $main.x myns.v \
+    run data get storage myns:mw mw.vars.main.m.pos 1000
+```
+
+- **書きの倍率は `1/S`。** レジスタは `S` 分の 1 を単位として持ち、storage は単位そのものを
+  持つ。`S` が 10 の冪でないときの倍率は近似になるが、バニラの `double` に渡す値であり、
+  そこで丸めるのはバニラの仕事
+- **読みの scale は `S` そのもの。** `data get <path> S` は掛けてから floor する
+- 実行時添字の先にある値でも同じ。マクロ補助関数の中の `data get` に scale が付くだけで、
+  マクロ性は呼び出し側に伝染しない（[§6.21](#621-vect--確定m7)）

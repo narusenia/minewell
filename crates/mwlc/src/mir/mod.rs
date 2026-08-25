@@ -117,6 +117,9 @@ pub enum Inst {
     CopyData { dst: String, src: String },
     /// `data get storage <ns>:mw <path>`, whose result is the value there.
     GetData { path: String },
+    /// `data get storage <ns>:mw <path> <scale>`: the same read, in `scale`ths of a
+    /// unit, which is how a `fix<S>` comes out of storage (spec section 6.26).
+    GetScaled { path: String, scale: u32 },
     /// `data remove storage <ns>:mw <path>`
     RemoveData { path: String },
     /// `data modify storage <ns>:mw <path> append value <snbt>`
@@ -133,6 +136,14 @@ pub enum Inst {
     StoreData {
         path: String,
         tag: &'static str,
+        inst: Box<Inst>,
+    },
+    /// The same store, dividing by `scale` on the way in: the register holds
+    /// `scale`ths of a unit and storage holds the unit (spec section 6.26).
+    StoreScaled {
+        path: String,
+        tag: &'static str,
+        scale: u32,
         inst: Box<Inst>,
     },
     /// `execute <cond> run <inst>`. Still one command, so still one instruction.
@@ -871,6 +882,11 @@ impl<'p> Lowering<'_, 'p> {
     ///
     /// A list read this way gives its element count, which is what `len` is.
     fn read_place_into(&mut self, dst: Reg, place: &hir::Place) {
+        self.read_place_scaled(dst, place, 1);
+    }
+
+    /// The same read, in `scale`ths of a unit (spec section 6.26).
+    fn read_place_scaled(&mut self, dst: Reg, place: &hir::Place, scale: u32) {
         // A scalar binding lives on the scoreboard, borrowed or not: there is nothing
         // in storage to read.
         if place.steps.is_empty() && !place.ty.is_storage() {
@@ -883,19 +899,21 @@ impl<'p> Lowering<'_, 'p> {
             return;
         }
         let path = place_path(self.function, place);
+        let read = |path: String| match scale {
+            1 => Inst::GetData { path },
+            scale => Inst::GetScaled { path, scale },
+        };
         let Some(index) = runtime_index(place) else {
             self.insts.push(Inst::StoreResult {
                 dst,
-                inst: Box::new(Inst::GetData { path }),
+                inst: Box::new(read(path)),
             });
             return;
         };
         let helper = self.macro_helper(
             "index",
             Inst::ReturnRun {
-                inst: Box::new(Inst::GetData {
-                    path: spliced(&path),
-                }),
+                inst: Box::new(read(spliced(&path))),
             },
         );
         self.write_index_arg(index);
@@ -1053,6 +1071,33 @@ impl<'p> Lowering<'_, 'p> {
                         self.insts.push(Inst::CallWithArgs { path: helper });
                     }
                 }
+            }
+            // One command, the same as any other store into storage: `execute store`
+            // divides by the scale as it writes (spec section 6.26).
+            hir::ExprKind::AsNbt {
+                value: inner,
+                scale,
+            } => {
+                let src = match &inner.kind {
+                    // A score binding is already a register; copying it into a
+                    // temporary first would be a command spent on nothing.
+                    hir::ExprKind::Field(place)
+                        if place.steps.is_empty() && !place.ty.is_storage() =>
+                    {
+                        place_reg(self.function, place)
+                    }
+                    _ => {
+                        let src = self.expr(inner);
+                        self.materialise(src)
+                    }
+                };
+                let store = Inst::StoreScaled {
+                    path: path.to_owned(),
+                    tag: tag_of(NbtTag::default_for(value.ty)),
+                    scale: *scale,
+                    inst: Box::new(Inst::Get { src }),
+                };
+                self.insts.push(store);
             }
             other => unreachable!("{other:?} is not a composite value"),
         }
@@ -1239,6 +1284,9 @@ impl<'p> Lowering<'_, 'p> {
             // destination too, so reading a field needs no temporary in between.
             hir::ExprKind::Field(place) | hir::ExprKind::Len(place) if !expr.ty.is_storage() => {
                 self.read_place_into(dst, place);
+            }
+            hir::ExprKind::ReadScaled { place, scale } => {
+                self.read_place_scaled(dst, place, *scale);
             }
             _ => {
                 let value = self.expr(expr);
@@ -1885,6 +1933,14 @@ impl<'p> Lowering<'_, 'p> {
                 Value::Reg(dst)
             }
             hir::ExprKind::List { .. } => unreachable!("a list is not a register value"),
+            hir::ExprKind::ReadScaled { place, scale } => {
+                let dst = self.temps_next();
+                self.read_place_scaled(dst.clone(), place, *scale);
+                Value::Reg(dst)
+            }
+            // The value only means anything once it is in storage, and everything
+            // that puts it there goes through `store_struct`.
+            hir::ExprKind::AsNbt { .. } => unreachable!("an NBT scalar is not a register value"),
         }
     }
 

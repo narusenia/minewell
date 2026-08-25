@@ -839,6 +839,19 @@ pub enum ExprKind {
     },
     /// `v.len()`.
     Len(Place),
+    /// Reading a number out of storage into a register, `S`ths of a unit at a time
+    /// (spec section 6.26). The place holds an NBT scalar; the expression's type is
+    /// what it is being read into.
+    ReadScaled {
+        place: Place,
+        scale: u32,
+    },
+    /// The other direction: a register value written back as an NBT scalar. The
+    /// expression's type is the tag it lands as.
+    AsNbt {
+        value: Box<Expr>,
+        scale: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2673,6 +2686,53 @@ impl FnLowering<'_> {
         }
     }
 
+    /// `x.as_f64()` and `d.as_i32()`: the two directions of the score/storage round
+    /// trip (spec section 4.16).
+    fn convert(&mut self, place: Place, target: Type, call: &ast::MethodCall) -> Option<Expr> {
+        let span = call.span;
+        if !call.args.is_empty() {
+            let name = &call.name.name;
+            self.error(span, format!("'{name}' takes no arguments"));
+            return None;
+        }
+        let scale = match (place.ty, target) {
+            // Out of storage: `data get` multiplies by the scale as it reads.
+            (from, Type::I32) if from.is_nbt_scalar() => {
+                return Some(Expr {
+                    kind: ExprKind::ReadScaled { place, scale: 1 },
+                    ty: target,
+                    span,
+                });
+            }
+            // Into storage, keeping the units: a fix divides by its scale on the way.
+            (Type::Fix(Scale::Const(scale)), Type::F32 | Type::F64) => scale,
+            (Type::I32, target) if target.is_nbt_scalar() => 1,
+            // A fix into an integer tag would have to choose between the raw units
+            // and the rounded value, and neither is what the spelling says.
+            (from, to) => {
+                let (from, to) = (self.ty(from), self.ty(to));
+                self.error(
+                    span,
+                    format!("there is no conversion from {from} to {to}; NBT numbers                              go through i32, and a fix only through f32 or f64"),
+                );
+                return None;
+            }
+        };
+        let value = Expr {
+            ty: place.ty,
+            kind: ExprKind::Field(place),
+            span,
+        };
+        Some(Expr {
+            kind: ExprKind::AsNbt {
+                value: Box::new(value),
+                scale,
+            },
+            ty: target,
+            span,
+        })
+    }
+
     fn method_call(&mut self, call: &ast::MethodCall, as_statement: bool) -> Option<MethodOutcome> {
         let place = self.place(&call.receiver)?;
         // An inherent method wins: `impl` is how a type gets behaviour of its own.
@@ -2696,6 +2756,11 @@ impl FnLowering<'_> {
                     return None;
                 }
             });
+        }
+        // The NBT interop conversions (spec section 4.16). Methods rather than free
+        // functions: the receiver is what decides which direction this is.
+        if let Some(target) = Type::parse(call.name.name.strip_prefix("as_").unwrap_or("")) {
+            return Some(MethodOutcome::Value(self.convert(place, target, call)?));
         }
         let Type::Vec(id) = place.ty else {
             let (found, name) = (self.ty(place.ty), &call.name.name);
@@ -2907,6 +2972,16 @@ impl FnLowering<'_> {
             Type::Fix(Scale::Const(from)) => {
                 let up = by_const(BinaryOp::Mul, value, scale, ty, span);
                 Some(by_const(BinaryOp::Div, up, from, ty, span))
+            }
+            // Storage holds the real number; `data get` scales it on the way out
+            // (spec section 6.26).
+            other if other.is_nbt_scalar() => {
+                let place = self.place(&cast.value)?;
+                Some(Expr {
+                    kind: ExprKind::ReadScaled { place, scale },
+                    ty,
+                    span,
+                })
             }
             other => {
                 let found = self.ty(other);
@@ -4969,6 +5044,27 @@ mod tests {
             let hir = lower_ok("struct Mob { #[nbt(double)] hp: i32 }");
             let def = hir.types.struct_def(StructId(0));
             assert_eq!(def.fields[0].tag, Some(NbtTag::Double));
+        }
+
+        #[test]
+        fn a_fix_cannot_become_an_integer_tag() {
+            let errors = lower_err(
+                "struct Mob { age: i64 } \
+                 fn main() { let a = fix::<1000>(1500); let m = Mob { age: a.as_i64() }; }",
+            );
+            assert!(errors[0].message.contains("no conversion"), "{errors:?}");
+        }
+
+        #[test]
+        fn a_conversion_takes_no_arguments() {
+            let errors = lower_err("fn main() { let a = 1; let d = a.as_f64(1); }");
+            assert!(errors[0].message.contains("no arguments"), "{errors:?}");
+        }
+
+        #[test]
+        fn an_nbt_scalar_cannot_be_assigned_a_score() {
+            let errors = lower_err("struct Mob { pos: f64 } fn main() { let m = Mob { pos: 1 }; }");
+            assert!(errors[0].message.contains("expected f64"), "{errors:?}");
         }
     }
 }

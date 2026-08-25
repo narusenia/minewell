@@ -289,6 +289,9 @@ fn command(inst: &Inst, ns: &str) -> String {
             format!("data modify storage {ns}:mw {path} set value {value}")
         }
         Inst::GetData { path } => format!("data get storage {ns}:mw {path}"),
+        Inst::GetScaled { path, scale } => {
+            format!("data get storage {ns}:mw {path} {scale}")
+        }
         Inst::RemoveData { path } => format!("data remove storage {ns}:mw {path}"),
         Inst::AppendValue { path, value } => {
             format!("data modify storage {ns}:mw {path} append value {value}")
@@ -306,6 +309,20 @@ fn command(inst: &Inst, ns: &str) -> String {
         Inst::StoreData { path, tag, inst } => {
             format!(
                 "execute store result storage {ns}:mw {path} {tag} 1 run {}",
+                command(inst, ns)
+            )
+        }
+        // The register holds `scale`ths of a unit, so storage takes the reciprocal.
+        // Vanilla multiplies by this before it converts to the tag.
+        Inst::StoreScaled {
+            path,
+            tag,
+            scale,
+            inst,
+        } => {
+            let factor = 1.0 / f64::from(*scale);
+            format!(
+                "execute store result storage {ns}:mw {path} {tag} {factor} run {}",
                 command(inst, ns)
             )
         }

@@ -357,6 +357,9 @@ fn print_generated_commands() {
          fn main() { let mut s = State::Chasing { target: 3 }; let mut x = 0;
                      match s { State::Idle => { x = 1; }
                                State::Chasing { target } => { x = target; } } }",
+        "struct Mob { pos: f64 }
+         fn main() { let a = fix::<1000>(1500); let m = Mob { pos: a.as_f64() };
+                     let x = fix::<1000>(m.pos); }",
         "fn main() { let a = fix::<1000>(1500); let b = fix::<1000>(2000);
                      let x = a * b; let y = a / b; let z = fix::<100>(a);
                      let w = fix::<100>(fix::<1000>(1500)); }",
@@ -1668,5 +1671,64 @@ mod fixed_point {
         );
         assert_eq!(local(&mc, "main", "a"), Some(3000));
         assert_eq!(local(&mc, "main", "b"), Some(300));
+    }
+}
+
+/// The score/storage round trip, and the scale that goes with it (spec section 6.26).
+mod round_trip {
+    use super::harness::{at_path, cost, local, run};
+    use tinymcf::nbt::NbtValue;
+
+    #[test]
+    fn a_fix_goes_into_a_double_and_comes_back() {
+        let mc = run("struct Mob { pos: f64 } \
+             fn main() { let a = fix::<1000>(1500); let m = Mob { pos: a.as_f64() }; \
+                         let x = fix::<1000>(m.pos); }");
+        // Storage holds the real number, not the raw units.
+        assert_eq!(
+            at_path(&mc, "mw.vars.main.m.pos"),
+            Some(NbtValue::Double(1.5))
+        );
+        assert_eq!(local(&mc, "main", "x"), Some(1500));
+    }
+
+    #[test]
+    fn a_float_field_keeps_its_tag() {
+        let mc = run("struct Mob { hp: f32, age: i64 } \
+             fn main() { let h = fix::<100>(2050); let n = 7; \
+                         let m = Mob { hp: h.as_f32(), age: n.as_i64() }; }");
+        assert_eq!(
+            at_path(&mc, "mw.vars.main.m.hp"),
+            Some(NbtValue::Float(20.5))
+        );
+        assert_eq!(at_path(&mc, "mw.vars.main.m.age"), Some(NbtValue::Long(7)));
+    }
+
+    #[test]
+    fn an_nbt_scalar_reads_back_as_an_integer() {
+        let mc = run("struct Mob { age: i64 } \
+             fn main() { let n = 7; let m = Mob { age: n.as_i64() }; \
+                         let x = m.age.as_i32(); }");
+        assert_eq!(local(&mc, "main", "x"), Some(7));
+    }
+
+    #[test]
+    fn reading_a_double_floors_what_the_scale_cannot_hold() {
+        // 1.5 read as hundredths is 150; as units it is 1.
+        let mc = run("struct Mob { pos: f64 } \
+             fn main() { let a = fix::<1000>(1500); let m = Mob { pos: a.as_f64() }; \
+                         let x = fix::<100>(m.pos); let y = m.pos.as_i32(); }");
+        assert_eq!(local(&mc, "main", "x"), Some(150));
+        assert_eq!(local(&mc, "main", "y"), Some(1));
+    }
+
+    #[test]
+    fn each_direction_costs_one_command() {
+        // `set a`, `set value` for the compound, then one `execute store` each way.
+        // An `execute ... run` is two commands, not one (tinymcf SPEC section 5).
+        let mc = run("struct Mob { pos: f64 } \
+             fn main() { let a = fix::<1000>(1500); let m = Mob { pos: a.as_f64() }; \
+                         let x = fix::<1000>(m.pos); }");
+        assert_eq!(cost(&mc), 1 + 1 + 2 + 2);
     }
 }
