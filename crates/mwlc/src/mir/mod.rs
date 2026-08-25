@@ -1683,11 +1683,33 @@ impl<'p> Lowering<'_, 'p> {
         // Guards run in order, and an arm is free to rewrite what is being matched —
         // a state machine does exactly that. Testing a copy taken on the way in is
         // what keeps exactly one arm running (spec section 6.20).
-        let tested = self.data_temp();
-        self.insts.push(Inst::CopyData {
-            dst: tested.clone(),
-            src: path.clone(),
+        //
+        // For an option the copy is one bit — whether the path is there — so it fits
+        // in a register, and `execute store success` puts it there in one command
+        // (spec section 6.28).
+        let present = matches!(scrutinee.ty, Type::Option(_)).then(|| {
+            let reg = self.temps_next();
+            self.insts.push(Inst::StoreCond {
+                dst: reg.clone(),
+                cond: Cond::Data {
+                    path: path.clone(),
+                    filter: String::new(),
+                    negated: false,
+                },
+            });
+            reg
         });
+        let tested = match present {
+            Some(_) => String::new(),
+            None => {
+                let tested = self.data_temp();
+                self.insts.push(Inst::CopyData {
+                    dst: tested.clone(),
+                    src: path.clone(),
+                });
+                tested
+            }
+        };
         let base = format!("match_{}", self.counter);
         self.counter += 1;
 
@@ -1699,7 +1721,12 @@ impl<'p> Lowering<'_, 'p> {
             // binding, not a path, and the compound is not written back.
             for binding in &arm.bindings {
                 let dst = local_reg(inner.function, binding.local);
-                let field = format!("{path}.{}", binding.nbt);
+                // An option holds its value at the scrutinee's own path; an enum's
+                // payload is a key under it.
+                let field = match binding.nbt.is_empty() {
+                    true => path.clone(),
+                    false => format!("{path}.{}", binding.nbt),
+                };
                 if binding.ty.is_storage() {
                     let dst = local_path(inner.function, binding.local);
                     inner.insts.push(Inst::CopyData { dst, src: field });
@@ -1717,8 +1744,8 @@ impl<'p> Lowering<'_, 'p> {
             self.record(arm_path.clone(), insts, generated);
 
             let call = Inst::Call { path: arm_path };
-            match arm.variant {
-                Some(variant) => {
+            match (arm.test, &present) {
+                (hir::ArmTest::Variant(variant), _) => {
                     let tag = self.tag_of_variant(scrutinee, variant);
                     covered.push(tag.clone());
                     self.insts.push(Inst::Guarded {
@@ -1730,7 +1757,25 @@ impl<'p> Lowering<'_, 'p> {
                         inst: Box::new(call),
                     });
                 }
-                None => self.insts.push(Inst::Otherwise {
+                // The snapshot is 1 or 0, and the arms ask which.
+                (test, Some(reg)) => {
+                    let wanted = match test {
+                        hir::ArmTest::Present => 1,
+                        hir::ArmTest::Absent => 0,
+                        // A `_` after one of the two is the other one.
+                        _ => i32::from(!arms.iter().any(|a| a.test == hir::ArmTest::Present)),
+                    };
+                    self.insts.push(Inst::Guarded {
+                        cond: Cond::Matches {
+                            src: reg.clone(),
+                            min: Some(wanted),
+                            max: Some(wanted),
+                            negated: false,
+                        },
+                        inst: Box::new(call),
+                    });
+                }
+                (_, None) => self.insts.push(Inst::Otherwise {
                     path: tested.clone(),
                     tags: covered.clone(),
                     inst: Box::new(call),

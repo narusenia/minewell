@@ -479,8 +479,9 @@ primary     += expr "?"
   `Some(x)` は組み込みの構文であって、ユーザが書ける形ではない
 - **`None` だけでは中身の型が決まらない。** 空のリストと同じで、注釈が要る
   （`let x: Option<i32> = None;`）
-- `if let` が取るパターンは `Some(名前)` と `None` の 2 つだけ。
-  `enum` のバリアントは `match` で書く — 網羅性検査があるのはそちらだけ
+- **`if let` は腕が 2 つの `match` そのもの**（構文解析の時点でそう組み替える）。
+  だから `enum` のバリアントも書けるが、`else` の側は `_` の腕になるので
+  網羅性検査は働かない。網羅させたいなら `match` を書く
 
 ### 3.5 未定
 
@@ -1623,7 +1624,7 @@ match m.hp {
 ```
 
 ```
-execute store success score $t0 myns.t run data get storage myns:mw mw.vars.main.m.hp
+execute store success score $t0 myns.t if data storage myns:mw mw.vars.main.m.hp
 execute if score $t0 myns.t matches 1 run function myns:main/match_0/some
 execute if score $t0 myns.t matches 0 run function myns:main/match_0/none
 
@@ -1634,9 +1635,10 @@ main/match_0/some:
 
 - **控えは score に取る。** `enum` は compound を `mw.tmp` に写して照合するが
   （[§6.20](#620-match--確定m7)）、`Option` の控えは「在るか」の 1 ビットなので
-  `execute store success` で 1 コマンド。腕が対象を書き換えても走る腕は 1 つ
-- **無いパスの `data get` は失敗し、`store success` は 0 を書く。**
-  失敗しても store は行われる（[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §4.4）。
+  `execute store success ... if data` で 1 コマンド。
+  腕が対象を書き換えても走る腕は 1 つ
+- **無いパスは失敗であって間違いではない。** 未設定の score が条件を偽にするのと同じで、
+  診断も出ない（[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §4.2）。
   これが「失敗の検出は 1 コマンドで無料」（要件定義 §9）の中身
 - `if let Some(x) = o { .. } else { .. }` は腕が 2 つの `match` と同じものに落ちる
 

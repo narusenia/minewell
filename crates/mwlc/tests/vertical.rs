@@ -357,6 +357,8 @@ fn print_generated_commands() {
          fn main() { let mut s = State::Chasing { target: 3 }; let mut x = 0;
                      match s { State::Idle => { x = 1; }
                                State::Chasing { target } => { x = target; } } }",
+        "fn main() { let a: Option<i32> = Some(7);
+                     match a { Some(v) => {} None => {} } }",
         r#"fn main() { let a = "ab"; let b = a + "cd"; let c = b.slice(1..3);
                       let x = a == "ab"; let y = a == b; let n = b.len(); }"#,
         "struct Mob { pos: f64 }
@@ -1918,7 +1920,7 @@ mod nbt_literals {
 
 /// `Option<T>`: the value, or the path not being there at all (spec section 6.28).
 mod options {
-    use super::harness::{at_path, cost, run};
+    use super::harness::{at_path, cost, local, run};
     use tinymcf::nbt::NbtValue;
 
     #[test]
@@ -1964,6 +1966,55 @@ mod options {
                          a = b; }",
         );
         assert_eq!(at_path(&mc, "mw.vars.main.a"), None);
+    }
+
+    #[test]
+    fn a_match_reads_the_value_when_it_is_there() {
+        let mc = run("fn main() { let a: Option<i32> = Some(7); let mut x = 0; \
+                         match a { Some(v) => { x = v; } None => { x = -1; } } }");
+        assert_eq!(local(&mc, "main", "x"), Some(7));
+    }
+
+    #[test]
+    fn a_missing_path_reads_as_none() {
+        // The point of the whole design: a key that vanilla never wrote is `None`,
+        // and nothing has to be there for it to say so.
+        let mc = run("struct Mob { hp: Option<i32> } \
+             fn main() { let m = Mob { hp: None }; let mut x = 0; \
+                         match m.hp { Some(v) => { x = v; } None => { x = -1; } } }");
+        assert_eq!(local(&mc, "main", "x"), Some(-1));
+    }
+
+    #[test]
+    fn a_match_on_an_option_costs_one_command_to_decide() {
+        // `set value`, then one `execute store success ... if data` to take the
+        // snapshot — that is the whole test. The rest is the guard that runs the arm
+        // (two, being an `execute ... run`), the guard that does not (one), and the
+        // read of the binding inside the arm (two).
+        let mc = run("fn main() { let a: Option<i32> = Some(7); \
+                         match a { Some(v) => {} None => {} } }");
+        assert_eq!(cost(&mc), 1 + 1 + 2 + 1 + 2);
+    }
+
+    #[test]
+    fn if_let_runs_only_when_there_is_something() {
+        let mc = run(
+            "fn main() { let a: Option<i32> = Some(2); let b: Option<i32> = None; \
+                         let mut x = 0; \
+                         if let Some(v) = a { x = v; } \
+                         if let Some(v) = b { x = 99; } else { x = x + 1; } }",
+        );
+        assert_eq!(local(&mc, "main", "x"), Some(3));
+    }
+
+    #[test]
+    fn an_arm_that_clears_the_option_does_not_make_the_other_arm_run() {
+        // The guards read a snapshot taken on the way in, so exactly one arm runs.
+        let mc = run(
+            "fn main() { let mut a: Option<i32> = Some(1); let mut x = 0; \
+                         match a { Some(v) => { a = None; x = 1; } None => { x = 2; } } }",
+        );
+        assert_eq!(local(&mc, "main", "x"), Some(1));
     }
 
     #[test]

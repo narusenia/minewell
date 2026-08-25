@@ -142,7 +142,23 @@ pub enum Pattern {
         binds: Vec<Ident>,
         span: Span,
     },
+    /// `Some(x)`: built in, because `Option` is (spec section 3.18).
+    Some {
+        bind: Ident,
+        span: Span,
+    },
+    /// `None`.
+    None(Span),
     Wildcard(Span),
+}
+
+impl Pattern {
+    pub fn span(&self) -> Span {
+        match self {
+            Pattern::Variant { span, .. } | Pattern::Some { span, .. } => *span,
+            Pattern::None(span) | Pattern::Wildcard(span) => *span,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

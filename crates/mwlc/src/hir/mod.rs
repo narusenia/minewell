@@ -799,19 +799,32 @@ enum MethodOutcome {
 /// One arm of a `match`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arm {
-    /// Which variant this arm is for; `None` for `_`.
-    pub variant: Option<u32>,
+    /// What has to hold for this arm to run.
+    pub test: ArmTest,
     /// The name this arm is generated under, already safe as a datapack path.
     pub path: String,
     pub bindings: Vec<Binding>,
     pub body: Vec<Stmt>,
 }
 
+/// What decides whether an arm runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArmTest {
+    /// One variant of an `enum`, told apart by its tag.
+    Variant(u32),
+    /// An option that holds something, told apart by the path being there.
+    Present,
+    Absent,
+    /// `_`: everything the arms above did not take.
+    Other,
+}
+
 /// A payload field bound by a pattern, copied out of the compound on arm entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
     pub local: LocalId,
-    /// The key to read, under the scrutinee's path.
+    /// The key to read, under the scrutinee's path. Empty for an option, whose value
+    /// is the scrutinee's path itself (spec section 6.28).
     pub nbt: String,
     pub ty: Type,
 }
@@ -2197,11 +2210,14 @@ impl FnLowering<'_> {
     /// generated guards would simply all fail and the block would do nothing.
     fn match_stmt(&mut self, stmt: &ast::MatchStmt) -> Option<Stmt> {
         let scrutinee = self.place(&stmt.scrutinee)?;
+        if let Type::Option(id) = scrutinee.ty {
+            return self.option_match(scrutinee, self.types.inner(id), stmt);
+        }
         let Type::Enum(id) = scrutinee.ty else {
             let found = self.ty(scrutinee.ty);
             self.error(
                 stmt.scrutinee.span(),
-                format!("only an enum can be matched on, found {found}"),
+                format!("only an enum or an option can be matched on, found {found}"),
             );
             return None;
         };
@@ -2219,7 +2235,16 @@ impl FnLowering<'_> {
             let arm = match &arm.pattern {
                 ast::Pattern::Wildcard(_) => {
                     wildcard = true;
-                    self.arm(None, Vec::new(), "other".to_owned(), &arm.body)
+                    self.arm(ArmTest::Other, Vec::new(), "other".to_owned(), &arm.body)
+                }
+                // `Some` and `None` belong to an option, and this is an enum.
+                pattern @ (ast::Pattern::Some { .. } | ast::Pattern::None(_)) => {
+                    let name = &def.name;
+                    self.error(
+                        pattern.span(),
+                        format!("'{name}' is an enum, so its arms name its variants"),
+                    );
+                    return None;
                 }
                 ast::Pattern::Variant {
                     ty,
@@ -2243,7 +2268,7 @@ impl FnLowering<'_> {
                         );
                         return None;
                     };
-                    if arms.iter().any(|a| a.variant == Some(index)) {
+                    if arms.iter().any(|a| a.test == ArmTest::Variant(index)) {
                         let name = &variant.name;
                         self.error(
                             *span,
@@ -2266,7 +2291,7 @@ impl FnLowering<'_> {
                         bindings.push((bind.name.clone(), field.nbt.clone(), field.ty));
                     }
                     self.arm(
-                        Some(index),
+                        ArmTest::Variant(index),
                         bindings,
                         declared.name.to_lowercase(),
                         &arm.body,
@@ -2280,7 +2305,11 @@ impl FnLowering<'_> {
                 .variants
                 .iter()
                 .enumerate()
-                .filter(|(index, _)| !arms.iter().any(|a| a.variant == Some(*index as u32)))
+                .filter(|(index, _)| {
+                    !arms
+                        .iter()
+                        .any(|a| a.test == ArmTest::Variant(*index as u32))
+                })
                 .map(|(_, variant)| variant.name.as_str())
                 .collect();
             if !missing.is_empty() {
@@ -2306,10 +2335,82 @@ impl FnLowering<'_> {
         })
     }
 
+    /// `match o { Some(x) => .., None => .. }` (spec section 6.28).
+    ///
+    /// Two arms, and the test is whether the path is there at all — there is no tag to
+    /// look at, because what says `None` is the absence itself.
+    fn option_match(
+        &mut self,
+        scrutinee: Place,
+        inner: Type,
+        stmt: &ast::MatchStmt,
+    ) -> Option<Stmt> {
+        let mut arms: Vec<Arm> = Vec::new();
+        let mut wildcard = false;
+        for arm in &stmt.arms {
+            if wildcard {
+                self.error(
+                    arm.span,
+                    "'_' has to be the last arm; nothing after it can run",
+                );
+                return None;
+            }
+            let (test, bindings, path) = match &arm.pattern {
+                ast::Pattern::Some { bind, .. } => (
+                    ArmTest::Present,
+                    vec![(bind.name.clone(), String::new(), inner)],
+                    "some",
+                ),
+                ast::Pattern::None(_) => (ArmTest::Absent, Vec::new(), "none"),
+                ast::Pattern::Wildcard(_) => {
+                    wildcard = true;
+                    (ArmTest::Other, Vec::new(), "other")
+                }
+                ast::Pattern::Variant { ty, .. } => {
+                    let name = &ty.name;
+                    self.error(
+                        arm.pattern.span(),
+                        format!("an option is matched with 'Some(x)' and 'None', not '{name}'"),
+                    );
+                    return None;
+                }
+            };
+            if arms.iter().any(|a| a.test == test) {
+                self.error(arm.pattern.span(), "this arm is already covered");
+                return None;
+            }
+            arms.push(self.arm(test, bindings, path.to_owned(), &arm.body));
+        }
+        let covered = |test: ArmTest| {
+            arms.iter()
+                .any(|a| a.test == test || a.test == ArmTest::Other)
+        };
+        match (covered(ArmTest::Present), covered(ArmTest::Absent)) {
+            (true, true) => {}
+            (present, _) => {
+                let missing = if present { "None" } else { "Some(x)" };
+                self.error(stmt.span, format!("this match does not cover {missing}"));
+                return None;
+            }
+        }
+        if wildcard && arms.len() > 2 {
+            self.error(
+                stmt.arms.last().expect("a wildcard arm").span,
+                "this arm cannot be reached: Some and None are already covered",
+            );
+            return None;
+        }
+        Some(Stmt::Match {
+            scrutinee,
+            arms,
+            span: stmt.span,
+        })
+    }
+
     /// Lowers one arm's body, with its payload bindings in scope.
     fn arm(
         &mut self,
-        variant: Option<u32>,
+        test: ArmTest,
         bindings: Vec<(String, String, Type)>,
         path: String,
         body: &ast::Block,
@@ -2330,7 +2431,7 @@ impl FnLowering<'_> {
             .collect();
         self.scopes.pop();
         Arm {
-            variant,
+            test,
             path,
             bindings,
             body,
@@ -5708,6 +5809,61 @@ mod tests {
                 lower_err("struct Mob { hp: Option<i32> } fn main() { let m = Mob { hp: 1 }; }");
             assert!(
                 errors[0].message.contains("expected Option<i32>"),
+                "{errors:?}"
+            );
+        }
+
+        #[test]
+        fn a_match_on_an_option_covers_both_sides() {
+            let errors =
+                lower_err("fn main() { let a: Option<i32> = Some(1); match a { Some(v) => {} } }");
+            assert!(
+                errors[0].message.contains("does not cover None"),
+                "{errors:?}"
+            );
+            let errors =
+                lower_err("fn main() { let a: Option<i32> = Some(1); match a { None => {} } }");
+            assert!(
+                errors[0].message.contains("does not cover Some(x)"),
+                "{errors:?}"
+            );
+            lower_ok(
+                "fn main() { let a: Option<i32> = Some(1); match a { Some(v) => {} None => {} } }",
+            );
+        }
+
+        #[test]
+        fn an_option_arm_cannot_name_a_variant() {
+            let errors = lower_err(
+                "enum State { Idle } \
+                 fn main() { let a: Option<i32> = Some(1); match a { State::Idle => {} } }",
+            );
+            assert!(
+                errors[0].message.contains("'Some(x)' and 'None'"),
+                "{errors:?}"
+            );
+        }
+
+        #[test]
+        fn an_enum_arm_cannot_be_some_or_none() {
+            let errors = lower_err(
+                "enum State { Idle } \
+                 fn main() { let s = State::Idle; match s { Some(v) => {} None => {} } }",
+            );
+            assert!(
+                errors[0].message.contains("name its variants"),
+                "{errors:?}"
+            );
+        }
+
+        #[test]
+        fn an_arm_after_both_sides_cannot_be_reached() {
+            let errors = lower_err(
+                "fn main() { let a: Option<i32> = Some(1); \
+                 match a { Some(v) => {} None => {} _ => {} } }",
+            );
+            assert!(
+                errors[0].message.contains("cannot be reached"),
                 "{errors:?}"
             );
         }

@@ -417,6 +417,16 @@ impl Parser {
         let attrs = self.attributes();
         let span = self.span();
         match self.peek() {
+            // `if let` is a `match` with two arms, and says so here rather than in a
+            // second lowering (spec section 3.18).
+            Some(TokenKind::Keyword(Keyword::If))
+                if matches!(
+                    self.tokens.get(self.at + 1).map(|t| &t.kind),
+                    Some(TokenKind::Keyword(Keyword::Let))
+                ) =>
+            {
+                self.if_let_stmt().map(Stmt::Match)
+            }
             Some(TokenKind::Keyword(Keyword::If)) => self.if_stmt(attrs).map(Stmt::If),
             Some(TokenKind::Keyword(Keyword::While | Keyword::Loop)) => {
                 self.loop_stmt(attrs).map(Stmt::Loop)
@@ -500,6 +510,48 @@ impl Parser {
         })
     }
 
+    /// `if let Some(x) = o { .. } else { .. }`, as the `match` it is.
+    fn if_let_stmt(&mut self) -> Option<MatchStmt> {
+        let start = self.span().start;
+        self.bump();
+        self.bump();
+        let pattern = self.pattern()?;
+        self.expect(Punct::Eq, "=")?;
+        let scrutinee = self.head_expr()?;
+        let then = self.block()?;
+        let then_span = then.span;
+        let otherwise = match self.eat_keyword(Keyword::Else) {
+            true => self.block()?,
+            false => Block {
+                stmts: Vec::new(),
+                span: then.span,
+            },
+        };
+        let else_span = otherwise.span;
+        let span = Span {
+            start,
+            end: self.previous_end(),
+        };
+        Some(MatchStmt {
+            scrutinee,
+            arms: vec![
+                MatchArm {
+                    span: pattern.span(),
+                    pattern,
+                    body: then,
+                },
+                // Everything the first arm did not take, which for an option is the
+                // other one of the two.
+                MatchArm {
+                    pattern: Pattern::Wildcard(else_span),
+                    body: otherwise,
+                    span: then_span,
+                },
+            ],
+            span,
+        })
+    }
+
     /// `match s { State::Idle => { .. } _ => { .. } }`.
     fn match_stmt(&mut self) -> Option<MatchStmt> {
         let start = self.span().start;
@@ -543,6 +595,26 @@ impl Parser {
             }));
         }
         let ty = self.ident()?;
+        // `Some(x)` and `None` are built in: `Option` is not a user enum, so they are
+        // spelled the way everyone spells them (spec section 3.18).
+        if ty.name == "None" {
+            return Some(Pattern::None(Span {
+                start,
+                end: self.previous_end(),
+            }));
+        }
+        if ty.name == "Some" {
+            self.expect(Punct::LParen, "(")?;
+            let bind = self.ident()?;
+            self.expect(Punct::RParen, ")")?;
+            return Some(Pattern::Some {
+                bind,
+                span: Span {
+                    start,
+                    end: self.previous_end(),
+                },
+            });
+        }
         if !self.eat_punct(Punct::ColonColon) {
             self.error("expected a variant, as in 'State::Idle'");
             return None;
