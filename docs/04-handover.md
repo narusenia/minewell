@@ -1,7 +1,8 @@
 # 引き継ぎ
 
-2026-08-24 時点。**70 / 90 タスク完了、テスト 400 超、コミット 66。**
+2026-08-25 時点。**71 / 91 タスク完了、テスト 452、コミット 70。**
 M0〜M7 完了。次は M8（数値拡張: `fix<S>` と NBT 相互運用の数値型）。
+その外に、エディタの構文サポート（X-6）が横断タスクとして 1 つ空いている。
 
 ---
 
@@ -97,6 +98,24 @@ compound どうしの `==`、タプル型バリアント（`V(i32)`）。
   バリアント名は小文字化していて、衝突する組はコンパイルエラーにしてある
 - コマンドの綴りは `Signature.parts`（木の順）で組み立てる。リテラルと引数は交互に来る
 
+## エディタ支援（X-6、v1 の中）
+
+順番だけ決めてある。**LSP は要件定義 §19 のとおり v1 後**で、先に来るのはハイライト。
+
+1. **tree-sitter grammar（`.mwl`）を 1 つ書く。** nvim と zed はどちらもこれを指せる。
+   字句規則は仕様 §2 が確定しているので、そこから起こす。**罠が 2 つ**:
+   リソースロケーション（`minecraft:block.note_block.pling` は 1 トークン、`.` と `-` を含む）と
+   セレクタ（`@e[...]` は中身を触らず 1 トークン。`]` は文字列の中に出うる）
+2. **VS Code は TextMate grammar が別に要る。** 同じ字句規則から 2 本目を書く
+3. 3 つのプラグインは grammar とファイル関連付け（`.mwl`）とビルドタスクだけ持つ。
+   **コンパイラには依存させない** — 依存させた瞬間に版の同期が発生する
+4. LSP はその後。`mwlc` は既に span 付きの診断を `Report` で返すので、
+   「保存時に診断を出す」だけの LSP は薄い。定義ジャンプと補完はその次
+
+置き場所は決めていない。`editors/{tree-sitter-mwl,vscode,zed,nvim}` あたりを想定。
+
+---
+
 ## 積み残し（理由つき）
 
 | 項目 | なぜ後回しか | 予定 |
@@ -182,3 +201,10 @@ compound どうしの `==`、タプル型バリアント（`V(i32)`）。
 - `mise run test` / `lint` / `ci` / `snap`
 - CI は GitHub Actions（mise-action + `Swatinem/rust-cache`）、push と PR で走る
 - toolchain 置き場は `MINEWELL_HOME` で変更可。テストは各自の一時ディレクトリを使う
+- 例の toolchain は `examples/toolchains/1.21.4/`（手書きの `commands.json`）。
+  手で試すときは `cd examples/arena && MINEWELL_HOME=.. mwl build`
+
+**ローカルの `mise run ci` が通っても CI が落ちることがある。** mise の `rust = "stable"` は
+CI では毎回その時点の stable を入れるのに対し、手元は rustup 管理の版を指していることがあり、
+**clippy の新しい lint だけ CI で出る**（実際に `question_mark` で 1 回落とした）。
+push 後は `gh run list` を見るまでが 1 セット。
