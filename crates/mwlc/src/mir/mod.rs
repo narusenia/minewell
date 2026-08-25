@@ -344,6 +344,13 @@ enum Slot {
 }
 
 /// Where a value to be written into storage came from.
+/// How a string comparison is asked: a condition that can be used where it stands, or
+/// one that has to run inside a macro function first (spec section 6.27).
+enum Match {
+    Here(Cond),
+    Spliced { cond: Cond, src: String },
+}
+
 enum Written {
     /// Already SNBT: `set value` takes it as it is.
     Const(String),
@@ -887,51 +894,71 @@ impl<'p> Lowering<'_, 'p> {
         rhs: &hir::Expr,
         into: Option<Reg>,
     ) -> Value {
-        let negated = op == BinaryOp::Ne;
-        let lhs = self.expr_or_copy(Type::Str, lhs);
-        let rhs = self.expr_or_copy(Type::Str, rhs);
-        // Both known now, so the answer is too.
-        if let (Written::Const(a), Written::Const(b)) = (&lhs, &rhs) {
-            return Value::Const(i32::from((a == b) != negated));
+        match self.string_match(op, lhs, rhs) {
+            // Both sides were literals, so the answer is already known.
+            Err(answer) => Value::Const(answer),
+            // `execute store success` names its destination, so the answer goes
+            // straight where it is wanted.
+            Ok(matched) => {
+                let dst = into.unwrap_or_else(|| self.temps_next());
+                self.store_match(dst.clone(), matched);
+                Value::Reg(dst)
+            }
         }
-        // `execute store success` names its destination, so the answer goes straight
-        // where it is wanted.
-        let dst = into.unwrap_or_else(|| self.temps_next());
-        let (path, other) = match (lhs, rhs) {
-            (Written::Data(path), other) | (other, Written::Data(path)) => (path, other),
-            _ => unreachable!("a string is never a register"),
-        };
-        let (parent, key) = self.filterable(path);
-        match other {
-            Written::Const(text) => self.insts.push(Inst::StoreCond {
-                dst: dst.clone(),
-                cond: Cond::Data {
-                    path: parent,
-                    filter: format!("{{{key}:{text}}}"),
-                    negated,
-                },
-            }),
-            Written::Data(src) => {
-                let helper = self.macro_helper(
-                    "streq",
-                    Inst::StoreCond {
-                        dst: dst.clone(),
-                        cond: Cond::Data {
-                            path: parent,
-                            filter: format!("{{{key}:\"$({MACRO_TEXT})\"}}"),
-                            negated,
-                        },
-                    },
-                );
+    }
+
+    /// Writes a match's 0/1 into `dst`.
+    fn store_match(&mut self, dst: Reg, matched: Match) {
+        match matched {
+            Match::Here(cond) => self.insts.push(Inst::StoreCond { dst, cond }),
+            Match::Spliced { cond, src } => {
+                let helper = self.macro_helper("streq", Inst::StoreCond { dst, cond });
                 self.insts.push(Inst::CopyData {
                     dst: format!("mw.args.{MACRO_TEXT}"),
                     src,
                 });
                 self.insts.push(Inst::CallWithArgs { path: helper });
             }
-            Written::Reg(_) => unreachable!("a string is never a register"),
         }
-        Value::Reg(dst)
+    }
+
+    /// The path match behind a string comparison, or the answer when both sides are
+    /// literals and there is nothing to ask the game.
+    fn string_match(
+        &mut self,
+        op: BinaryOp,
+        lhs: &hir::Expr,
+        rhs: &hir::Expr,
+    ) -> Result<Match, i32> {
+        let negated = op == BinaryOp::Ne;
+        let lhs = self.expr_or_copy(Type::Str, lhs);
+        let rhs = self.expr_or_copy(Type::Str, rhs);
+        if let (Written::Const(a), Written::Const(b)) = (&lhs, &rhs) {
+            return Err(i32::from((a == b) != negated));
+        }
+        let (path, other) = match (lhs, rhs) {
+            (Written::Data(path), other) | (other, Written::Data(path)) => (path, other),
+            _ => unreachable!("a string is never a register"),
+        };
+        let (parent, key) = self.filterable(path);
+        Ok(match other {
+            Written::Const(text) => Match::Here(Cond::Data {
+                path: parent,
+                filter: format!("{{{key}:{text}}}"),
+                negated,
+            }),
+            // Two runtime strings: the only way vanilla can compare them is to splice
+            // one into the match, and splicing needs a macro.
+            Written::Data(src) => Match::Spliced {
+                cond: Cond::Data {
+                    path: parent,
+                    filter: format!("{{{key}:\"$({MACRO_TEXT})\"}}"),
+                    negated,
+                },
+                src,
+            },
+            Written::Reg(_) => unreachable!("a string is never a register"),
+        })
     }
 
     /// A path split into the compound that holds it and the key inside, which is the
@@ -2025,6 +2052,34 @@ impl<'p> Lowering<'_, 'p> {
     fn cond(&mut self, expr: &hir::Expr) -> Cond {
         match &expr.kind {
             hir::ExprKind::Unary(UnaryOp::Not, inner) => self.cond(inner).negate(),
+            // `execute if data` is a condition already: asking it into a register and
+            // then asking about the register would be a command wasted.
+            hir::ExprKind::Binary(op, lhs, rhs) if lhs.ty == Type::Str => {
+                match self.string_match(*op, lhs, rhs) {
+                    Ok(Match::Here(cond)) => cond,
+                    // A spliced match runs inside a macro function, which has to put
+                    // its answer somewhere before this condition can read it.
+                    Ok(matched) => {
+                        let dst = self.temps_next();
+                        self.store_match(dst.clone(), matched);
+                        Cond::Matches {
+                            src: dst,
+                            min: Some(1),
+                            max: Some(1),
+                            negated: false,
+                        }
+                    }
+                    Err(answer) => {
+                        let src = self.materialise(Value::Const(answer));
+                        Cond::Matches {
+                            src,
+                            min: Some(1),
+                            max: Some(1),
+                            negated: false,
+                        }
+                    }
+                }
+            }
             hir::ExprKind::Binary(op, lhs, rhs) if is_comparison(*op) => {
                 let lhs = self.expr(lhs);
                 let rhs = self.expr(rhs);
