@@ -3426,11 +3426,23 @@ impl FnLowering<'_> {
                 _ => None,
             };
             let value = if prefix.is_some() {
+                // `~-1` is three tokens, and it is the offset datapacks write most.
+                let negated = matches!(
+                    tokens.peek().map(|t| &t.kind),
+                    Some(TokenKind::Punct(Punct::Minus))
+                );
+                if negated {
+                    tokens.next();
+                }
                 match tokens.peek().map(|t| &t.kind) {
                     Some(TokenKind::Int(n)) => {
                         let n = *n;
                         tokens.next();
-                        Some(n)
+                        Some(if negated { -n } else { n })
+                    }
+                    _ if negated => {
+                        self.error(token.span, "expected a coordinate after '-'");
+                        return None;
                     }
                     _ => None,
                 }
@@ -3887,6 +3899,14 @@ mod tests {
         assert!(
             command_text("fn main() { setblock(pos!(^ ^ ^5), minecraft:stone); }")
                 .contains("^ ^ ^5")
+        );
+    }
+
+    #[test]
+    fn a_relative_coordinate_can_be_negative() {
+        assert!(
+            command_text("fn main() { setblock(pos!(~ ~-1 ~), minecraft:stone); }")
+                .contains("~ ~-1 ~")
         );
     }
 
