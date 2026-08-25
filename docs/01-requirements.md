@@ -161,7 +161,8 @@ MC バージョンごとの差分は **toolchain** として配布する（rustu
 - `struct` — storage 上の NBT compound。フィールドの NBT 表現は `#[nbt(...)]` で制御する。
   - `#[nbt(byte)]` / `short` / `int` / `long` / `float` / `double` / `string` — タグ型指定
   - `#[nbt(rename = "Health")]` — フィールド名（バニラの NBT は PascalCase が多い）
-  - `#[nbt(optional)]` — 欠損可。`Option<T>` として読む
+  - **欠損可のフィールドは型に書く**（`hp: Option<i32>`）。属性では書かない —
+    属性と型の両方に「欠けうる」と書けると、その 2 つが食い違える
   - 既定: `i32`→`Int`, `bool`→`Byte(0/1)`, `String`→`String`, `f64`→`Double`, `f32`→`Float`
   - タグ型の指定が必要な理由: NBT では `Byte(1)` と `Int(1)` が別物であり、
     間違えると Minecraft が黙って無視する
@@ -208,6 +209,35 @@ MC バージョンごとの差分は **toolchain** として配布する（rustu
 - `Pos` — 座標（絶対 / `~` 相対 / `^` ローカル）
 - `ResourceLocation` — `minecraft:stone` 等の ID
 - `TextComponent` — `tellraw` 等の JSON テキスト
+
+### 4.6 エンティティ NBT のビュー
+
+バニラの NBT を読み書きする手段は**ビュー**とする。値ではなく、パスの束。
+
+```rust
+#[entity]
+struct Mob {
+    #[nbt(rename = "Health")] hp: Option<fix<1000>>,
+    #[nbt(rename = "Fire")]   fire: Option<i16>,
+}
+
+#[ctx(entity)]
+fn hurt() {
+    let mut m = Mob::of(@s);
+    if let Some(hp) = m.hp { .. }
+    m.fire = Some(100);
+}
+```
+
+- **ビューはコンパイル時のみの型。** フィールドは場所であって値ではなく、
+  ビュー自身は渡すことも返すことも storage に置くこともできない
+- **新しい規則を持ち込まない。** タグは型が決め、スケールは `fix<S>` が決め、
+  欠損は `Option` が持つ。`struct` に対して決めたことがそのまま効く
+- **セレクタは単一対象でなければならない**（`@s` / `@p` / `@r` / `limit=1`）。
+  バニラの `data get entity` は複数一致を黙って失敗させる。これは静的に検出できる
+- キーの綴りは検査できない（バニラの NBT にスキーマは無い）。だから**宣言が唯一の情報源**で、
+  欠けうるものを `Option` と書くかどうかは書き手の責任
+- ブロックの NBT は v1 では持たない。座標のモデルが要る
 
 ---
 
@@ -335,8 +365,15 @@ scoreboard のフェイクプレイヤー名はグローバルであり、素朴
 バニラのコマンドは失敗しても黙る。一方、全コマンドは `execute store success` で
 0/1 を取得できる（**失敗の検出自体は 1 コマンドで無料**）。
 
-- 失敗しうる stdlib は `Option<T>` を返す（`get_data`, `find_entity`, `get_block` 等）
-- `?` 演算子は `Option` に対してのみ。`if let Some(x)` / `match` をサポート
+- **`Option<T>` は「パスが在るか」で表す。** `Some(v)` はパスが `v` を持つこと、
+  `None` はパスが無いこと。タグ付き compound（`{tag:"Some"}`）にはしない —
+  そうするとバニラが書いた NBT の欠けたフィールドを `None` として読めなくなる
+- 失敗しうる読み取りは `Option<T>` を返す。エンティティの NBT は**ビュー**として読む
+  （`#[entity] struct` のフィールドが場所になる。§4.6）。
+  文字列パスを取る stdlib 関数（`get_data("Health")` のような形）にはしない —
+  それではタグもスケールも欠損も検査できず、設計原則 2 が働かない
+- `?` 演算子は `Option` に対してのみ。`if let Some(x)` / `match` をサポート。
+  **`?` はレジスタに開ける**ので、中身は score に載る型に限る
 - **`Result<T, E>` は v1 では持たない。** エラー値の受け渡しコストが呼び出しごとに乗る
 - `debug_assert!` / `expect()` — debug ビルドでは失敗時に `tellraw @a` で
   発生箇所（ファイル:行）を報告。release ビルドでは消える
@@ -607,7 +644,7 @@ mwl toolchain install|list|build-from-jar
 | **M6** | スキーマ統合 | `commands.json` ロード / 型付きコマンド呼び出し / toolchain |
 | **M7** | 複合型 | `struct` / `enum` / `match` / `Vec` / storage 割り付け |
 | **M8** | 数値拡張 | `fix<S>` / NBT 相互運用型 |
-| **M9** | 仕上げ | `Option` / `?` / `debug_assert` / release 最適化 / CLI 完成 |
+| **M9** | 仕上げ | `Option` / `?` / エンティティ NBT / `debug_assert` / release 最適化 / CLI 完成 |
 
 **M0 を最初に置く理由:** 測定器が無い状態で TDD を始めると M1〜M4 のテストが
 全部 golden file になり、M5 以降で必ず書き直しになる。
