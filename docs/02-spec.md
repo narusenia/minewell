@@ -460,6 +460,28 @@ range       := or [".." [or]]
 `slice` の引数以外の位置に書くとエラー。ここに置いたのは、境界を式として書けるように
 するため — 範囲専用の文法をもう 1 つ作るより小さい。
 
+### 3.18 `Option<T>` — 確定（M9）
+
+```
+type        += "Option" "<" type ">"
+primary     += "Some" "(" expr ")" | "None"
+pattern     += "Some" "(" IDENT ")" | "None"
+stmt        += if_let_stmt
+if_let_stmt := "if" "let" pattern "=" expr block ["else" block]
+primary     += expr "?"
+```
+
+- **`Option<T>` は組み込みの型。** ユーザが `enum` にジェネリクスを書く手段は無く、
+  `Vec<T>` と同じく中身の型で内部化される。`Option<T>` のためだけに `enum` の
+  型パラメータを足しても、他に使い道が無い
+- `Some(x)` と `None` は**タグ付きバリアントではない**（[§4.19](#419-optiont--確定m9)）。
+  だからタプル型バリアントを持たないという決定（[§3.11](#311-enum--確定m7)）とも矛盾しない —
+  `Some(x)` は組み込みの構文であって、ユーザが書ける形ではない
+- **`None` だけでは中身の型が決まらない。** 空のリストと同じで、注釈が要る
+  （`let x: Option<i32> = None;`）
+- `if let` が取るパターンは `Some(名前)` と `None` の 2 つだけ。
+  `enum` のバリアントは `match` で書く — 網羅性検査があるのはそちらだけ
+
 ### 3.5 未定
 
 以降のタスクが、実装の直前に確定させる。
@@ -810,6 +832,36 @@ let m: Mob = nbt!({ Health: 20, name: "bob" });
 - `enum` は書けない。バリアントを選ぶには名前が要り、それは `State::Idle` の仕事
 - コストは 1 コマンド。中身はすべてコンパイル時に決まっている（設計原則 1）
 
+### 4.19 `Option<T>` — 確定（M9）
+
+**`Some` と `None` の区別はパスが在るかどうか**（要件定義 §9）。タグは持たない。
+
+| 状態 | storage |
+|---|---|
+| `Some(v)` | パスが `v` を持つ |
+| `None` | **パスが無い** |
+
+タグ付き compound（`{tag:"Some",v:1}`）にしない理由: バニラが書いた NBT には
+そんなタグは無く、`#[nbt]` で読む対象の「欠けているフィールド」をそのまま
+`None` として読めなくなる。パスの有無はバニラがすでに持っている表現であり、
+`execute if data` 1 つで見分けられる。
+
+| 式 | 要求 | 結果 |
+|---|---|---|
+| `Some(e)` | `e` は実行時の値 | `Option<その型>` |
+| `None` | 文脈が中身の型を決める | `Option<T>` |
+| `o?` | `o: Option<T>`、関数の戻り値が `Option<U>` | `T` |
+| `if let Some(x) = o { .. }` | `o: Option<T>` | `x: T` はブロックの中だけ |
+| `match o { Some(x) => .., None => .. }` | 両方の腕が要る | — |
+
+- **`Option<Option<T>>` は書けない。** パスの有無は 1 段しか区別できない
+- `Option<T>` は storage に置く。中身が score の型（`i32` など）でも同じで、
+  「無い」を score で表す方法が無いため
+- **関数の戻り値としての `Option<T>` だけは別**（[§6.28](#628-optiont--確定m9)）。
+  中身が score に載る型なら、値は戻り値に、有無は `execute store success` に乗る。
+  中身が compound の `Option` を返すことはできない（戻り値は整数 1 つ）
+- `?` は `Option<T>` を返す関数の中でだけ書ける。`None` なら**その場で関数を抜ける**
+
 ## 5. 型の表現 — M8 の範囲まで確定
 
 | 型 | 置き場所 | 表現 |
@@ -822,6 +874,7 @@ let m: Mob = nbt!({ Health: 20, name: "bob" });
 | `enum` | storage | `tag` を持つ NBT compound |
 | `Vec<T>` | storage | NBT list |
 | `String` | storage | NBT の `String`（[§4.17](#417-string--確定m8)） |
+| `Option<T>` | storage | 中身がそのまま。`None` は**パスが無い**（[§4.19](#419-optiont--確定m9)） |
 | `Selector` / `ResourceLocation` / `Pos` | どこにも置かない | コンパイル時のみ |
 
 置き場所は **score / storage / コンパイル時のみ** の 3 分類になる。2 分類（実行時か否か）
@@ -830,7 +883,7 @@ let m: Mob = nbt!({ Health: 20, name: "bob" });
 `bool` を scoreboard の 0/1 で持つのは、`execute store success` が 0/1 を書き、
 `execute if score ... matches 1` が読めるため。バニラの真偽値の扱いがそもそもこれ。
 
-残るのは `Option<T>` / `TextComponent` で、どちらも M9。
+残るのは `TextComponent` で、M9-4。
 
 ## 6. lowering — M8 の範囲まで確定
 
@@ -1530,3 +1583,85 @@ main/streq_1:
 - `slice` は `data modify ... set string`（1.19.4+）。添字が定数なので 1 コマンド
 - 生成関数（`concat_0` / `streq_1`）は呼び出し元の関数のサブディレクトリに置く
   （[§6.11](#611-生成関数の命名)）
+
+### 6.28 `Option<T>` — 確定（M9）
+
+**書き込みはパスを作るか消すか。**
+
+```rust
+struct Mob { hp: Option<i32> }
+
+fn main() {
+    let mut a: Option<i32> = Some(3);
+    a = None;
+    let m = Mob { hp: a };
+}
+```
+
+```
+data modify storage myns:mw mw.vars.main.a set value 3
+data remove storage myns:mw mw.vars.main.a
+data modify storage myns:mw mw.vars.main.m set value {}
+data modify storage myns:mw mw.vars.main.m.hp set from storage myns:mw mw.vars.main.a
+```
+
+- **`None` は `data remove` 1 つ**、`Some(定数)` は `set value` 1 つ
+- **compound の中の `Option` にはプレースホルダを置かない。** 他のフィールドは
+  `0` を書いておいて後から上書きするが（[§6.18](#618-struct-の配置と構築--確定m7)）、
+  `Option` は「無い」が意味を持つので、キーを作ってはいけない。
+  元が無ければ `set from` は失敗し、キーは無いままになる — それが `None` そのもの
+- **束縛への複製は `remove` してから `set from` の 2 コマンド。** ループの中の `let` は
+  同じパスを使い回すので、前の周回の値が残っていないことを先に保証する必要がある
+
+**読み出しは `execute if data`。**
+
+```rust
+match m.hp {
+    Some(hp) => { raw!("say some"); }
+    None => { raw!("say none"); }
+}
+```
+
+```
+execute store success score $t0 myns.t run data get storage myns:mw mw.vars.main.m.hp
+execute if score $t0 myns.t matches 1 run function myns:main/match_0/some
+execute if score $t0 myns.t matches 0 run function myns:main/match_0/none
+
+main/match_0/some:
+  execute store result score $main.hp myns.v run data get storage myns:mw mw.vars.main.m.hp
+  say some
+```
+
+- **控えは score に取る。** `enum` は compound を `mw.tmp` に写して照合するが
+  （[§6.20](#620-match--確定m7)）、`Option` の控えは「在るか」の 1 ビットなので
+  `execute store success` で 1 コマンド。腕が対象を書き換えても走る腕は 1 つ
+- **無いパスの `data get` は失敗し、`store success` は 0 を書く。**
+  失敗しても store は行われる（[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §4.4）。
+  これが「失敗の検出は 1 コマンドで無料」（要件定義 §9）の中身
+- `if let Some(x) = o { .. } else { .. }` は腕が 2 つの `match` と同じものに落ちる
+
+**戻り値と `?`。**
+
+```rust
+fn find(m: Mob) -> Option<i32> {
+    let hp = m.hp?;
+    return Some(hp * 2);
+}
+```
+
+```
+find:
+  execute store success score $t0 myns.t run data get storage myns:mw mw.vars.find.m.hp
+  execute if score $t0 myns.t matches 0 run return fail
+  execute store result score $find.hp myns.v run data get storage myns:mw mw.vars.find.m.hp
+  scoreboard players operation $t1 myns.t = $find.hp myns.v
+  scoreboard players operation $t1 myns.t *= ...
+  return run scoreboard players get $t1 myns.t
+```
+
+- **`Some(v)` を返すのは `return <v>`、`None` を返すのは `return fail`。**
+  バニラの関数は成功フラグと結果の 2 つを返しており、`Option<T>` はその 2 つそのもの
+- 呼び出し側は 1 コマンドで両方受け取る:
+  `execute store success score $ok store result score $v run function myns:find`
+- **`?` は早期 return と同じ扱い。** 生成ブロックの中では制御レジスタを立てて伝播する
+  （[§6.10](#610-break--continue--return)）。`return` が抱えていた罠と同じもの

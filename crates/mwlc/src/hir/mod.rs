@@ -46,6 +46,10 @@ pub struct EnumId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VecId(pub u32);
 
+/// Identifies one `Option<T>`, interned by inner type the same way as a list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OptionId(pub u32);
+
 /// The scale of a `fix<S>`: a number, or the const parameter that will become one
 /// (spec section 3.16).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -84,6 +88,9 @@ pub enum Type {
     Enum(EnumId),
     /// An NBT list in storage (spec section 4.11).
     Vec(VecId),
+    /// Maybe a `T`, and the difference is whether the path exists at all
+    /// (spec section 4.19).
+    Option(OptionId),
     /// A type parameter, inside a template that has not been instantiated yet
     /// (spec section 4.12). No value ever has this type: instantiation replaces it.
     Param(u32),
@@ -114,7 +121,7 @@ impl Type {
 
     /// Whether values of this type live in storage rather than on the scoreboard.
     pub fn is_storage(&self) -> bool {
-        self.is_compound() || self.is_storage_scalar()
+        self.is_compound() || self.is_storage_scalar() || matches!(self, Type::Option(_))
     }
 
     /// Whether this is a structure in storage, rather than one value in it.
@@ -156,6 +163,7 @@ impl Type {
             Type::Struct(_) => "struct",
             Type::Enum(_) => "enum",
             Type::Vec(_) => "Vec",
+            Type::Option(_) => "Option",
             Type::Param(_) => "a type parameter",
         }
     }
@@ -174,6 +182,8 @@ pub struct Types {
     template_by_name: HashMap<String, usize>,
     /// Element type per `VecId`, interned the same way.
     vecs: RefCell<Vec<Type>>,
+    /// Inner type per `OptionId`.
+    options: RefCell<Vec<Type>>,
 }
 
 /// A generic parameter as declared: its name, and whether it stands for a scale
@@ -287,6 +297,7 @@ impl Types {
                 // Out of range only when the arity was already reported.
                 .unwrap_or(Type::I32),
             Type::Vec(id) => self.vec_of(self.substitute(self.element(id), args)),
+            Type::Option(id) => self.option_of(self.substitute(self.inner(id), args)),
             Type::Struct(id) => {
                 let def = self.struct_def(id);
                 match def.from {
@@ -309,6 +320,7 @@ impl Types {
         match ty {
             Type::Param(_) | Type::Fix(Scale::Param(_)) => true,
             Type::Vec(id) => self.mentions_param(self.element(id)),
+            Type::Option(id) => self.mentions_param(self.inner(id)),
             Type::Struct(id) => match self.struct_def(id).from {
                 Some((_, args)) => args.iter().any(|t| self.mentions_param(*t)),
                 None => false,
@@ -342,6 +354,7 @@ impl Types {
                 }
             },
             (Type::Vec(a), Type::Vec(b)) => self.unify(self.element(a), self.element(b), args),
+            (Type::Option(a), Type::Option(b)) => self.unify(self.inner(a), self.inner(b), args),
             (Type::Struct(a), Type::Struct(b)) => {
                 let (a, b) = (self.struct_def(a), self.struct_def(b));
                 match (&a.from, &b.from) {
@@ -360,6 +373,7 @@ impl Types {
     pub fn mangle(&self, ty: Type) -> String {
         match ty {
             Type::Vec(id) => format!("vec_{}", self.mangle(self.element(id))),
+            Type::Option(id) => format!("option_{}", self.mangle(self.inner(id))),
             Type::Fix(Scale::Const(scale)) => format!("fix_{scale}"),
             Type::Struct(_) | Type::Enum(_) => self
                 .name_of(ty)
@@ -383,6 +397,7 @@ impl Types {
             Type::Struct(id) => self.struct_def(id).name.clone(),
             Type::Enum(id) => self.enum_def(id).name.clone(),
             Type::Vec(id) => format!("Vec<{}>", self.name_of(self.element(id))),
+            Type::Option(id) => format!("Option<{}>", self.name_of(self.inner(id))),
             other => other.name().to_owned(),
         }
     }
@@ -403,6 +418,24 @@ impl Types {
     /// What a list holds.
     pub fn element(&self, id: VecId) -> Type {
         self.vecs.borrow()[id.0 as usize]
+    }
+
+    /// `Option<inner>`, interned so that the same option type is the same id.
+    pub fn option_of(&self, inner: Type) -> Type {
+        let mut options = self.options.borrow_mut();
+        let index = match options.iter().position(|known| *known == inner) {
+            Some(index) => index,
+            None => {
+                options.push(inner);
+                options.len() - 1
+            }
+        };
+        Type::Option(OptionId(index as u32))
+    }
+
+    /// What an option holds when it holds anything.
+    pub fn inner(&self, id: OptionId) -> Type {
+        self.options.borrow()[id.0 as usize]
     }
 
     /// The fields a composite type holds, across every variant of an `enum`.
@@ -862,6 +895,10 @@ pub enum ExprKind {
         value: Box<Expr>,
         scale: u32,
     },
+    /// `Some(e)`: the value, written where the option lives (spec section 6.28).
+    Some(Box<Expr>),
+    /// `None`: nothing at all. Writing it removes the path.
+    None,
     /// `nbt!({ hp: 20 })`: a compound written out and checked against the type it is
     /// going into (spec section 4.18). Already SNBT, so it costs one `set value`.
     Nbt(String),
@@ -1290,6 +1327,7 @@ fn lower_function(
             instances,
             scopes: vec![HashMap::new()],
             selector_aliases: HashMap::new(),
+            expected: None,
             provided: Vec::new(),
             in_entity_loop: false,
             loop_depth: 0,
@@ -1557,7 +1595,7 @@ fn collect_fields(
             ));
             continue;
         }
-        let (tag, rename) = nbt_attrs(field, ty, errors);
+        let (tag, rename) = nbt_attrs(field, ty, types, errors);
         let nbt = rename.unwrap_or_else(|| field.name.name.clone());
         // Two fields writing one key is one field, silently: the second write would
         // overwrite the first and nothing would say so.
@@ -1583,8 +1621,15 @@ fn collect_fields(
 fn nbt_attrs(
     field: &ast::FieldDef,
     ty: Type,
+    types: &Types,
     errors: &mut Vec<SyntaxError>,
 ) -> (Option<NbtTag>, Option<String>) {
+    // An option holds its value directly — what says `None` is the key not being
+    // there — so its tag is the tag of what it holds (spec section 4.19).
+    let ty = match ty {
+        Type::Option(id) => types.inner(id),
+        other => other,
+    };
     let mut tag = NbtTag::default_for(ty);
     let mut rename = None;
     for attr in &field.attrs {
@@ -1620,8 +1665,8 @@ fn nbt_attrs(
             if option == "optional" {
                 errors.push(SyntaxError::new(
                     token.span,
-                    "#[nbt(optional)] is not implemented yet: a missing field is read \
-                     as Option<T>, which arrives with enums",
+                    "a missing field is written into the type: declare it as \
+                     Option<T> rather than saying so twice",
                 ));
                 continue;
             }
@@ -1824,6 +1869,35 @@ fn resolve_written(
         }
         return Some(Type::Param(index as u32));
     }
+    if written.name == "Option" {
+        let [inner] = written.args.as_slice() else {
+            errors.push(SyntaxError::new(
+                written.span,
+                "Option takes one type argument: write 'Option<i32>'",
+            ));
+            return None;
+        };
+        let inner = resolve_written(inner, types, generics, errors)?;
+        if inner.is_compile_time() {
+            let name = inner.name();
+            errors.push(SyntaxError::new(
+                written.span,
+                format!("a {name} exists only while compiling, so it is never missing"),
+            ));
+            return None;
+        }
+        // What says `None` is the path not being there, and a path is either there or
+        // not: there is no second level to tell apart (spec section 4.19).
+        if matches!(inner, Type::Option(_)) {
+            errors.push(SyntaxError::new(
+                written.span,
+                "Option<Option<T>> cannot be told apart: a path is either there or \
+                 not, and that is the only thing 'None' is",
+            ));
+            return None;
+        }
+        return Some(types.option_of(inner));
+    }
     if written.name == "Vec" {
         let [elem] = written.args.as_slice() else {
             errors.push(SyntaxError::new(
@@ -1922,6 +1996,9 @@ struct FnLowering<'a> {
     scopes: Vec<HashMap<String, LocalId>>,
     /// Bindings that stand for a selector rather than a value.
     selector_aliases: HashMap<LocalId, String>,
+    /// The type the expression being lowered is going into, where one is known.
+    /// Only `None` reads it (spec section 3.18).
+    expected: Option<Type>,
     /// The contexts available at this point: the function's own `#[ctx]`, plus
     /// whatever the enclosing `as` / `at` / `for` blocks add.
     provided: Vec<Ctx>,
@@ -2057,7 +2134,7 @@ impl FnLowering<'_> {
         let value = match (value, self.ret) {
             (None, None) => None,
             (Some(expr), Some(want)) => {
-                let expr = self.expr(expr)?;
+                let expr = self.expr_expecting(expr, want)?;
                 if expr.ty != want {
                     self.error(
                         expr.span,
@@ -2483,6 +2560,11 @@ impl FnLowering<'_> {
                 let want = self.resolve(written)?;
                 self.nbt_lit(call, want)?
             }
+            // And anything holding a `None`, which says nothing about its own type.
+            (value, Some(written)) => {
+                let want = self.resolve(written)?;
+                self.expr_expecting(value, want)?
+            }
             _ => self.expr(&stmt.value)?,
         };
         let ty = match &stmt.ty {
@@ -2510,8 +2592,10 @@ impl FnLowering<'_> {
     }
 
     fn assign(&mut self, assign: &ast::AssignExpr) -> Option<Stmt> {
-        let value = self.expr(&assign.value)?;
+        // The place first: what is being written into is what an untyped `None` on
+        // the right needs to know.
         let place = self.place(&assign.target)?;
+        let value = self.expr_expecting(&assign.value, place.ty)?;
         // Mutability belongs to the binding, or to the borrow it came through.
         if !place.mutable {
             let name = &place.via;
@@ -2919,6 +3003,30 @@ impl FnLowering<'_> {
                 ty: Type::Bool,
                 span,
             }),
+            // `None` says nothing about what is missing, so the type has to come from
+            // where it is going (spec section 3.18).
+            AstExpr::Path(name) if name.name == "None" && self.lookup_quietly(name).is_none() => {
+                match self.expected {
+                    Some(ty @ Type::Option(_)) => Some(Expr {
+                        kind: ExprKind::None,
+                        ty,
+                        span,
+                    }),
+                    Some(other) => {
+                        let want = self.ty(other);
+                        self.error(span, format!("expected {want}, found None"));
+                        None
+                    }
+                    None => {
+                        self.error(
+                            span,
+                            "'None' does not say what it is an option of: annotate the \
+                             binding, as in 'let x: Option<i32> = None;'",
+                        );
+                        None
+                    }
+                }
+            }
             AstExpr::Path(name) => {
                 let local = self.lookup(name)?;
                 // Reading through a borrow reads the caller's place, not a local of
@@ -2969,6 +3077,33 @@ impl FnLowering<'_> {
             AstExpr::Assign(_) => {
                 self.error(span, "an assignment is a statement and produces no value");
                 None
+            }
+            // `Some(e)` is built in, not a call: `Option` is not a user enum and
+            // there is no function behind the name (spec section 3.18).
+            AstExpr::Call(call) if call.callee.name == "Some" => {
+                let [value] = call.args.as_slice() else {
+                    self.error(span, "Some takes one value");
+                    return None;
+                };
+                let value = self.expr(value)?;
+                if value.ty.is_compile_time() {
+                    let found = value.ty.name();
+                    self.error(span, format!("a {found} has no runtime value to hold"));
+                    return None;
+                }
+                if matches!(value.ty, Type::Option(_)) {
+                    self.error(
+                        span,
+                        "Some(None) and None cannot be told apart: a path is either \
+                         there or not",
+                    );
+                    return None;
+                }
+                Some(Expr {
+                    ty: self.types.option_of(value.ty),
+                    kind: ExprKind::Some(Box::new(value)),
+                    span,
+                })
             }
             AstExpr::Call(call) if !self.signatures.contains_key(&call.callee.name) => {
                 self.command(call)
@@ -4090,7 +4225,11 @@ impl FnLowering<'_> {
     ) -> Option<Vec<Expr>> {
         let mut written = Vec::new();
         for init in &lit.fields {
-            let value = self.expr(&init.value)?;
+            // The field's type is known here, which is what an untyped `None` needs.
+            let value = match declared.iter().find(|f| f.name == init.name.name) {
+                Some(field) => self.expr_expecting(&init.value, field.ty)?,
+                None => self.expr(&init.value)?,
+            };
             written.push((init.name.clone(), value));
         }
         self.check_fields(declared, written, lit.span, what)
@@ -4153,11 +4292,22 @@ impl FnLowering<'_> {
         id
     }
 
+    /// Lowers an expression in a place whose type is already known.
+    ///
+    /// Only `None` reads this: it is the one expression that says nothing about its
+    /// own type (spec section 3.18). A nested expression sees the same expectation,
+    /// which is harmless — a `None` in the wrong place fails the type check either
+    /// way.
+    fn expr_expecting(&mut self, expr: &AstExpr, want: Type) -> Option<Expr> {
+        let outer = self.expected.replace(want);
+        let value = self.expr(expr);
+        self.expected = outer;
+        value
+    }
+
     fn lookup(&mut self, name: &ast::Ident) -> Option<LocalId> {
-        for scope in self.scopes.iter().rev() {
-            if let Some(id) = scope.get(&name.name) {
-                return Some(*id);
-            }
+        if let Some(id) = self.lookup_quietly(name) {
+            return Some(id);
         }
         let text = &name.name;
         self.errors.push(SyntaxError::new(
@@ -4165,6 +4315,15 @@ impl FnLowering<'_> {
             format!("'{text}' is not defined"),
         ));
         None
+    }
+
+    /// The same lookup without reporting: `None` has to check whether a binding of
+    /// that name shadows the keyword before complaining about it.
+    fn lookup_quietly(&self, name: &ast::Ident) -> Option<LocalId> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(&name.name).copied())
     }
 
     fn error(&mut self, span: Span, message: impl Into<String>) {
@@ -4886,9 +5045,11 @@ mod tests {
         }
 
         #[test]
-        fn nbt_optional_says_what_it_is_waiting_for() {
+        fn nbt_optional_points_at_the_type() {
+            // Saying it twice lets the two disagree: the type is where it belongs.
             let errors = lower_err("struct Mob { #[nbt(optional)] hp: i32 }");
-            assert!(errors[0].message.contains("not implemented"), "{errors:?}");
+            assert!(errors[0].message.contains("Option<T>"), "{errors:?}");
+            lower_ok("struct Mob { hp: Option<i32> }");
         }
 
         #[test]
@@ -5493,6 +5654,69 @@ mod tests {
                 "struct Mob { hp: i32 } fn main() { let m: Mob = nbt!({ hp: 1, hp: 2 }); }",
             );
             assert!(errors[0].message.contains("twice"), "{errors:?}");
+        }
+    }
+
+    /// `Option<T>`: the value, or the path not being there (spec section 4.19).
+    mod options {
+        use super::*;
+
+        #[test]
+        fn none_on_its_own_says_what_is_missing() {
+            let errors = lower_err("fn main() { let a = None; }");
+            assert!(
+                errors[0].message.contains("does not say what it is"),
+                "{errors:?}"
+            );
+            lower_ok("fn main() { let a: Option<i32> = None; }");
+        }
+
+        #[test]
+        fn an_option_of_an_option_cannot_be_told_apart() {
+            let errors = lower_err("fn f(x: Option<Option<i32>>) {}");
+            assert!(
+                errors[0].message.contains("either there or not"),
+                "{errors:?}"
+            );
+            let errors = lower_err("fn main() { let a: Option<i32> = Some(1); let b = Some(a); }");
+            assert!(
+                errors[0].message.contains("cannot be told apart"),
+                "{errors:?}"
+            );
+        }
+
+        #[test]
+        fn an_option_holds_a_runtime_value() {
+            let errors = lower_err("fn main() { let a = Some(@s); }");
+            assert!(errors[0].message.contains("no runtime value"), "{errors:?}");
+        }
+
+        #[test]
+        fn option_takes_one_type_argument() {
+            let errors = lower_err("fn f(x: Option) {}");
+            assert!(
+                errors[0].message.contains("one type argument"),
+                "{errors:?}"
+            );
+        }
+
+        #[test]
+        fn the_type_has_to_match_what_it_is_written_into() {
+            let errors = lower_err("fn main() { let a: i32 = None; }");
+            assert!(errors[0].message.contains("expected i32"), "{errors:?}");
+            let errors =
+                lower_err("struct Mob { hp: Option<i32> } fn main() { let m = Mob { hp: 1 }; }");
+            assert!(
+                errors[0].message.contains("expected Option<i32>"),
+                "{errors:?}"
+            );
+        }
+
+        #[test]
+        fn a_binding_can_shadow_the_word_none() {
+            // `None` is not a keyword: a binding of that name wins, as any other does.
+            let hir = lower_ok("fn main() { let None = 1; let x = None; }");
+            assert_eq!(hir.functions[0].locals[1].ty, Type::I32);
         }
     }
 }

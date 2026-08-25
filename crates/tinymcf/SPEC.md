@@ -219,9 +219,12 @@ needs it.
 The string case is what makes `String::len()` free in the source language, so it is
 tested rather than assumed. `data get` with no path returns 1.
 
-A path matching **nothing** fails. For `get` and for the *source* of a `from` or
-`string` operation, a path matching **more than one** value also fails, as in vanilla.
-Everywhere else all matches are acted on.
+A path matching **nothing** fails, and **records no diagnostic**: a path that is not
+there is an answer in vanilla's data model, the same way an unset score is (§4.4), and
+it is what `Option<T>` is made of in the source language. For `get` and for the *source*
+of a `from` or `string` operation, a path matching **more than one** value also fails —
+that one *is* a diagnostic, because nothing sensible was asked for. Everywhere else all
+matches are acted on.
 
 `string` converts the source to text — the characters themselves for a string tag, its
 SNBT otherwise — and takes `[start, end)`. Negative bounds count from the end; an

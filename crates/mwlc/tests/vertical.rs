@@ -1915,3 +1915,63 @@ mod nbt_literals {
         );
     }
 }
+
+/// `Option<T>`: the value, or the path not being there at all (spec section 6.28).
+mod options {
+    use super::harness::{at_path, cost, run};
+    use tinymcf::nbt::NbtValue;
+
+    #[test]
+    fn some_writes_the_value_and_none_takes_it_away() {
+        let mc = run("fn main() { let mut a: Option<i32> = Some(3); }");
+        assert_eq!(at_path(&mc, "mw.vars.main.a"), Some(NbtValue::Int(3)));
+        assert_eq!(cost(&mc), 1);
+
+        let mc = run("fn main() { let mut a: Option<i32> = Some(3); a = None; }");
+        assert_eq!(at_path(&mc, "mw.vars.main.a"), None);
+    }
+
+    #[test]
+    fn an_option_field_leaves_no_key_when_it_is_none() {
+        let mc = run("struct Mob { hp: Option<i32>, name: i32 } \
+             fn main() { let m = Mob { hp: None, name: 1 }; }");
+        assert_eq!(at_path(&mc, "mw.vars.main.m.hp"), None);
+        assert_eq!(at_path(&mc, "mw.vars.main.m.name"), Some(NbtValue::Int(1)));
+        // The whole compound is still one command: the key is simply not in it.
+        assert_eq!(cost(&mc), 1);
+    }
+
+    #[test]
+    fn an_option_field_holding_a_constant_is_written_with_the_compound() {
+        let mc = run("struct Mob { hp: Option<i32> } fn main() { let m = Mob { hp: Some(20) }; }");
+        assert_eq!(at_path(&mc, "mw.vars.main.m.hp"), Some(NbtValue::Int(20)));
+        assert_eq!(cost(&mc), 1);
+    }
+
+    #[test]
+    fn an_option_field_takes_the_tag_of_what_it_holds() {
+        let mc = run("struct Mob { #[nbt(short)] hp: Option<i32> } \
+             fn main() { let n = 3; let m = Mob { hp: Some(n) }; }");
+        assert_eq!(at_path(&mc, "mw.vars.main.m.hp"), Some(NbtValue::Short(3)));
+    }
+
+    #[test]
+    fn copying_an_option_clears_the_destination_first() {
+        // Without the `data remove`, copying a `None` would leave the old value in
+        // place: `set from` on a path that is not there fails and changes nothing.
+        let mc = run(
+            "fn main() { let mut a: Option<i32> = Some(3); let b: Option<i32> = None; \
+                         a = b; }",
+        );
+        assert_eq!(at_path(&mc, "mw.vars.main.a"), None);
+    }
+
+    #[test]
+    fn an_option_of_a_compound_works_the_same_way() {
+        let mc = run("struct Point { x: i32 } \
+             fn main() { let a: Option<Point> = Some(Point { x: 2 }); \
+                         let b: Option<Point> = None; }");
+        assert_eq!(at_path(&mc, "mw.vars.main.a.x"), Some(NbtValue::Int(2)));
+        assert_eq!(at_path(&mc, "mw.vars.main.b"), None);
+    }
+}

@@ -65,12 +65,22 @@ fn unmodelled(target: &Target) -> String {
     )
 }
 
+/// Why a read produced nothing.
+///
+/// `None` is an ordinary absence, and carries no diagnostic: a path that is not there
+/// is an answer in vanilla's data model, the same way an unset score is (SPEC.md
+/// section 4.2). It is what `Option<T>` is made of in the source language.
+type ReadError = Option<String>;
+
 /// Vanilla refuses a source or a `data get` that is ambiguous.
-fn exactly_one(matches: &[NbtValue]) -> Result<NbtValue, String> {
+fn exactly_one(matches: &[NbtValue]) -> Result<NbtValue, ReadError> {
     match matches {
         [one] => Ok(one.clone()),
-        [] => Err("found no elements matching the path".to_owned()),
-        many => Err(format!("found {} elements matching the path", many.len())),
+        [] => Err(None),
+        many => Err(Some(format!(
+            "found {} elements matching the path",
+            many.len()
+        ))),
     }
 }
 
@@ -433,13 +443,17 @@ impl Interpreter {
         match args {
             FnArgs::None => Ok(None),
             FnArgs::Inline(fields) => Ok(Some(fields.clone())),
-            FnArgs::From { target, path } => match self.read_source(target, path.as_ref())? {
-                NbtValue::Compound(fields) => Ok(Some(fields)),
-                other => Err(format!(
-                    "function arguments must be a compound, found {}",
-                    other.tag_name()
-                )),
-            },
+            FnArgs::From { target, path } => {
+                match self.read_source(target, path.as_ref()).map_err(|error| {
+                    error.unwrap_or_else(|| "found no arguments at the path".to_owned())
+                })? {
+                    NbtValue::Compound(fields) => Ok(Some(fields)),
+                    other => Err(format!(
+                        "function arguments must be a compound, found {}",
+                        other.tag_name()
+                    )),
+                }
+            }
         }
     }
 
@@ -610,8 +624,8 @@ impl Interpreter {
                 Some(!found.is_empty())
             }
             Condition::Data { target, path } => match self.read_target(target) {
-                Err(message) => {
-                    self.fail(message);
+                Err(error) => {
+                    self.failed_read(error);
                     None
                 }
                 Ok(root) => Some(!path.resolve(&root).is_empty()),
@@ -670,6 +684,15 @@ impl Interpreter {
         Outcome::FAILED
     }
 
+    /// A read that produced nothing: a diagnostic if it was a mistake, and a plain
+    /// failure if the path was simply not there.
+    fn failed_read(&mut self, error: ReadError) -> Outcome {
+        match error {
+            Some(message) => self.fail(message),
+            None => Outcome::FAILED,
+        }
+    }
+
     fn data(&mut self, cmd: &Data) -> Outcome {
         match cmd {
             Data::Get {
@@ -679,13 +702,13 @@ impl Interpreter {
             } => {
                 let root = match self.read_target(target) {
                     Ok(root) => root,
-                    Err(message) => return self.fail(message),
+                    Err(message) => return self.failed_read(message),
                 };
                 let Some(path) = path else {
                     return Outcome::ok(1);
                 };
                 match exactly_one(&path.resolve(&root)) {
-                    Err(message) => self.fail(message),
+                    Err(error) => self.failed_read(error),
                     Ok(value) => match measure(&value) {
                         None => self.fail(format!("{value} is not a value data can read")),
                         Some(n) => Outcome::ok((n * scale).floor() as i32),
@@ -713,7 +736,7 @@ impl Interpreter {
             } => {
                 let value = match self.resolve_source(source) {
                     Ok(value) => value,
-                    Err(message) => return self.fail(message),
+                    Err(error) => return self.failed_read(error),
                 };
                 self.with_target(target, |root| {
                     let leaf = if kind.wants_list() {
@@ -734,10 +757,10 @@ impl Interpreter {
     }
 
     /// A snapshot of a target's root, or why it cannot be read.
-    fn read_target(&self, target: &Target) -> Result<NbtValue, String> {
+    fn read_target(&self, target: &Target) -> Result<NbtValue, ReadError> {
         match target {
             Target::Storage(id) => Ok(self.world.storage(id).clone()),
-            other => Err(unmodelled(other)),
+            other => Err(Some(unmodelled(other))),
         }
     }
 
@@ -755,7 +778,7 @@ impl Interpreter {
         }
     }
 
-    fn resolve_source(&self, source: &Source) -> Result<NbtValue, String> {
+    fn resolve_source(&self, source: &Source) -> Result<NbtValue, ReadError> {
         match source {
             Source::Value(value) => Ok(value.clone()),
             Source::From { target, path } => self.read_source(target, path.as_ref()),
@@ -775,7 +798,7 @@ impl Interpreter {
         }
     }
 
-    fn read_source(&self, target: &Target, path: Option<&NbtPath>) -> Result<NbtValue, String> {
+    fn read_source(&self, target: &Target, path: Option<&NbtPath>) -> Result<NbtValue, ReadError> {
         let root = self.read_target(target)?;
         match path {
             None => Ok(root),
@@ -1128,15 +1151,32 @@ mod data_tests {
 
     #[test]
     fn get_fails_on_no_match_and_on_several() {
+        // A path that is not there is an answer, not a mistake: it is what the source
+        // language reads as `None`, so it carries no diagnostic (SPEC.md section 4.2).
         let (it, out) = run(&["data get storage ns:mw missing"]);
         assert_eq!(out, Outcome::FAILED);
-        assert!(!it.diagnostics.is_empty());
+        assert!(it.diagnostics.is_empty(), "{:?}", it.diagnostics);
 
-        let (_, out) = run(&[
+        // Several matches is a mistake, and does say so.
+        let (it, out) = run(&[
             "data modify storage ns:mw l set value [1,2]",
             "data get storage ns:mw l[]",
         ]);
         assert_eq!(out, Outcome::FAILED);
+        assert!(!it.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn copying_from_a_path_that_is_not_there_says_nothing() {
+        // `data modify ... set from <missing>` leaves the target alone and reports
+        // failure. That silence is what lets an option be copied.
+        let (it, out) = run(&[
+            "data modify storage ns:mw a set value 1",
+            "data modify storage ns:mw a set from storage ns:mw missing",
+        ]);
+        assert_eq!(out, Outcome::FAILED);
+        assert!(it.diagnostics.is_empty(), "{:?}", it.diagnostics);
+        assert_eq!(at(&it, "a"), vec![NbtValue::Int(1)]);
     }
 
     #[test]

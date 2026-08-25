@@ -722,6 +722,16 @@ fn runtime_index(place: &hir::Place) -> Option<&hir::Expr> {
 /// The path a macro line writes, with the substitution in place of the index.
 /// A string as SNBT: quoted, with the two characters that cannot stand alone inside
 /// quotes escaped.
+/// Whether `snbt` could write this value out in full, with nothing left to store.
+fn is_literal(value: &hir::Expr) -> bool {
+    match &value.kind {
+        hir::ExprKind::Int(_) | hir::ExprKind::Bool(_) | hir::ExprKind::Str(_) => true,
+        hir::ExprKind::Nbt(_) => true,
+        hir::ExprKind::Some(inner) => is_literal(inner),
+        _ => false,
+    }
+}
+
 fn quoted(text: &str) -> String {
     format!("\"{}\"", escaped(text))
 }
@@ -1165,6 +1175,13 @@ impl<'p> Lowering<'_, 'p> {
         op: Option<BinaryOp>,
         value: &hir::Expr,
     ) {
+        // An option is the value itself, or the path not being there at all. The tag
+        // is the one the field was declared with, and it belongs to what is held.
+        if let Type::Option(id) = ty {
+            let inner = self.program.types.inner(id);
+            self.store_option(path, inner, tag, value, false);
+            return;
+        }
         if ty.is_storage() {
             self.store_struct(path, value);
             return;
@@ -1197,11 +1214,55 @@ impl<'p> Lowering<'_, 'p> {
         }
     }
 
+    /// Writes an option (spec section 6.28).
+    ///
+    /// `fresh` says the path is known to hold nothing yet — the key of a compound that
+    /// was just written whole — which is what lets the copy skip its `data remove`.
+    fn store_option(
+        &mut self,
+        path: &str,
+        inner: Type,
+        tag: Option<NbtTag>,
+        value: &hir::Expr,
+        fresh: bool,
+    ) {
+        match &value.kind {
+            hir::ExprKind::None => self.insts.push(Inst::RemoveData {
+                path: path.to_owned(),
+            }),
+            // Writing the value overwrites whatever was there, so nothing has to be
+            // cleared first.
+            hir::ExprKind::Some(value) => self.assign_in_storage(path, inner, tag, None, value),
+            // Copying another option: `set from` on a path that is not there fails and
+            // leaves what was there, so the destination is cleared first.
+            _ => {
+                if !fresh {
+                    self.insts.push(Inst::RemoveData {
+                        path: path.to_owned(),
+                    });
+                }
+                match self.expr_or_copy(value.ty, value) {
+                    Written::Data(src) => self.insts.push(Inst::CopyData {
+                        dst: path.to_owned(),
+                        src,
+                    }),
+                    _ => unreachable!("an option is a path or a value written into one"),
+                }
+            }
+        }
+    }
+
     /// Writes a composite value to `path`.
     ///
     /// One `set value` puts everything that is known now in place, and only the fields
     /// that are not get a command of their own (spec section 6.18).
     fn store_struct(&mut self, path: &str, value: &hir::Expr) {
+        if let Type::Option(id) = value.ty {
+            let inner = self.program.types.inner(id);
+            let tag = NbtTag::default_for(inner);
+            self.store_option(path, inner, tag, value, false);
+            return;
+        }
         match &value.kind {
             hir::ExprKind::Struct { .. }
             | hir::ExprKind::Enum { .. }
@@ -1329,6 +1390,7 @@ impl<'p> Lowering<'_, 'p> {
                 let tag = vec![format!("{TAG_KEY}:\"{}\"", variant.name)];
                 format!("{{{}}}", self.compound_body(&variant.fields, fields, tag))
             }
+            hir::ExprKind::Some(inner) => self.snbt(inner, tag),
             // Not known now: leave room for the write that follows.
             _ => match value.ty {
                 Type::Struct(_) | Type::Enum(_) => "{}".to_owned(),
@@ -1352,6 +1414,12 @@ impl<'p> Lowering<'_, 'p> {
                 declared
                     .iter()
                     .zip(values)
+                    // An option that is not a value right here leaves no key at all:
+                    // the key being absent is what `None` is (spec section 6.28).
+                    .filter(|(field, value)| {
+                        !matches!(field.ty, Type::Option(_))
+                            || matches!(value.kind, hir::ExprKind::Some(_))
+                    })
                     .map(|(field, value)| format!("{}:{}", field.nbt, self.snbt(value, field.tag))),
             )
             .collect::<Vec<_>>()
@@ -1402,6 +1470,17 @@ impl<'p> Lowering<'_, 'p> {
         };
         for (field, value) in declared.iter().zip(values) {
             let path = format!("{path}.{}", field.nbt);
+            // The key was left out of the compound, so there is nothing to clear.
+            if let Type::Option(id) = field.ty {
+                let inner = self.program.types.inner(id);
+                match &value.kind {
+                    // Already in the compound, or deliberately not in it.
+                    hir::ExprKind::None => {}
+                    hir::ExprKind::Some(inner_value) if is_literal(inner_value) => {}
+                    _ => self.store_option(&path, inner, field.tag, value, true),
+                }
+                continue;
+            }
             match &value.kind {
                 hir::ExprKind::Int(_) | hir::ExprKind::Bool(_) => {}
                 hir::ExprKind::Struct { .. } => self.write_runtime_fields(&path, value),
@@ -2169,7 +2248,10 @@ impl<'p> Lowering<'_, 'p> {
             // The value only means anything once it is in storage, and everything
             // that puts it there goes through `store_struct`.
             hir::ExprKind::AsNbt { .. } => unreachable!("an NBT scalar is not a register value"),
-            hir::ExprKind::Slice { .. } | hir::ExprKind::Nbt(_) => {
+            hir::ExprKind::Slice { .. }
+            | hir::ExprKind::Nbt(_)
+            | hir::ExprKind::Some(_)
+            | hir::ExprKind::None => {
                 unreachable!("a compound is not a register value")
             }
         }
