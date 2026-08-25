@@ -195,7 +195,6 @@ pub struct LetStmt {
     pub span: Span,
 }
 
-/// A written type. Resolved to a real type in HIR.
 /// A generic parameter as written: a type, or a `const` one that stands for a scale
 /// (spec section 3.16).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +222,7 @@ impl ScaleArg {
     }
 }
 
+/// A written type. Resolved to a real type in HIR.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeName {
     /// `&T` / `&mut T`: compile-time only, and legal on a parameter alone.
@@ -266,6 +266,16 @@ pub enum Expr {
     Borrow(BorrowExpr),
     /// `fix::<1000>(1500)`.
     Fix(FixExpr),
+    /// `1..3`, which only `slice` takes.
+    Range(RangeExpr),
+}
+
+/// `a..b`, with either end able to be left out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeExpr {
+    pub start: Option<Box<Expr>>,
+    pub end: Option<Box<Expr>>,
+    pub span: Span,
 }
 
 /// `fix::<S>(e)`: the only way to make a fixed-point value (spec section 3.16).
@@ -360,6 +370,7 @@ impl Expr {
         match self {
             Expr::Int(e) => e.span,
             Expr::Fix(e) => e.span,
+            Expr::Range(e) => e.span,
             Expr::Bool(e) => e.span,
             Expr::Str(e) => e.span,
             Expr::Path(e) => e.span,

@@ -146,6 +146,15 @@ pub enum Inst {
         scale: u32,
         inst: Box<Inst>,
     },
+    /// `execute store success score <dst> <cond>`: the condition's answer as 0 or 1.
+    StoreCond { dst: Reg, cond: Cond },
+    /// `data modify storage <ns>:mw <dst> set string storage <ns>:mw <src> [a] [b]`
+    SetString {
+        dst: String,
+        src: String,
+        start: Option<i32>,
+        end: Option<i32>,
+    },
     /// `execute <cond> run <inst>`. Still one command, so still one instruction.
     Guarded { cond: Cond, inst: Box<Inst> },
     /// A `match`'s `_` arm: run when none of `tags` is the one in `path`. Several
@@ -704,12 +713,26 @@ fn runtime_index(place: &hir::Place) -> Option<&hir::Expr> {
 }
 
 /// The path a macro line writes, with the substitution in place of the index.
+/// A string as SNBT: quoted, with the two characters that cannot stand alone inside
+/// quotes escaped.
+fn quoted(text: &str) -> String {
+    format!("\"{}\"", escaped(text))
+}
+
+/// The inside of a quoted string: the two characters that cannot stand alone there.
+fn escaped(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn spliced(prefix: &str) -> String {
     format!("{prefix}[$({MACRO_INDEX})]")
 }
 
 /// The argument a macro helper reads its index from, under `mw.args`.
 const MACRO_INDEX: &str = "i";
+
+/// The macro parameter a spliced string arrives in.
+const MACRO_TEXT: &str = "s";
 
 /// The tag to store a scalar as when nothing named one.
 fn tag_of(tag: Option<NbtTag>) -> &'static str {
@@ -852,6 +875,122 @@ impl<'p> Lowering<'_, 'p> {
         self.insts.push(Inst::CallWithArgs { path: helper });
     }
 
+    /// `s == "lit"` and `s == other` (spec section 6.27).
+    ///
+    /// Vanilla can only ask whether a path *holds* a value, so the comparison is a
+    /// path match. A literal goes into the match as it is written; another string has
+    /// to be spliced in, which is what makes that case a macro.
+    fn string_compare(
+        &mut self,
+        op: BinaryOp,
+        lhs: &hir::Expr,
+        rhs: &hir::Expr,
+        into: Option<Reg>,
+    ) -> Value {
+        let negated = op == BinaryOp::Ne;
+        let lhs = self.expr_or_copy(Type::Str, lhs);
+        let rhs = self.expr_or_copy(Type::Str, rhs);
+        // Both known now, so the answer is too.
+        if let (Written::Const(a), Written::Const(b)) = (&lhs, &rhs) {
+            return Value::Const(i32::from((a == b) != negated));
+        }
+        // `execute store success` names its destination, so the answer goes straight
+        // where it is wanted.
+        let dst = into.unwrap_or_else(|| self.temps_next());
+        let (path, other) = match (lhs, rhs) {
+            (Written::Data(path), other) | (other, Written::Data(path)) => (path, other),
+            _ => unreachable!("a string is never a register"),
+        };
+        let (parent, key) = self.filterable(path);
+        match other {
+            Written::Const(text) => self.insts.push(Inst::StoreCond {
+                dst: dst.clone(),
+                cond: Cond::Data {
+                    path: parent,
+                    filter: format!("{{{key}:{text}}}"),
+                    negated,
+                },
+            }),
+            Written::Data(src) => {
+                let helper = self.macro_helper(
+                    "streq",
+                    Inst::StoreCond {
+                        dst: dst.clone(),
+                        cond: Cond::Data {
+                            path: parent,
+                            filter: format!("{{{key}:\"$({MACRO_TEXT})\"}}"),
+                            negated,
+                        },
+                    },
+                );
+                self.insts.push(Inst::CopyData {
+                    dst: format!("mw.args.{MACRO_TEXT}"),
+                    src,
+                });
+                self.insts.push(Inst::CallWithArgs { path: helper });
+            }
+            Written::Reg(_) => unreachable!("a string is never a register"),
+        }
+        Value::Reg(dst)
+    }
+
+    /// A path split into the compound that holds it and the key inside, which is the
+    /// form `execute if data` needs to match a value.
+    ///
+    /// A path that does not end in a key — an element of a list — is copied into
+    /// `mw.tmp` first, which is the same trick `match` uses (spec section 6.20).
+    fn filterable(&mut self, path: String) -> (String, String) {
+        match path.rsplit_once('.') {
+            Some((parent, key)) if !key.ends_with(']') => (parent.to_owned(), key.to_owned()),
+            _ => {
+                // A temporary rather than a fixed path: whatever is in storage has to
+                // be saved and restored across recursion, and `data_temp` is what the
+                // save list is built from.
+                let temp = self.data_temp();
+                self.insts.push(Inst::CopyData {
+                    dst: temp.clone(),
+                    src: path,
+                });
+                let (parent, key) = temp.rsplit_once('.').expect("a temp path has a key");
+                (parent.to_owned(), key.to_owned())
+            }
+        }
+    }
+
+    /// `a + b` on strings: one macro line, with every literal part already in it
+    /// (spec section 6.27).
+    fn concat_into(&mut self, path: &str, lhs: &hir::Expr, rhs: &hir::Expr) {
+        let mut spliced = false;
+        let mut body = String::new();
+        for (side, name) in [(lhs, "a"), (rhs, "b")] {
+            match &side.kind {
+                hir::ExprKind::Str(text) => body.push_str(&escaped(text)),
+                _ => {
+                    let Written::Data(src) = self.expr_or_copy(Type::Str, side) else {
+                        unreachable!("a string is a literal or a path")
+                    };
+                    self.insts.push(Inst::CopyData {
+                        dst: format!("mw.args.{name}"),
+                        src,
+                    });
+                    body.push_str(&format!("$({name})"));
+                    spliced = true;
+                }
+            }
+        }
+        let write = Inst::SetValue {
+            path: path.to_owned(),
+            value: format!("\"{body}\""),
+        };
+        // Two literals joined is still a literal: nothing has to be substituted.
+        if !spliced {
+            self.insts.push(write);
+            return;
+        }
+        let helper = self.macro_helper("concat", write);
+        self.insts.push(Inst::CallWithArgs { path: helper });
+    }
+
     /// Evaluates a value into whatever a storage write can take: a literal, a register
     /// or a path to copy from.
     fn expr_or_copy(&mut self, ty: Type, value: &hir::Expr) -> Written {
@@ -865,6 +1004,8 @@ impl<'p> Lowering<'_, 'p> {
             };
         }
         match &value.kind {
+            // A literal is SNBT already; nothing has to hold it first.
+            hir::ExprKind::Str(text) => Written::Const(quoted(text)),
             hir::ExprKind::Local(local) => Written::Data(local_path(self.function, *local)),
             hir::ExprKind::Field(place) if place.is_static() => {
                 Written::Data(place_path(self.function, place))
@@ -1045,6 +1186,21 @@ impl<'p> Lowering<'_, 'p> {
                 });
                 self.write_runtime_fields(path, value);
             }
+            hir::ExprKind::Binary(BinaryOp::Add, lhs, rhs) => self.concat_into(path, lhs, rhs),
+            hir::ExprKind::Slice { place, start, end } => {
+                let src = place_path(self.function, place);
+                self.insts.push(Inst::SetString {
+                    dst: path.to_owned(),
+                    src,
+                    start: *start,
+                    end: *end,
+                });
+            }
+            // A literal is one `set value`, the same as any other constant.
+            hir::ExprKind::Str(text) => self.insts.push(Inst::SetValue {
+                path: path.to_owned(),
+                value: quoted(text),
+            }),
             hir::ExprKind::Local(local) => {
                 let src = local_path(self.function, *local);
                 self.insts.push(Inst::CopyData {
@@ -1112,6 +1268,7 @@ impl<'p> Lowering<'_, 'p> {
         let suffix = tag.map(NbtTag::suffix).unwrap_or_default();
         match &value.kind {
             hir::ExprKind::Int(n) => format!("{n}{suffix}"),
+            hir::ExprKind::Str(text) => quoted(text),
             hir::ExprKind::Bool(b) => format!("{}{suffix}", i32::from(*b)),
             hir::ExprKind::Struct { id, fields } => {
                 let def = self.program.types.struct_def(*id);
@@ -1143,6 +1300,7 @@ impl<'p> Lowering<'_, 'p> {
             _ => match value.ty {
                 Type::Struct(_) | Type::Enum(_) => "{}".to_owned(),
                 Type::Vec(_) => "[]".to_owned(),
+                Type::Str => "\"\"".to_owned(),
                 _ => format!("0{suffix}"),
             },
         }
@@ -1264,6 +1422,15 @@ impl<'p> Lowering<'_, 'p> {
     /// evaluated before the store.
     fn expr_into(&mut self, dst: Reg, expr: &hir::Expr) {
         match &expr.kind {
+            // A string comparison writes its own destination too, but it is a path
+            // match rather than a score comparison (spec section 6.27).
+            hir::ExprKind::Binary(op, lhs, rhs) if lhs.ty == Type::Str => {
+                match self.string_compare(*op, lhs, rhs, Some(dst.clone())) {
+                    // Both sides were literals, so nothing was stored yet.
+                    value @ Value::Const(_) => self.copy_into(dst, value),
+                    Value::Reg(_) => {}
+                }
+            }
             hir::ExprKind::Binary(op, lhs, rhs) if is_comparison(*op) => {
                 let lhs = self.expr(lhs);
                 let rhs = self.expr(rhs);
@@ -1941,6 +2108,7 @@ impl<'p> Lowering<'_, 'p> {
             // The value only means anything once it is in storage, and everything
             // that puts it there goes through `store_struct`.
             hir::ExprKind::AsNbt { .. } => unreachable!("an NBT scalar is not a register value"),
+            hir::ExprKind::Slice { .. } => unreachable!("a string is not a register value"),
         }
     }
 
@@ -1978,6 +2146,11 @@ impl<'p> Lowering<'_, 'p> {
 
     fn binary(&mut self, op: BinaryOp, lhs: &hir::Expr, rhs: &hir::Expr) -> Value {
         use BinaryOp::*;
+        // Strings are matched, not compared: there is no `scoreboard` value to put
+        // one in (spec section 6.27).
+        if lhs.ty == Type::Str {
+            return self.string_compare(op, lhs, rhs, None);
+        }
         let is_bool = lhs.ty == Type::Bool;
         match op {
             And | Or if !is_pure(rhs) => {

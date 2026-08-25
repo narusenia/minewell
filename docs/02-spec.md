@@ -448,6 +448,18 @@ primary       += "fix" "::" "<" scale ">" "(" expr ")"
 - 型引数と同じく**書かずに決まる**。`fix<S>` を取る関数に `fix<1000>` を渡せば
   `S` は 1000。決まらない書き方はエラー（[§4.12](#412-ジェネリクス--確定m7)）
 
+### 3.17 範囲 — 確定（M8）
+
+```
+expr        := assign
+assign      := range [assign_op range]
+range       := or [".." [or]]
+```
+
+`slice` の添字を書くためだけにある（[§4.17](#417-string--確定m8)）。**`Range` という型は無く**、
+`slice` の引数以外の位置に書くとエラー。ここに置いたのは、境界を式として書けるように
+するため — 範囲専用の文法をもう 1 つ作るより小さい。
+
 ### 3.5 未定
 
 以降のタスクが、実装の直前に確定させる。
@@ -746,6 +758,28 @@ Minecraft が黙って無視するので、型で区別する（要件定義 §4
 - **エンティティ・ブロックの NBT はまだ読めない。** 失敗しうる読み取りであり、
   `Option<T>` を返す stdlib（要件定義 §9）と一緒に入るのが正しい
 
+### 4.17 `String` — 確定（M8）
+
+storage 上の**不変値型**。バニラができる操作だけを持つ（要件定義 §4.4）。
+
+| 式 | 意味 | コスト |
+|---|---|---|
+| `"abc"` | リテラル | 無料（`set value` 1 つ） |
+| `s.len()` | 長さ | 1 コマンド（`data get` が文字列に長さを返す） |
+| `s.slice(1..3)` | 部分文字列 | 1 コマンド。**添字はコンパイル時定数** |
+| `s == "lit"` | リテラルとの比較 | 1 コマンド（`execute if data ... {s:"lit"}`） |
+| `s == t` | 実行時どうしの比較 | マクロ昇格 |
+| `s + t` | 連結 | マクロ昇格。両辺リテラルなら無料 |
+| 検索・置換・分割 | — | **持たない**（バニラに対応物が無い） |
+
+- `String` は score に載らないので、`i32` や `fix<S>` と混ぜるとエラー。
+  数との相互変換も無い（`text!` が入る M9 まで、文字列に数を混ぜる手段は無い）
+- `+` は連結**だけ**。`-` `*` `/` `%` は無い
+- `s.slice(a..b)` の範囲は `a..b` / `a..` / `..b` を書ける。**範囲は式ではない** —
+  `slice` の引数の位置にしか書けず、`Range` という型は無い
+- **リテラルどうしの `==` と `+` はコンパイル時に片付く。** 静的に分かるものは無料
+  （設計原則 1）
+
 ## 5. 型の表現 — M6 と `struct` の範囲まで確定
 
 | 型 | 置き場所 | 表現 |
@@ -757,6 +791,7 @@ Minecraft が黙って無視するので、型で区別する（要件定義 §4
 | `struct` | storage | NBT compound（[§6.18](#618-struct-の配置と構築--確定m7)） |
 | `enum` | storage | `tag` を持つ NBT compound |
 | `Vec<T>` | storage | NBT list |
+| `String` | storage | NBT の `String`（[§4.17](#417-string--確定m8)） |
 | `Selector` / `ResourceLocation` / `Pos` | どこにも置かない | コンパイル時のみ |
 
 置き場所は **score / storage / コンパイル時のみ** の 3 分類になる。2 分類（実行時か否か）
@@ -1423,3 +1458,45 @@ execute store result score $main.x myns.v \
 - **読みの scale は `S` そのもの。** `data get <path> S` は掛けてから floor する
 - 実行時添字の先にある値でも同じ。マクロ補助関数の中の `data get` に scale が付くだけで、
   マクロ性は呼び出し側に伝染しない（[§6.21](#621-vect--確定m7)）
+
+### 6.27 `String` — 確定（M8）
+
+```rust
+fn main() {
+    let a = "ab";
+    let b = a + "cd";
+    let c = b.slice(1..3);
+    let x = a == "ab";
+    let y = a == b;
+    let n = b.len();
+}
+```
+
+```
+data modify storage myns:mw mw.vars.main.a set value "ab"
+data modify storage myns:mw mw.args.a set from storage myns:mw mw.vars.main.a
+function myns:main/concat_0 with storage myns:mw mw.args
+data modify storage myns:mw mw.vars.main.c set string storage myns:mw mw.vars.main.b 1 3
+execute store success score $main.x myns.v if data storage myns:mw mw.vars.main{a:"ab"}
+data modify storage myns:mw mw.args.s set from storage myns:mw mw.vars.main.b
+function myns:main/streq_1 with storage myns:mw mw.args
+execute store result score $main.n myns.v run data get storage myns:mw mw.vars.main.b
+
+main/concat_0:
+  $data modify storage myns:mw mw.vars.main.b set value "$(a)cd"
+
+main/streq_1:
+  $execute store success score $main.y myns.v if data storage myns:mw mw.vars.main{a:"$(s)"}
+```
+
+- **比較は照合。** バニラに「2 つの文字列を比べる」コマンドは無く、あるのは
+  「このパスはこの値を持つか」だけ。だから `s == "lit"` は親のパスへの
+  `{キー:"lit"}` 照合になる。リストの要素のように**キーで終わらないパスは
+  `mw.tmp` の一時に写してから**照合する（`match` と同じ手）
+- **相手が実行時の文字列ならマクロ**。照合の中に値を差し込む以外に方法が無い。
+  差し込みはマクロ関数の中だけで起き、呼び出し側は昇格しない（要件定義 §10.1）
+- **連結もマクロ**。ただしリテラルの部分は macro の値に直接埋め込むので、
+  `a + "cd"` の引数は 1 つで済む。両辺リテラルならマクロ自体が消える
+- `slice` は `data modify ... set string`（1.19.4+）。添字が定数なので 1 コマンド
+- 生成関数（`concat_0` / `streq_1`）は呼び出し元の関数のサブディレクトリに置く
+  （[§6.11](#611-生成関数の命名)）

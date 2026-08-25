@@ -357,6 +357,8 @@ fn print_generated_commands() {
          fn main() { let mut s = State::Chasing { target: 3 }; let mut x = 0;
                      match s { State::Idle => { x = 1; }
                                State::Chasing { target } => { x = target; } } }",
+        r#"fn main() { let a = "ab"; let b = a + "cd"; let c = b.slice(1..3);
+                      let x = a == "ab"; let y = a == b; let n = b.len(); }"#,
         "struct Mob { pos: f64 }
          fn main() { let a = fix::<1000>(1500); let m = Mob { pos: a.as_f64() };
                      let x = fix::<1000>(m.pos); }",
@@ -1730,5 +1732,122 @@ mod round_trip {
              fn main() { let a = fix::<1000>(1500); let m = Mob { pos: a.as_f64() }; \
                          let x = fix::<1000>(m.pos); }");
         assert_eq!(cost(&mc), 1 + 1 + 2 + 2);
+    }
+}
+
+/// Strings: what vanilla can do with one, and nothing more (spec section 4.17).
+mod strings {
+    use super::harness::{at_path, cost, local, run};
+    use tinymcf::nbt::NbtValue;
+
+    #[test]
+    fn a_literal_lands_in_storage() {
+        let mc = run(r#"fn main() { let s = "hi"; }"#);
+        assert_eq!(
+            at_path(&mc, "mw.vars.main.s"),
+            Some(NbtValue::String("hi".to_owned()))
+        );
+        assert_eq!(cost(&mc), 1);
+    }
+
+    #[test]
+    fn len_is_one_command_and_no_macro() {
+        let mc = run(r#"fn main() { let s = "hello"; let x = s.len(); }"#);
+        assert_eq!(local(&mc, "main", "x"), Some(5));
+        // `set value` and the `execute store ... run data get` behind it.
+        assert_eq!(cost(&mc), 1 + 2);
+    }
+
+    #[test]
+    fn comparing_against_a_literal_is_one_command() {
+        let mc = run(r#"fn main() { let s = "hi"; let x = s == "hi"; let y = s == "no"; }"#);
+        assert_eq!(local(&mc, "main", "x"), Some(1));
+        assert_eq!(local(&mc, "main", "y"), Some(0));
+        // `set value`, then one `execute store success ... if data` each.
+        assert_eq!(cost(&mc), 3);
+    }
+
+    #[test]
+    fn two_literals_are_compared_while_compiling() {
+        let mc = run(r#"fn main() { let x = "a" == "a"; let y = "a" != "a"; }"#);
+        assert_eq!(local(&mc, "main", "x"), Some(1));
+        assert_eq!(local(&mc, "main", "y"), Some(0));
+        assert_eq!(cost(&mc), 2);
+    }
+
+    #[test]
+    fn comparing_two_strings_at_runtime_works() {
+        let mc = run(r#"fn main() { let a = "hi"; let b = "hi"; let c = "no";
+                          let x = a == b; let y = a == c; }"#);
+        assert_eq!(local(&mc, "main", "x"), Some(1));
+        assert_eq!(local(&mc, "main", "y"), Some(0));
+    }
+
+    #[test]
+    fn joining_two_literals_needs_no_macro() {
+        let mc = run(r#"fn main() { let s = "ab" + "cd"; let x = s.len(); }"#);
+        assert_eq!(local(&mc, "main", "x"), Some(4));
+        assert_eq!(cost(&mc), 1 + 2);
+    }
+
+    #[test]
+    fn joining_a_runtime_string_splices_it() {
+        let mc =
+            run(r#"fn main() { let a = "ab"; let s = a + "cd"; let t = s + a; let x = t.len(); }"#);
+        assert_eq!(
+            at_path(&mc, "mw.vars.main.s"),
+            Some(NbtValue::String("abcd".to_owned()))
+        );
+        assert_eq!(
+            at_path(&mc, "mw.vars.main.t"),
+            Some(NbtValue::String("abcdab".to_owned()))
+        );
+        assert_eq!(local(&mc, "main", "x"), Some(6));
+    }
+
+    #[test]
+    fn a_constant_slice_is_one_command() {
+        let mc = run(
+            r#"fn main() { let s = "abcdef"; let a = s.slice(1..3); let b = s.slice(2..);
+                          let x = a.len(); }"#,
+        );
+        assert_eq!(
+            at_path(&mc, "mw.vars.main.a"),
+            Some(NbtValue::String("bc".to_owned()))
+        );
+        assert_eq!(
+            at_path(&mc, "mw.vars.main.b"),
+            Some(NbtValue::String("cdef".to_owned()))
+        );
+        assert_eq!(local(&mc, "main", "x"), Some(2));
+    }
+
+    #[test]
+    fn a_string_survives_recursion() {
+        // Every string here lives in storage, so the saves and restores around the
+        // recursive call have to cover them (spec section 6.13).
+        let mc = run(r#"fn grow(s: String, n: i32) -> i32 {
+                   if n <= 0 { return 0; }
+                   let t = s + "xy";
+                   let rest = grow(t, n - 1);
+                   return rest + s.len();
+               }
+               fn main() { let x = grow("a", 2); }"#);
+        // The tails are "axy" and "a": 3 + 1.
+        assert_eq!(local(&mc, "main", "x"), Some(4));
+    }
+
+    #[test]
+    fn comparing_an_element_of_a_list() {
+        let mc = run(r#"fn main() { let v = ["a", "b"]; let x = v[1] == "b"; }"#);
+        assert_eq!(local(&mc, "main", "x"), Some(1));
+    }
+
+    #[test]
+    fn a_string_copies_and_passes() {
+        let mc = run(r#"struct Tag { name: String }
+               fn take(t: Tag) -> i32 { return t.name.len(); }
+               fn main() { let s = "abcd"; let t = Tag { name: s }; let x = take(t); }"#);
+        assert_eq!(local(&mc, "main", "x"), Some(4));
     }
 }

@@ -676,7 +676,7 @@ impl Parser {
     }
 
     fn assign(&mut self) -> Option<Expr> {
-        let lhs = self.or()?;
+        let lhs = self.range()?;
         let op = match self.peek() {
             Some(TokenKind::Punct(Punct::Eq)) => None,
             Some(TokenKind::Punct(Punct::PlusEq)) => Some(BinaryOp::Add),
@@ -690,6 +690,7 @@ impl Parser {
         self.bump();
         // Right associative: `a = b = c` is `a = (b = c)`.
         let value = self.assign()?;
+
         if !matches!(lhs, Expr::Path(_) | Expr::Field(_) | Expr::Index(_)) {
             self.errors.push(SyntaxError::new(
                 op_span,
@@ -706,6 +707,29 @@ impl Parser {
             target: Box::new(lhs),
             value: Box::new(value),
             span,
+        }))
+    }
+
+    /// `a..b`. Only `slice` takes one, but it parses here so that the bounds are
+    /// ordinary expressions rather than a second grammar (spec section 3.17).
+    fn range(&mut self) -> Option<Expr> {
+        let start = self.or()?;
+        if self.peek() != Some(&TokenKind::Punct(Punct::DotDot)) {
+            return Some(start);
+        }
+        let span = start.span();
+        self.bump();
+        let end = match self.peek() {
+            Some(TokenKind::Punct(Punct::RParen | Punct::Comma)) => None,
+            _ => Some(Box::new(self.or()?)),
+        };
+        Some(Expr::Range(RangeExpr {
+            span: Span {
+                start: span.start,
+                end: self.previous_end(),
+            },
+            start: Some(Box::new(start)),
+            end,
         }))
     }
 

@@ -75,6 +75,8 @@ pub enum Type {
     Resource,
     /// `pos!(~ ~1 ~)`. Compile-time only.
     Pos,
+    /// An immutable string in storage (spec section 4.17).
+    Str,
     /// A composite value. It lives in storage rather than in a register, which is a
     /// third category: neither a score nor compile-time only (spec section 5).
     Struct(StructId),
@@ -96,6 +98,7 @@ impl Type {
             "i64" => Some(Type::I64),
             "f32" => Some(Type::F32),
             "f64" => Some(Type::F64),
+            "String" => Some(Type::Str),
             "bool" => Some(Type::Bool),
             // Deliberately not spellable in a type annotation: a selector is inferred
             // from the literal, never declared.
@@ -111,12 +114,18 @@ impl Type {
 
     /// Whether values of this type live in storage rather than on the scoreboard.
     pub fn is_storage(&self) -> bool {
-        self.is_compound() || self.is_nbt_scalar()
+        self.is_compound() || self.is_storage_scalar()
     }
 
     /// Whether this is a structure in storage, rather than one value in it.
     pub fn is_compound(&self) -> bool {
         matches!(self, Type::Struct(_) | Type::Enum(_) | Type::Vec(_))
+    }
+
+    /// Whether values of this type live in storage without being a structure: one
+    /// tag, one value.
+    pub fn is_storage_scalar(&self) -> bool {
+        self.is_nbt_scalar() || *self == Type::Str
     }
 
     /// Whether this is one of the types that exists to match an NBT tag exactly.
@@ -136,6 +145,7 @@ impl Type {
             Type::I64 => "i64",
             Type::F32 => "f32",
             Type::F64 => "f64",
+            Type::Str => "String",
             // Only where the scale cannot be spelled; `Types::name_of` writes it out.
             Type::Fix(_) => "fix",
             Type::Selector => "selector",
@@ -851,6 +861,13 @@ pub enum ExprKind {
     AsNbt {
         value: Box<Expr>,
         scale: u32,
+    },
+    /// `s.slice(1..3)`: a piece of a string, taken by `data modify ... set string`
+    /// (spec section 6.27). Both bounds are known while compiling.
+    Slice {
+        place: Place,
+        start: Option<i32>,
+        end: Option<i32>,
     },
 }
 
@@ -2686,6 +2703,61 @@ impl FnLowering<'_> {
         }
     }
 
+    /// The methods a `String` has: only the ones vanilla can do (spec section 4.17).
+    fn string_method(&mut self, place: Place, call: &ast::MethodCall) -> Option<Expr> {
+        let span = call.span;
+        match call.name.name.as_str() {
+            "len" => {
+                if !call.args.is_empty() {
+                    self.error(span, "'len' takes no arguments");
+                    return None;
+                }
+                // `data get` on a string answers with its length, which is why this
+                // costs one command and not a loop.
+                Some(Expr {
+                    kind: ExprKind::Len(place),
+                    ty: Type::I32,
+                    span,
+                })
+            }
+            "slice" => {
+                let [ast::Expr::Range(range)] = call.args.as_slice() else {
+                    self.error(span, "'slice' takes one range, as in 's.slice(1..3)'");
+                    return None;
+                };
+                // The bounds are part of the command's text, so they have to be known
+                // now. A runtime bound would need a macro, and nothing asks for one.
+                let bound = |value: &Option<Box<ast::Expr>>| match value.as_deref() {
+                    None => Ok(None),
+                    Some(ast::Expr::Int(lit)) => Ok(Some(lit.value)),
+                    Some(other) => Err(other.span()),
+                };
+                let (start, end) = match (bound(&range.start), bound(&range.end)) {
+                    (Ok(start), Ok(end)) => (start, end),
+                    (Err(span), _) | (_, Err(span)) => {
+                        self.error(span, "a slice's bounds have to be known while compiling");
+                        return None;
+                    }
+                };
+                Some(Expr {
+                    kind: ExprKind::Slice { place, start, end },
+                    ty: Type::Str,
+                    span,
+                })
+            }
+            name => {
+                self.error(
+                    call.name.span,
+                    format!(
+                        "'String' has no method named '{name}'; vanilla can measure, \
+                         slice and compare a string, and nothing else"
+                    ),
+                );
+                None
+            }
+        }
+    }
+
     /// `x.as_f64()` and `d.as_i32()`: the two directions of the score/storage round
     /// trip (spec section 4.16).
     fn convert(&mut self, place: Place, target: Type, call: &ast::MethodCall) -> Option<Expr> {
@@ -2761,6 +2833,9 @@ impl FnLowering<'_> {
         // functions: the receiver is what decides which direction this is.
         if let Some(target) = Type::parse(call.name.name.strip_prefix("as_").unwrap_or("")) {
             return Some(MethodOutcome::Value(self.convert(place, target, call)?));
+        }
+        if place.ty == Type::Str {
+            return self.string_method(place, call).map(MethodOutcome::Value);
         }
         let Type::Vec(id) = place.ty else {
             let (found, name) = (self.ty(place.ty), &call.name.name);
@@ -2910,8 +2985,7 @@ impl FnLowering<'_> {
             }),
             AstExpr::Str(lit) => Some(Expr {
                 kind: ExprKind::Str(lit.value.clone()),
-                // Strings are compile-time only until M8 gives them a storage home.
-                ty: Type::Resource,
+                ty: Type::Str,
                 span,
             }),
             AstExpr::Resource(lit) => Some(Expr {
@@ -2947,6 +3021,13 @@ impl FnLowering<'_> {
                     kind: ExprKind::Field(place),
                     span,
                 })
+            }
+            AstExpr::Range(range) => {
+                self.error(
+                    range.span,
+                    "a range is only the argument of 'slice'; there is no range type",
+                );
+                None
             }
             AstExpr::List(lit) => self.list_lit(lit, None),
             AstExpr::Method(call) => match self.method_call(call, false)? {
@@ -3075,6 +3156,27 @@ impl FnLowering<'_> {
                 );
                 return None;
             }
+        }
+        // A string is in storage, but it is one value rather than a structure, and
+        // vanilla can compare and splice one (spec section 4.17).
+        if lhs.ty == Type::Str || rhs.ty == Type::Str {
+            if lhs.ty != rhs.ty {
+                let (a, b) = (self.ty(lhs.ty), self.ty(rhs.ty));
+                self.error(span, format!("cannot mix {a} with {b}"));
+                return None;
+            }
+            return match op {
+                Eq | Ne => Some(Type::Bool),
+                Add => Some(Type::Str),
+                _ => {
+                    self.error(
+                        span,
+                        "a String has no arithmetic; '+' joins two of them and \
+                         that is the whole of it",
+                    );
+                    None
+                }
+            };
         }
         // A fix is an integer with a scale attached, and the scale decides which
         // operands go together (spec section 4.14).

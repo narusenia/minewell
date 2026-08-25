@@ -327,6 +327,26 @@ fn command(inst: &Inst, ns: &str) -> String {
             )
         }
         Inst::Return { value } => format!("return {value}"),
+        Inst::StoreCond { dst, cond } => {
+            let (d, dobj) = (&dst.holder, objective(ns, dst));
+            format!(
+                "execute store success score {d} {dobj} {}",
+                condition(cond, ns)
+            )
+        }
+        Inst::SetString {
+            dst,
+            src,
+            start,
+            end,
+        } => {
+            let bounds = match (start, end) {
+                (None, None) => String::new(),
+                (start, None) => format!(" {}", start.unwrap_or(0)),
+                (start, Some(end)) => format!(" {} {end}", start.unwrap_or(0)),
+            };
+            format!("data modify storage {ns}:mw {dst} set string storage {ns}:mw {src}{bounds}")
+        }
         Inst::Guarded { cond, inst } => {
             format!("execute {} run {}", condition(cond, ns), command(inst, ns))
         }
