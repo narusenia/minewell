@@ -63,19 +63,17 @@ fn the_arena_example_does_what_it_says() {
     for (i, id) in zombies.iter().enumerate() {
         mc.world.spawn(id, [i as f64, 64.0, 0.0]);
     }
+    // The first one is nearly dead; the rest have no Health key at all, which is
+    // what `Option` reads as `None`.
+    mc.world.entity_mut("z0").expect("spawned").nbt =
+        tinymcf::snbt::parse("{Health:2.5f}").expect("snbt");
     mc.world
         .bind_selector("@e[type=zombie, distance=..12]", zombies);
     mc.call("arena:tick");
 
-    // `data merge entity` is the one thing here the interpreter does not model
-    // (`crates/tinymcf/SPEC.md` section 4.2); everything else has to be silent.
-    assert!(
-        mc.diagnostics
-            .iter()
-            .all(|d| d.contains("entity targets are not modelled")),
-        "{:?}",
-        mc.diagnostics
-    );
+    // Nothing here may fail: entity NBT is modelled now, so silence is the whole
+    // assertion (`crates/tinymcf/SPEC.md` section 4.2).
+    assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
 
     let effects: Vec<(&str, &str)> = mc
         .effects
@@ -90,6 +88,14 @@ fn the_arena_example_does_what_it_says() {
             .filter(|(name, _)| *name == "setblock")
             .count(),
         3,
+        "{effects:?}"
+    );
+    // The view wrote through to the entity, and the one with a Health below 5 made
+    // the pling sound.
+    let z0 = mc.world.entity("z0").expect("spawned").nbt.to_string();
+    assert!(z0.contains("Glowing:1b"), "{z0}");
+    assert!(
+        effects.contains(&("playsound", "minecraft:block.note_block.pling master @a")),
         "{effects:?}"
     );
     // Seven is a swarm, so the loud arm runs and the quiet one does not.

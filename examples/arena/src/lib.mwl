@@ -89,6 +89,20 @@ fn total<T>(v: Vec<T>) -> i32 {
     return v.len();
 }
 
+/// A window onto an entity's NBT. Not a value: the fields are paths on whatever the
+/// selector found, and making one costs no commands at all.
+///
+/// The declaration is where the mistakes get caught. `Health` is a `Float` holding the
+/// real number, so reading it into a `fix<1000>` is `data get entity @s Health 1000` —
+/// written once here rather than at every use.
+#[entity]
+struct Mob {
+    #[nbt(float, rename = "Health")]
+    hp: Option<fix<1000>>,
+    #[nbt(byte, rename = "Glowing")]
+    glowing: Option<i32>,
+}
+
 /// `#[ctx(entity)]` says this needs an executor. Calling it without one is a compile
 /// error — in vanilla it would run, do nothing, and say nothing.
 #[ctx(entity)]
@@ -96,7 +110,16 @@ fn seal() {
     // `~ ~2 ~` is relative to the position the caller is `at`, and is known while
     // compiling, so it costs nothing to pass.
     setblock(pos!(~ ~2 ~), minecraft:stone);
-    merge_entity(@s, "{Glowing:1b}");
+
+    let mut m = Mob::of(@s);
+    m.glowing = Some(1);
+    // A key vanilla never wrote reads as `None`; there is nothing to test for it
+    // beyond asking whether the path is there.
+    if let Some(hp) = m.hp {
+        if hp < fix::<1000>(5000) {
+            play_sound(minecraft:block.note_block.pling, @a);
+        }
+    }
 }
 
 #[tick]
