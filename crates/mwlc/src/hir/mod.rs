@@ -885,10 +885,45 @@ pub struct Selector {
     pub span: Span,
 }
 
+/// One piece of a `raw!` command (spec section 6.31).
+///
+/// A constant interpolation is already folded into the literal beside it; only a value
+/// that is not known until runtime survives as a part of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawPart {
+    Lit(String),
+    Value(Expr),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawCommand {
-    pub text: String,
+    pub parts: Vec<RawPart>,
     pub span: Span,
+}
+
+impl RawCommand {
+    pub fn literal(text: String, span: Span) -> Self {
+        Self {
+            parts: vec![RawPart::Lit(text)],
+            span,
+        }
+    }
+
+    /// The whole command, when nothing in it has to wait for runtime.
+    pub fn as_text(&self) -> Option<&str> {
+        match self.parts.as_slice() {
+            [RawPart::Lit(text)] => Some(text),
+            _ => None,
+        }
+    }
+}
+
+/// What a `{name}` in a `raw!` string turned out to be.
+enum Interpolated {
+    /// A compile-time value: it goes into the string and costs nothing.
+    Const(String),
+    /// A value only the running game knows, which promotes the line to a macro.
+    Value(Expr),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2240,10 +2275,7 @@ impl FnLowering<'_> {
                 let ExprKind::Command(text) = self.command(call)?.kind else {
                     return None;
                 };
-                Some(Stmt::Raw(RawCommand {
-                    text,
-                    span: call.span,
-                }))
+                Some(Stmt::Raw(RawCommand::literal(text, call.span)))
             }
             ast::Stmt::Expr(AstExpr::Call(call)) => {
                 let (callee, _, args) = self.call_parts(call)?;
@@ -4377,24 +4409,109 @@ impl FnLowering<'_> {
     }
 
     fn raw(&mut self, call: &ast::MacroCall) -> Option<RawCommand> {
-        match call.tokens.as_slice() {
-            [token] => match &token.kind {
-                TokenKind::Str(text) => Some(RawCommand {
-                    text: text.clone(),
-                    span: call.span,
-                }),
-                _ => {
-                    self.error(token.span, "raw! takes a string literal");
-                    None
-                }
-            },
+        let token = match call.tokens.as_slice() {
+            [token] => token,
             [] => {
                 self.error(call.span, "raw! takes a string literal");
-                None
+                return None;
             }
             tokens => {
-                let span = tokens[1].span;
-                self.error(span, "raw! takes a single string literal");
+                self.error(tokens[1].span, "raw! takes a single string literal");
+                return None;
+            }
+        };
+        let TokenKind::Str(text) = &token.kind else {
+            self.error(token.span, "raw! takes a string literal");
+            return None;
+        };
+        self.interpolate(&text.clone(), token.span, call.span)
+    }
+
+    /// Splits a `raw!` string into literals and the values written `{name}`
+    /// (spec section 3.21).
+    ///
+    /// `{` always opens an interpolation. Falling back to "a name that does not
+    /// resolve is just text" would let a typo through silently, which is the whole
+    /// reason this language exists.
+    fn interpolate(&mut self, text: &str, span: Span, call: Span) -> Option<RawCommand> {
+        let mut parts = Vec::new();
+        let mut lit = String::new();
+        let mut rest = text;
+        let mut ok = true;
+        while let Some(at) = rest.find(['{', '}']) {
+            let (before, tail) = rest.split_at(at);
+            lit.push_str(before);
+            let (brace, tail) = tail.split_at(1);
+            // `{{` and `}}` are the characters themselves.
+            if let Some(after) = tail.strip_prefix(brace) {
+                lit.push_str(brace);
+                rest = after;
+                continue;
+            }
+            if brace == "}" {
+                self.error(
+                    span,
+                    "this '}' in raw! closes nothing; write '}}' to mean the character",
+                );
+                return None;
+            }
+            let Some(end) = tail.find('}') else {
+                self.error(
+                    span,
+                    "this '{' in raw! is never closed; write '{{' to mean the character",
+                );
+                return None;
+            };
+            let (name, after) = tail.split_at(end);
+            rest = &after[1..];
+            match self.interpolated(name, span) {
+                Some(Interpolated::Const(text)) => lit.push_str(&text),
+                Some(Interpolated::Value(value)) => {
+                    parts.push(RawPart::Lit(std::mem::take(&mut lit)));
+                    parts.push(RawPart::Value(value));
+                }
+                None => ok = false,
+            }
+        }
+        lit.push_str(rest);
+        parts.push(RawPart::Lit(lit));
+        ok.then_some(RawCommand { parts, span: call })
+    }
+
+    /// What `{name}` stands for: text that is known now, or a value to splice in.
+    fn interpolated(&mut self, name: &str, span: Span) -> Option<Interpolated> {
+        if name.is_empty() {
+            self.error(span, "raw! needs a name between the braces");
+            return None;
+        }
+        let value = self.expr(&AstExpr::Path(ast::Ident {
+            name: name.to_owned(),
+            span,
+        }))?;
+        if let ExprKind::Local(local) = &value.kind
+            && let Some(text) = self.selector_aliases.get(local)
+        {
+            return Some(Interpolated::Const(text.clone()));
+        }
+        match value.ty {
+            Type::I32 | Type::Bool | Type::Str => Some(Interpolated::Value(value)),
+            // The scoreboard holds S-ths of a unit, so the digits would not be the
+            // number the author wrote. Showing a real number is `text!`'s job.
+            Type::Fix(_) => {
+                self.error(
+                    span,
+                    format!(
+                        "'{name}' is a fixed-point number, which holds scaled units;                          interpolating it would print the wrong value"
+                    ),
+                );
+                None
+            }
+            ty => {
+                let found = self.ty(ty);
+                self.error(
+                    span,
+                    format!("a {found} cannot be interpolated into a raw! command"),
+                );
                 None
             }
         }
@@ -4765,7 +4882,7 @@ mod tests {
     fn command_text(src: &str) -> String {
         let hir = with_toolchain(src).expect("compiles");
         match &hir.functions[0].body[0] {
-            Stmt::Raw(raw) => raw.text.clone(),
+            Stmt::Raw(raw) => raw.as_text().expect("a command is literal").to_owned(),
             other => panic!("expected a command, found {other:?}"),
         }
     }
@@ -4879,7 +4996,7 @@ mod tests {
         let Stmt::Raw(raw) = &hir.functions[0].body[0] else {
             panic!("expected a raw command")
         };
-        assert_eq!(raw.text, "say hi");
+        assert_eq!(raw.as_text(), Some("say hi"));
     }
 
     #[test]
@@ -4894,6 +5011,44 @@ mod tests {
         assert!(!lower_err("fn main() { raw!(1); }").is_empty());
         assert!(!lower_err(r#"fn main() { raw!("a", "b"); }"#).is_empty());
         assert!(!lower_err("fn main() { raw!(); }").is_empty());
+    }
+
+    #[test]
+    fn an_interpolated_name_has_to_exist() {
+        let errors = lower_err(r#"fn main() { raw!("say {nope}"); }"#);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("nope"), "{errors:?}");
+    }
+
+    #[test]
+    fn an_unmatched_brace_says_to_write_it_twice() {
+        for src in [
+            r#"fn main() { raw!("summon zombie ~ ~ ~ {NoAI:1b"); }"#,
+            r#"fn main() { raw!("say a } b"); }"#,
+        ] {
+            let errors = lower_err(src);
+            assert_eq!(errors.len(), 1, "{src}");
+            assert!(
+                errors[0].message.contains("mean the character"),
+                "{errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn interpolating_a_fixed_point_number_is_refused() {
+        let errors = lower_err(r#"fn main() { let r = fix::<1000>(1500); raw!("say {r}"); }"#);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("scaled"), "{errors:?}");
+    }
+
+    #[test]
+    fn interpolating_a_compound_is_refused() {
+        let errors = lower_err(
+            r#"struct Mob { hp: i32 } fn main() { let m = Mob { hp: 1 }; raw!("say {m}"); }"#,
+        );
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("Mob"), "{errors:?}");
     }
 
     #[test]

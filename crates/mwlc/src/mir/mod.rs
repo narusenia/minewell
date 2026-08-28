@@ -958,10 +958,7 @@ impl<'p> Lowering<'_, 'p> {
             hir::Stmt::Match {
                 scrutinee, arms, ..
             } => self.match_stmt(scrutinee, arms),
-            hir::Stmt::Raw(raw) => self.insts.push(Inst::Raw {
-                text: raw.text.clone(),
-                span: raw.span,
-            }),
+            hir::Stmt::Raw(raw) => self.raw_command(raw),
             hir::Stmt::Let { local, value, .. } if self.local_ty(*local).is_storage() => {
                 let path = local_path(self.function, *local);
                 self.store_struct(&path.into(), value);
@@ -1283,6 +1280,62 @@ impl<'p> Lowering<'_, 'p> {
             path: format!("mw.args.{MACRO_INDEX}").into(),
             tag: "int",
             inst: Box::new(Inst::Get { src }),
+        });
+    }
+
+    /// `raw!`, with any runtime value spliced in through a macro helper
+    /// (spec section 6.31).
+    ///
+    /// The helper is what keeps the `$` line out of this function: a `#[tick]` function
+    /// is called with no arguments, and a macro function called that way fails.
+    fn raw_command(&mut self, raw: &hir::RawCommand) {
+        let mut text = String::new();
+        let mut args = Vec::new();
+        for part in &raw.parts {
+            match part {
+                hir::RawPart::Lit(lit) => text.push_str(lit),
+                hir::RawPart::Value(value) => match self.expr_or_copy(value.ty, value) {
+                    // Known now after all: it can go straight into the line.
+                    Written::Const(literal) if !value.ty.is_storage() => text.push_str(&literal),
+                    written => {
+                        let name = format!("a{}", args.len());
+                        text.push_str(&format!("$({name})"));
+                        args.push((name, written));
+                    }
+                },
+            }
+        }
+        let inst = Inst::Raw {
+            text,
+            span: raw.span,
+        };
+        if args.is_empty() {
+            self.insts.push(inst);
+            return;
+        }
+        let helper = self.macro_helper("raw", inst);
+        // Written last: evaluating a value can itself call a macro helper, which uses
+        // `mw.args` for its own arguments.
+        for (name, written) in args {
+            self.write_macro_arg(&name, written);
+        }
+        self.insts.push(Inst::CallWithArgs { path: helper });
+    }
+
+    /// Puts one value where the macro helper will read it from.
+    fn write_macro_arg(&mut self, name: &str, written: Written) {
+        let path = DataRef::from(format!("mw.args.{name}"));
+        self.insts.push(match written {
+            Written::Const(value) => Inst::SetValue { path, value },
+            Written::Reg(src) => Inst::StoreData {
+                path,
+                tag: "int",
+                inst: Box::new(Inst::Get { src }),
+            },
+            Written::Data(src) => Inst::CopyData {
+                dst: path,
+                src: src.into(),
+            },
         });
     }
 

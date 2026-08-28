@@ -540,6 +540,36 @@ let v = maybe?.expect("the arena always has a keeper");
 - **release では消える。** 文そのものが lowering されないので、条件のために
   取るはずだったテンポラリも生まれない（要件定義 §15）
 
+### 3.21 `raw!` の補間 — 確定（M9）
+
+```
+raw_stmt := "raw" "!" "(" STRING ")" ";"
+```
+
+文字列の中身は、コマンドとしては検査しないが**補間だけは読む**。
+
+| 書き方 | 意味 |
+|---|---|
+| `{名前}` | 束縛の補間 |
+| `{{` / `}}` | `{` / `}` そのもの |
+| 対応しない `{` / `}` | エラー |
+
+```rust
+let z = @e[type=zombie];
+let n = 3;
+raw!("execute as {z} run say {n}");
+raw!("summon zombie ~ ~ ~ {{NoAI:1b}}");
+```
+
+- **`{` はつねに補間の始まり。** 生コマンドは NBT の `{...}` を書くことが多いが、
+  「名前として解決できなければ文字面」にすると**綴り違いが黙って通る**（設計原則 2）。
+  二重に書かせるほうを採り、診断が `{{` を提案する
+- 補間できる型: `Selector`（コンパイル時、無料）と `i32` / `bool` / `String`（実行時、昇格）
+- **`fix<S>` は書けない。** score にあるのはスケール後の整数で、字面が値と食い違う。
+  実数を見せたいのは `text!` の仕事（[§10.3](#103-text-の仕様)）
+- `struct` / `Vec` / `Option` / ビューも書けない。compound をコマンド文字列に
+  埋めても意味を持たない
+
 ### 3.5 未定
 
 以降のタスクが、実装の直前に確定させる。
@@ -1849,3 +1879,37 @@ execute unless score $hurt.hp myns.v matches 1.. run tellraw @a \
 - **release では文ごと消える。** MIR に降りる前に落とすので、条件の評価も
   テンポラリの確保も起きない。「release 出力に assert 由来のコマンドが無い」は
   出力を grep するのではなく、**コマンド数が 0 であること**で確かめられる
+
+---
+
+### 6.31 `raw!` の補間 — 確定（M9）
+
+```rust
+fn main() {
+    let z = @e[type=zombie];
+    let n = 3;
+    raw!("say {z} has {n}");
+}
+```
+
+```
+execute store result storage myns:mw mw.args.a0 int 1 run scoreboard players get $main.n myns.v
+function myns:main/raw_0 with storage myns:mw mw.args
+
+main/raw_0:
+  $say @e[type=zombie] has $(a0)
+```
+
+- **定数の補間は畳み込む。** セレクタはコンパイル時の値なので `{z}` は生成時に消え、
+  実行時の値が 1 つも無ければコマンドは 1 つのまま（要件定義 §10.1）
+- 実行時の値が混ざったら、**その行だけを本体に持つマクロ補助関数**へ移す。
+  `mw.args.a<n>` に書いてから `function <親>/raw_<n> with storage` で呼ぶ。
+  [§6.21](#621-vect--確定m7) の実行時添字・[§6.27](#627-string--確定m8) の連結と同じ手
+- score の値は `execute store result storage ... int 1 run scoreboard players get`、
+  storage の値は `data modify ... set from`。定数に畳まった値は本体に直接書く
+- **昇格は補助関数に閉じる。** 呼び出し元の関数は `$` の行を持たないのでマクロ関数に
+  ならず、`#[tick]` / `#[load]` の関数でも実行時補間を書ける。
+  要件定義 §10.1 が「タグの関数が昇格したらエラー」としていたのは
+  **関数そのものを昇格させる案**が前提で、その案は局所変数を補間できない
+  （呼び出し元が値を知らない）ので採らない
+- コストは実行時の値 1 つにつきマーシャル 1 + 呼び出し 1 + マクロ行 1

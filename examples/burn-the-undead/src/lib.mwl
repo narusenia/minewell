@@ -10,7 +10,7 @@
 
 #[ctx(entity)]
 fn ignite() {
-    raw!("data merge entity @s {Fire: 100s}");
+    raw!("data merge entity @s {{Fire: 100s}}");
 }
 
 /// Everything the selector finds, once each. `z` stands for the current entity.

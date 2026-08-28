@@ -2232,3 +2232,64 @@ mod checks {
         assert_eq!(mc.commands_run, 1 + 2 + 1);
     }
 }
+
+/// `raw!` interpolation (spec section 6.31).
+mod interpolation {
+    use super::harness::{load, local, run};
+
+    fn said(mc: &tinymcf::Interpreter) -> Vec<&str> {
+        mc.effects.iter().map(|e| e.args.as_str()).collect()
+    }
+
+    #[test]
+    fn a_constant_is_folded_into_the_command() {
+        let mc = run(r#"fn main() { let z = @e[type=zombie]; raw!("say {z}"); }"#);
+        assert_eq!(said(&mc), vec!["@e[type=zombie]"]);
+        assert_eq!(mc.commands_run, 1, "a compile-time value costs nothing");
+    }
+
+    #[test]
+    fn braces_written_twice_mean_themselves() {
+        let mc = run(r#"fn main() { raw!("say {{NoAI:1b}}"); }"#);
+        assert_eq!(said(&mc), vec!["{NoAI:1b}"]);
+        assert_eq!(mc.commands_run, 1);
+    }
+
+    #[test]
+    fn a_runtime_number_is_spliced_through_a_macro() {
+        let mc = run(r#"fn main() { let n = 7; raw!("say {n}"); }"#);
+        assert_eq!(said(&mc), vec!["7"]);
+    }
+
+    #[test]
+    fn a_runtime_string_goes_in_without_its_quotes() {
+        let mc = run(r#"fn main() { let s = "pit"; raw!("say the {s} is open"); }"#);
+        assert_eq!(said(&mc), vec!["the pit is open"]);
+    }
+
+    #[test]
+    fn the_command_it_writes_actually_runs() {
+        let mc = run(
+            r#"fn main() { let n = 41; raw!("scoreboard players set $main.out test.v {n}"); }"#,
+        );
+        assert_eq!(local(&mc, "main", "out"), Some(41));
+    }
+
+    #[test]
+    fn a_runtime_value_costs_a_marshal_a_call_and_the_line() {
+        let mc = run(r#"fn main() { let n = 7; raw!("say {n}"); }"#);
+        // `players set` for the binding, then the splice: the marshal is an `execute
+        // store result ... run`, which is two, plus the call and the macro line.
+        assert_eq!(mc.commands_run, 1 + 2 + 1 + 1);
+    }
+
+    #[test]
+    fn promotion_does_not_reach_the_function_that_wrote_it() {
+        // A function tag calls with no arguments, so the tagged function itself must
+        // not become a macro function (requirements section 10.1).
+        let mut mc = load(r#"#[tick] fn main() { let n = 2; raw!("say {n}"); }"#);
+        mc.call("test:main");
+        assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
+        assert_eq!(said(&mc), vec!["2"]);
+    }
+}
