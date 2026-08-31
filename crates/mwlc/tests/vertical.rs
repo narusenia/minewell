@@ -2293,3 +2293,83 @@ mod interpolation {
         assert_eq!(said(&mc), vec!["2"]);
     }
 }
+
+/// Constant folding (spec section 6.33).
+mod folding {
+    use super::harness::{NS, load_with, local};
+    use mwlc::emit::Profile;
+    use tinymcf::Interpreter;
+
+    /// Every arm of the folder, all of it constant.
+    const CONSTANTS: &str = r"fn main() {
+        let add = 2 + 3 * 4;
+        let sub = 10 - 3;
+        let div = (0 - 7) / 2;
+        let rem = (0 - 7) % 2;
+        let cmp = 3 < 5;
+        let eq = 4 == 4;
+        let neg = -(2 + 3);
+        let not = !(1 == 2);
+        let and = true && false;
+        let or = true || false;
+        let scaled = fix::<100>(fix::<1000>(1500));
+    }";
+
+    fn run_in(src: &str, profile: Profile) -> Interpreter {
+        let mut mc = load_with(src, profile);
+        mc.call(&format!("{NS}:main"));
+        assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
+        mc
+    }
+
+    fn values(mc: &Interpreter) -> Vec<Option<i32>> {
+        [
+            "add", "sub", "div", "rem", "cmp", "eq", "neg", "not", "and", "or", "scaled",
+        ]
+        .iter()
+        .map(|name| local(mc, "main", name))
+        .collect()
+    }
+
+    #[test]
+    fn folding_does_not_change_what_the_program_computes() {
+        let debug = run_in(CONSTANTS, Profile::Debug);
+        let release = run_in(CONSTANTS, Profile::Release);
+        assert_eq!(values(&debug), values(&release));
+    }
+
+    #[test]
+    fn vanilla_arithmetic_is_what_gets_folded() {
+        // Floor division, not truncation: -7 / 2 is -4 and -7 % 2 is 1.
+        let mc = run_in(CONSTANTS, Profile::Release);
+        assert_eq!(local(&mc, "main", "add"), Some(14));
+        assert_eq!(local(&mc, "main", "div"), Some(-4));
+        assert_eq!(local(&mc, "main", "rem"), Some(1));
+        assert_eq!(local(&mc, "main", "neg"), Some(-5));
+        assert_eq!(local(&mc, "main", "not"), Some(1));
+        assert_eq!(local(&mc, "main", "and"), Some(0));
+        assert_eq!(local(&mc, "main", "or"), Some(1));
+    }
+
+    #[test]
+    fn a_folded_binding_is_one_command() {
+        let mc = run_in("fn main() { let a = 2 + 3 * 4; }", Profile::Release);
+        assert_eq!(mc.commands_run, 1);
+    }
+
+    #[test]
+    fn a_debug_build_is_not_folded() {
+        // Requirements section 15: debug keeps source and output one to one.
+        let mc = run_in("fn main() { let a = 2 + 3 * 4; }", Profile::Debug);
+        assert!(mc.commands_run > 1, "{}", mc.commands_run);
+    }
+
+    #[test]
+    fn dividing_by_a_constant_zero_still_fails_at_runtime() {
+        // Vanilla leaves the target alone and says so; deciding the answer while
+        // compiling would lose that.
+        let mut mc = load_with("fn main() { let a = 1 / 0; }", Profile::Release);
+        mc.call(&format!("{NS}:main"));
+        assert!(!mc.diagnostics.is_empty(), "expected a division diagnostic");
+    }
+}

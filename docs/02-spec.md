@@ -1975,3 +1975,42 @@ tellraw @a {"extra":[{"bold":true,"color":"red","text":"Danger"},{"text":" HP: "
 - 名前は [`names`](#) モジュールが 1 か所で決める。フェイクプレイヤー名と
   `mw.vars` のパスは MIR、objective と storage の id は emit と共有していて、
   **JSON の中の名前が実際の出力とずれない**ことをそこで担保する
+
+---
+
+### 6.33 定数畳み込み — 確定（M9）
+
+```rust
+fn main() {
+    let a = 2 + 3 * 4;
+    let b = fix::<100>(fix::<1000>(1500));
+}
+```
+
+```
+# debug — 最適化なし。式の形がそのまま出る（要件定義 §15）。13 コマンド
+scoreboard players set $t0 myns.t 3
+scoreboard players set $t1 myns.t 4
+scoreboard players operation $t0 myns.t *= $t1 myns.t
+scoreboard players set $t2 myns.t 2
+scoreboard players operation $t2 myns.t += $t0 myns.t
+scoreboard players operation $main.a myns.v = $t2 myns.t
+…
+
+# release — 2 コマンド
+scoreboard players set $main.a myns.v 14
+scoreboard players set $main.b myns.v 150
+```
+
+- **debug では畳み込まない。** 要件定義 §15 が debug に求めているのは
+  「ソースと出力が 1:1 で追える」ことで、畳み込みはそれを壊す
+- 仕組みは MIR の `Value::Const` の延長。定数は最後まで materialise されないので、
+  両端が `Value::Const` の二項演算を計算して `Value::Const` を返すだけでよい。
+  テンポラリも `Inst` も生まれない
+- **バニラの算術に合わせる**（[`crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §6）:
+  加減乗は wrapping、除と剰余は**切り捨てでなく切り下げ**（`-7 / 2` は `-4`、
+  `-7 % 2` は `1`）、`&&` / `||` は 0/1 の min / max
+- **0 除算は畳み込まない。** バニラは失敗して対象を変えずに残す。答えをコンパイル時に
+  決めてしまうとその挙動が消える。判定できるのは除数が定数のときだけなので、
+  そこだけ畳み込みを見送る
+- 単項の `-` と `!`、比較も同じ規則で畳む

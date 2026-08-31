@@ -2807,6 +2807,14 @@ impl<'p> Lowering<'_, 'p> {
 
     fn unary(&mut self, op: UnaryOp, operand: &hir::Expr) -> Value {
         let value = self.expr(operand);
+        if !self.program.debug
+            && let Value::Const(n) = &value
+        {
+            return Value::Const(match op {
+                UnaryOp::Neg => n.wrapping_neg(),
+                UnaryOp::Not => i32::from(*n == 0),
+            });
+        }
         match op {
             UnaryOp::Neg => {
                 let dst = self.temps_next();
@@ -2835,6 +2843,41 @@ impl<'p> Lowering<'_, 'p> {
                 Value::Reg(dst)
             }
         }
+    }
+
+    /// Both sides known while compiling, so the answer is too (spec section 6.33).
+    ///
+    /// The arithmetic is vanilla's rather than Rust's — floor division, wrapping
+    /// overflow — because that is what the commands this replaces would have done.
+    fn fold(&self, op: BinaryOp, lhs: &Value, rhs: &Value) -> Option<Value> {
+        use BinaryOp::*;
+        // Debug keeps source and output one to one (requirements section 15).
+        if self.program.debug {
+            return None;
+        }
+        let (Value::Const(a), Value::Const(b)) = (lhs, rhs) else {
+            return None;
+        };
+        let (a, b) = (*a, *b);
+        Some(Value::Const(match op {
+            Add => a.wrapping_add(b),
+            Sub => a.wrapping_sub(b),
+            Mul => a.wrapping_mul(b),
+            // Vanilla fails and leaves the target unchanged, so there is no answer to
+            // fold to; letting it happen at runtime keeps the behaviour.
+            Div | Rem if b == 0 => return None,
+            Div => floor_div(a, b),
+            Rem => a.wrapping_sub(floor_div(a, b).wrapping_mul(b)),
+            // For 0/1 values min is and, max is or, which is how they are lowered.
+            And => a.min(b),
+            Or => a.max(b),
+            Eq => i32::from(a == b),
+            Ne => i32::from(a != b),
+            Lt => i32::from(a < b),
+            Le => i32::from(a <= b),
+            Gt => i32::from(a > b),
+            Ge => i32::from(a >= b),
+        }))
     }
 
     fn binary(&mut self, op: BinaryOp, lhs: &hir::Expr, rhs: &hir::Expr) -> Value {
@@ -2869,6 +2912,9 @@ impl<'p> Lowering<'_, 'p> {
             Add | Sub | Mul | Div | Rem | And | Or => {
                 let lhs = self.expr(lhs);
                 let rhs = self.expr(rhs);
+                if let Some(folded) = self.fold(op, &lhs, &rhs) {
+                    return folded;
+                }
                 let dst = self.temps_next();
                 self.copy_into(dst.clone(), lhs);
                 match (op, &rhs) {
@@ -2895,6 +2941,9 @@ impl<'p> Lowering<'_, 'p> {
                 let _ = is_bool;
                 let lhs = self.expr(lhs);
                 let rhs = self.expr(rhs);
+                if let Some(folded) = self.fold(op, &lhs, &rhs) {
+                    return folded;
+                }
                 let dst = self.temps_next();
                 self.compare_into(dst.clone(), op, lhs, rhs);
                 Value::Reg(dst)
@@ -3029,6 +3078,19 @@ fn tag_filter(tag: &str) -> String {
 fn is_comparison(op: BinaryOp) -> bool {
     use BinaryOp::*;
     matches!(op, Eq | Ne | Lt | Le | Gt | Ge)
+}
+
+/// Vanilla floors rather than truncating: `-7 / 2` is `-4`
+/// (`crates/tinymcf/SPEC.md` section 6).
+///
+/// Spelled out again here rather than shared: `mwlc` does not depend on `tinymcf`.
+fn floor_div(a: i32, b: i32) -> i32 {
+    let quotient = a.wrapping_div(b);
+    if a.wrapping_rem(b) != 0 && (a < 0) != (b < 0) {
+        quotient - 1
+    } else {
+        quotient
+    }
 }
 
 fn arith(op: BinaryOp) -> Op {
