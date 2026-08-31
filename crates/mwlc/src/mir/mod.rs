@@ -545,9 +545,7 @@ pub fn lower(hir: &Hir, debug: bool) -> Mir {
             in_entity_body: false,
             entity_body_root: false,
         };
-        for stmt in &f.body {
-            cx.stmt(stmt);
-        }
+        cx.body(&f.body);
         let (mut insts, generated) = (cx.insts, cx.generated);
         // The register outlives the call: a `return` that reached the top left it
         // raised, and the next invocation would read that as its own. Clear it on the
@@ -711,7 +709,46 @@ struct Program<'a> {
     initialised: Vec<LocalId>,
 }
 
+/// Where the temporary counters and the save list stood at the start of a statement
+/// (spec section 6.35).
+#[derive(Debug, Clone, Copy)]
+struct Mark {
+    scores: u32,
+    data: u32,
+    iters: u32,
+    used: usize,
+    used_data: usize,
+}
+
 impl Program<'_> {
+    fn mark(&self) -> Mark {
+        Mark {
+            scores: self.temps.scores,
+            data: self.temps.data,
+            iters: self.temps.iters,
+            used: self.used.len(),
+            used_data: self.used_data.len(),
+        }
+    }
+
+    /// Ends a statement: its temporaries are dead, so both the save list and — in a
+    /// release build — the names themselves go back to where they were.
+    fn reset_to(&mut self, mark: Mark) {
+        // Narrowing the save list is a fix, not an optimisation: a temporary from a
+        // finished statement holds nothing anyone can want back, and on the paths that
+        // never wrote it the save command failed outright. Both profiles get it.
+        self.used.truncate(mark.used);
+        self.used_data.truncate(mark.used_data);
+        // Reusing the names is the optimisation, and debug keeps source and output one
+        // to one (requirements section 15).
+        if self.debug {
+            return;
+        }
+        self.temps.scores = mark.scores;
+        self.temps.data = mark.data;
+        self.temps.iters = mark.iters;
+    }
+
     fn same_component(&self, a: FnId, b: FnId) -> bool {
         self.components[a.0 as usize] == self.components[b.0 as usize]
     }
@@ -2115,7 +2152,7 @@ impl<'p> Lowering<'_, 'p> {
             && inline != hir::Inline::Never;
         if inlinable {
             let before = self.insts.len();
-            self.stmt(&then[0]);
+            self.scoped_stmt(&then[0]);
             if self.insts.len() == before + 1 {
                 let inst = self.insts.pop().expect("just pushed");
                 self.insts.push(Inst::Guarded {
@@ -2231,9 +2268,7 @@ impl<'p> Lowering<'_, 'p> {
                     });
                 }
             }
-            for stmt in &arm.body {
-                inner.stmt(stmt);
-            }
+            inner.body(&arm.body);
             let (insts, generated) = inner.finish();
             self.record(arm_path.clone(), insts, generated);
 
@@ -2314,7 +2349,7 @@ impl<'p> Lowering<'_, 'p> {
         let inlinable = body.len() == 1 && !escaping.any() && inline != hir::Inline::Never;
         if inlinable {
             let before = self.insts.len();
-            self.stmt(&body[0]);
+            self.scoped_stmt(&body[0]);
             if self.insts.len() == before + 1 {
                 let inst = self.insts.pop().expect("just pushed");
                 self.insts.push(Inst::Context {
@@ -2358,9 +2393,7 @@ impl<'p> Lowering<'_, 'p> {
                 inst: Box::new(Inst::Return { value: 0 }),
             });
         }
-        for stmt in body {
-            inner.stmt(stmt);
-        }
+        inner.body(body);
         let (insts, generated) = inner.finish();
         self.record(path.clone(), insts, generated);
 
@@ -2429,9 +2462,7 @@ impl<'p> Lowering<'_, 'p> {
             inner.consume(CTL_CONTINUE);
             inner.propagate();
         } else {
-            for stmt in body {
-                inner.stmt(stmt);
-            }
+            inner.body(body);
         }
         inner.insts.push(Inst::Call { path: path.clone() });
         let (insts, generated) = inner.finish();
@@ -2468,9 +2499,7 @@ impl<'p> Lowering<'_, 'p> {
             inner.consume(CTL_CONTINUE);
             inner.propagate();
         } else {
-            for stmt in body {
-                inner.stmt(stmt);
-            }
+            inner.body(body);
         }
         inner.insts.push(Inst::Call { path: path.clone() });
         let (insts, generated) = inner.finish();
@@ -2503,9 +2532,7 @@ impl<'p> Lowering<'_, 'p> {
         let path = format!("{}/{kind}_{}", self.prefix, self.counter);
         self.counter += 1;
         let mut inner = self.child(path.clone());
-        for stmt in stmts {
-            inner.stmt(stmt);
-        }
+        inner.body(stmts);
         let (insts, generated) = inner.finish();
         self.record(path.clone(), insts, generated);
         path
@@ -3112,6 +3139,35 @@ impl<'p> Lowering<'_, 'p> {
         let path = self.program.temps.next_iter();
         self.program.used_data.push(path.clone());
         path
+    }
+
+    /// Lowers a run of statements, letting each reuse the last one's temporaries.
+    ///
+    /// A temporary never outlives the statement that made it: statements run in order,
+    /// and a generated function has returned before the next statement starts. The
+    /// mark is taken here rather than when the context was made, so anything the
+    /// enclosing statement set up first — a `for`'s copy of the list, a `while`'s
+    /// condition — is behind it and cannot be reused (spec section 6.35).
+    fn body(&mut self, stmts: &[hir::Stmt]) {
+        let mark = self.program.mark();
+        let locals = self.program.initialised.len();
+        for stmt in stmts {
+            self.program.reset_to(mark);
+            self.stmt(stmt);
+        }
+        self.program.reset_to(mark);
+        // A binding declared in this block is out of scope now. Leaving it in the save
+        // list would mean saving it across a later call on paths that never ran this
+        // block, and reading a score nothing set fails outright.
+        self.program.initialised.truncate(locals);
+    }
+
+    /// One statement inlined where a block would otherwise go: its bindings still go
+    /// out of scope at the end of it.
+    fn scoped_stmt(&mut self, stmt: &hir::Stmt) {
+        let locals = self.program.initialised.len();
+        self.stmt(stmt);
+        self.program.initialised.truncate(locals);
     }
 
     /// A lowering context for a block split out of this one.

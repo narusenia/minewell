@@ -2373,3 +2373,105 @@ mod folding {
         assert!(!mc.diagnostics.is_empty(), "expected a division diagnostic");
     }
 }
+
+/// Register reuse (spec section 6.35).
+mod registers {
+    use super::harness::{NS, load_with, local};
+    use mwlc::emit::{Options, Profile};
+    use std::collections::HashSet;
+    use tinymcf::Interpreter;
+
+    /// Ten statements in a row, each needing a temporary of its own.
+    const SEQUENCE: &str = "#[load] fn main() {
+        let a = 1;
+        let b0 = a + a; let b1 = a + a; let b2 = a + a; let b3 = a + a; let b4 = a + a;
+        let b5 = a + a; let b6 = a + a; let b7 = a + a; let b8 = a + a; let b9 = a + a;
+    }";
+
+    /// Recursion, a loop and a match together: what a reuse bug would break.
+    const MIXED: &str = r#"enum Threat { Calm, Rising { seen: i32 } }
+        fn fact(n: i32) -> i32 {
+            if n <= 1 { return 1; }
+            return n * fact(n - 1);
+        }
+        #[load] fn main() {
+            let f = fact(5);
+            let mut total = 0;
+            let mut i = 0;
+            while i < 4 {
+                if i == 2 { total = total + fact(i + 1); }
+                i = i + 1;
+            }
+            let t = Threat::Rising { seen: total };
+            let mut got = 0;
+            match t {
+                Threat::Calm => {}
+                Threat::Rising { seen } => { got = seen + f; }
+            }
+        }"#;
+
+    fn temporaries(src: &str, profile: Profile) -> HashSet<String> {
+        let options = Options {
+            profile,
+            ..Options::default()
+        };
+        let pack = mwlc::driver::compile(src, "myns", &options).expect("compiles");
+        pack.files
+            .values()
+            .flat_map(|body| body.split_whitespace())
+            .filter(|word| word.starts_with("$t"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn run_in(src: &str, profile: Profile) -> Interpreter {
+        let mut mc = load_with(src, profile);
+        mc.call(&format!("{NS}:main"));
+        assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
+        mc
+    }
+
+    #[test]
+    fn ten_statements_do_not_need_ten_temporaries() {
+        let temps = temporaries(SEQUENCE, Profile::Release);
+        assert!(temps.len() < 10, "{temps:?}");
+    }
+
+    #[test]
+    fn a_debug_build_still_gives_each_one_its_own_name() {
+        // Requirements section 15: source and output stay one to one.
+        let temps = temporaries(SEQUENCE, Profile::Debug);
+        assert!(temps.len() >= 10, "{temps:?}");
+    }
+
+    #[test]
+    fn reuse_does_not_change_what_the_program_computes() {
+        let debug = run_in(MIXED, Profile::Debug);
+        let release = run_in(MIXED, Profile::Release);
+        for name in ["f", "total", "i", "got"] {
+            assert_eq!(
+                local(&debug, "main", name),
+                local(&release, "main", name),
+                "{name}"
+            );
+        }
+        assert_eq!(local(&release, "main", "got"), Some(6 + 120));
+    }
+
+    #[test]
+    fn recursion_does_not_save_a_temporary_from_a_finished_statement() {
+        // The M8-6 waste: a value used only inside an `if` was saved on every call,
+        // including on the paths that never wrote it, and the read failed. Narrowing
+        // the save list is a fix rather than an optimisation, so both profiles get it.
+        let src = "fn f(n: i32) -> i32 {
+            if n <= 1 { let guard = n + n; return guard; }
+            return n * f(n - 1);
+        }
+        #[load] fn main() { let x = f(4); }";
+        for profile in [Profile::Debug, Profile::Release] {
+            let mc = run_in(src, profile);
+            // 4 * 3 * 2 * (1 + 1): the base case answers with `guard`, not with 1.
+            assert_eq!(local(&mc, "main", "x"), Some(48), "{profile:?}");
+        }
+    }
+}

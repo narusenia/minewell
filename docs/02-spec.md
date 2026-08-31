@@ -2046,3 +2046,43 @@ data/myns/function/__init.mcfunction
 `/function myns:foo` を手で打って呼ぶ、あるいは他のパックから呼ぶつもりの関数を
 「外から入る口」だと宣言する手段は v1 にまだ無い（§3.12 の `pub` / `extern fn` は未定）。
 それが入るまで、そういう関数はタグを付けるか debug で出す。
+
+---
+
+### 6.35 レジスタ再利用 — 確定（M9）
+
+```rust
+#[load] fn main() { let a = 1; let b0 = a + a; let b1 = a + a; let b2 = a + a; }
+```
+
+```
+# debug — 式ごとに新しい名前（要件定義 §15）
+scoreboard players operation $t0 myns.t = $main.a myns.v
+…
+scoreboard players operation $t1 myns.t = $main.a myns.v
+…
+scoreboard players operation $t2 myns.t = $main.a myns.v
+
+# release — 同じ名前を使い回す
+scoreboard players operation $t0 myns.t = $main.a myns.v
+…
+scoreboard players operation $t0 myns.t = $main.a myns.v
+…
+scoreboard players operation $t0 myns.t = $main.a myns.v
+```
+
+- **テンポラリは文をまたいで生きない。** 文は順に走り、生成関数は次の文が始まる前に
+  返っている。だから生存解析ではなく**文の切れ目で番号を巻き戻す**だけでよい
+- 巻き戻す先は**文の並びに入る直前**の値。`for` が取るリストの控えや `while` の条件は
+  それより前で採られているので、本体の文が踏むことはない
+- **コマンド数は減らない。** 減るのは `<ns>.t` に並ぶフェイクプレイヤーの数で、
+  要件定義 §15 が挙げている肥大化がこれ
+- **debug は名前を分ける**（要件定義 §15）
+
+**退避リストの絞り込みは最適化ではなく修正なので、両方のプロファイルで行う。**
+
+- 終わった文のテンポラリは誰も要らない。**ブロックの中でだけ使う束縛も同じ**で、
+  ブロックを抜けたら退避対象から外す
+- これが M8-6 で見つけた無駄の正体。`if` の中でだけ使う束縛が、
+  **その `if` を通らなかった経路でも退避対象に入り**、`scoreboard players get` が
+  失敗していた。上の `f(4)` の例で **94 コマンド・失敗 3 件 → 82 コマンド・失敗 0 件**
