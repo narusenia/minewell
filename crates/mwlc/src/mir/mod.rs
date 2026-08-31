@@ -470,10 +470,13 @@ enum Slot {
 
 /// Where a value to be written into storage came from.
 /// What a call's outcome is captured into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Capture {
     Nothing,
     Result,
+    /// Straight into a register the caller picked, with no temporary in between
+    /// (spec section 6.37). Only safe where that register is not on the save list.
+    Into(Reg),
     /// Both halves: an option-returning function puts the value in one and whether
     /// there was a value in the other.
     Option,
@@ -1101,7 +1104,14 @@ impl<'p> Lowering<'_, 'p> {
             }
             hir::Stmt::Let { local, value, .. } => {
                 let dst = self.local(*local);
-                self.store(dst, None, value);
+                // A fresh binding is the one destination it is always safe to write
+                // through: nothing has read it yet, and it is not on the save list
+                // (spec section 6.37).
+                if self.direct(&dst, value) {
+                    self.expr_direct(dst, value);
+                } else {
+                    self.store(dst, None, value);
+                }
                 // Only now: a call inside `value` must not try to save this local,
                 // which has nothing in it yet.
                 self.program.initialised.push(*local);
@@ -1903,6 +1913,78 @@ impl<'p> Lowering<'_, 'p> {
         }
     }
 
+    /// Whether `expr` can be written straight into `dst` (spec section 6.37).
+    ///
+    /// Two things make it unsafe. The destination may be an operand — bindings of the
+    /// same name share a register, so `let x = x + 1;` reads what it is about to
+    /// write. And a call to the right of the chain would run with the answer so far
+    /// already in `dst`, which a recursive callee overwrites with its own.
+    fn direct(&self, dst: &Reg, expr: &hir::Expr) -> bool {
+        match &expr.kind {
+            // The call names its own destination and nothing runs after it.
+            hir::ExprKind::Call { args, .. } => args.iter().all(|arg| self.settled(dst, arg)),
+            hir::ExprKind::Binary(op, lhs, rhs) if joins(*op) => {
+                self.head(dst, lhs) && self.settled(dst, rhs)
+            }
+            _ => false,
+        }
+    }
+
+    /// The left end of a chain: whatever already writes its own destination, as long
+    /// as it is not `dst` itself.
+    fn head(&self, dst: &Reg, expr: &hir::Expr) -> bool {
+        match &expr.kind {
+            hir::ExprKind::Binary(op, lhs, rhs) if joins(*op) => {
+                self.head(dst, lhs) && self.settled(dst, rhs)
+            }
+            hir::ExprKind::Field(place) | hir::ExprKind::Len(place) if !expr.ty.is_storage() => {
+                self.elsewhere(dst, place)
+            }
+            hir::ExprKind::ReadScaled { place, .. } => self.elsewhere(dst, place),
+            _ => self.settled(dst, expr),
+        }
+    }
+
+    /// An operand that reads nothing but itself, and is not `dst`.
+    fn settled(&self, dst: &Reg, expr: &hir::Expr) -> bool {
+        match &expr.kind {
+            hir::ExprKind::Int(_) | hir::ExprKind::Bool(_) => true,
+            hir::ExprKind::Local(local) => self.local(*local).holder != dst.holder,
+            _ => false,
+        }
+    }
+
+    /// Whether a place is somewhere other than `dst`. Anything reached through a step,
+    /// or held in storage, is not a register at all.
+    fn elsewhere(&self, dst: &Reg, place: &hir::Place) -> bool {
+        if !place.steps.is_empty() || place.ty.is_storage() {
+            return true;
+        }
+        match &place.root {
+            Root::Local(_) | Root::Lent { .. } => {
+                place_reg(self.function, place).holder != dst.holder
+            }
+            Root::Entity { .. } => true,
+        }
+    }
+
+    /// Lowers what [`direct`] approved, writing into `dst` as it goes.
+    fn expr_direct(&mut self, dst: Reg, expr: &hir::Expr) {
+        match &expr.kind {
+            hir::ExprKind::Call { callee, args } => {
+                self.call(*callee, args, Capture::Into(dst));
+            }
+            hir::ExprKind::Binary(op, lhs, rhs) => {
+                match self.direct(&dst, lhs) {
+                    true => self.expr_direct(dst.clone(), lhs),
+                    false => self.expr_into(dst.clone(), lhs),
+                }
+                self.store(dst, Some(*op), rhs);
+            }
+            _ => unreachable!("only what `direct` approved gets here"),
+        }
+    }
+
     /// Evaluates `expr` directly into `dst` where the command already writes somewhere.
     ///
     /// `execute store success score <dst> ... if ...` names its destination, so routing
@@ -2673,6 +2755,10 @@ impl<'p> Lowering<'_, 'p> {
                 value: self.program.temps.next(),
                 present: None,
             }),
+            Capture::Into(dst) => Some(Called {
+                value: dst.clone(),
+                present: None,
+            }),
             // An option-returning function answers in both halves at once: the value
             // in the result, whether there was one in the success (spec section 6.28).
             Capture::Option => Some(Called {
@@ -3234,6 +3320,17 @@ fn floor_div(a: i32, b: i32) -> i32 {
     } else {
         quotient
     }
+}
+
+/// Whether the operator combines its two sides into the left one, which is what lets
+/// the chain be written straight into its destination (spec section 6.37).
+///
+/// `&&` and `||` are min and max over 0/1, so they join the same way. They are only
+/// reached here with a settled right-hand side, which is pure, so nothing is lost by
+/// not short-circuiting (spec section 6.14).
+fn joins(op: BinaryOp) -> bool {
+    use BinaryOp::*;
+    matches!(op, Add | Sub | Mul | Div | Rem | And | Or)
 }
 
 fn arith(op: BinaryOp) -> Op {

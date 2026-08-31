@@ -3781,14 +3781,20 @@ impl FnLowering<'_> {
                 ty: Type::Pos,
                 span,
             }),
-            AstExpr::Macro(call) if call.name.name == "nbt" => {
-                self.error(
-                    span,
-                    "nbt! has to know what it is being written into: annotate the \
-                     binding, as in 'let m: Mob = nbt!({ .. });'",
-                );
-                None
-            }
+            // `nbt!` is checked against wherever it is going, so it can only be
+            // written where that is known: an annotated `let`, or an argument whose
+            // parameter names a concrete type (spec section 6.37).
+            AstExpr::Macro(call) if call.name.name == "nbt" => match self.expected {
+                Some(want) if !matches!(want, Type::Param(_)) => self.nbt_lit(call, want),
+                _ => {
+                    self.error(
+                        span,
+                        "nbt! has to know what it is being written into: annotate the \
+                         binding, as in 'let m: Mob = nbt!({ .. });'",
+                    );
+                    None
+                }
+            },
             AstExpr::Macro(call) => {
                 let name = &call.name.name;
                 self.error(span, format!("'{name}!' does not produce a value"));
@@ -4204,7 +4210,10 @@ impl FnLowering<'_> {
                             kind: ExprKind::Field(place),
                             span,
                         },
-                        (None, Some(arg)) => self.expr(arg)?,
+                        // The parameter's type is the expectation the argument is read
+                        // under, which is what lets `nbt!` be written here
+                        // (spec section 6.37).
+                        (None, Some(arg)) => self.expr_expecting(arg, param.ty)?,
                         (None, None) => unreachable!("one of the two is always there"),
                     };
                     actual.push(value.ty);

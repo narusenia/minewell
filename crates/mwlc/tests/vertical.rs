@@ -512,19 +512,18 @@ mod functions {
         // No frame, no save, no restore: an argument write and the call itself.
         let mut mc = load("fn id(n: i32) -> i32 { return n; } fn main() { let x = id(1); }");
         mc.call("test:main");
-        // Caller: write the argument, `execute store result` + `function`, copy the
-        // result out of its temporary. Callee: `return run` + the `get` it runs.
-        // The copy is a temporary the destination-driven lowering (M9-10) removes.
-        assert_eq!(cost(&mc), 6);
+        // Caller: write the argument, then `execute store result` + `function`
+        // naming the binding itself. Callee: `return run` + the `get` it runs.
+        assert_eq!(cost(&mc), 5);
     }
 
     #[test]
     fn a_short_circuit_with_a_pure_right_hand_side_stays_one_command() {
         let mut mc = load("fn main() { let a = true; let b = false; let x = a && b; }");
         mc.call("test:main");
-        // Two `set`s, a copy into a temporary, the `min`, and a copy back out. The two
-        // copies are what M9-10 removes; the point here is that there is no branch.
-        assert_eq!(cost(&mc), 5);
+        // Two `set`s, a copy of the left side into the binding and the `min` onto
+        // it. The point is that there is no branch.
+        assert_eq!(cost(&mc), 4);
     }
 
     #[test]
@@ -1518,10 +1517,10 @@ mod references {
              fn read(p: &Point) -> i32 { return p.x; } \
              fn main() { let a = Point { x: 5 }; let n = read(&a); }");
         assert_eq!(local(&mc, "main", "n"), Some(5));
-        // Build the compound (1), call it storing the result (2), read the field (2)
-        // and return it (2), copy the result into the binding (1). Not one of those is
-        // spent marshalling the argument, which is the whole point of a borrow.
-        assert_eq!(cost(&mc), 8);
+        // Build the compound (1), call it storing straight into the binding (2), read
+        // the field (2) and return it (2). Not one of those is spent marshalling the
+        // argument, which is the whole point of a borrow.
+        assert_eq!(cost(&mc), 7);
     }
 
     #[test]
@@ -2382,10 +2381,15 @@ mod registers {
     use tinymcf::Interpreter;
 
     /// Ten statements in a row, each needing a temporary of its own.
+    /// The nested sums are what still need a temporary: a plain `a + a` is written
+    /// through the destination now (spec section 6.37).
     const SEQUENCE: &str = "#[load] fn main() {
         let a = 1;
-        let b0 = a + a; let b1 = a + a; let b2 = a + a; let b3 = a + a; let b4 = a + a;
-        let b5 = a + a; let b6 = a + a; let b7 = a + a; let b8 = a + a; let b9 = a + a;
+        let b0 = (a + a) * (a + a); let b1 = (a + a) * (a + a);
+        let b2 = (a + a) * (a + a); let b3 = (a + a) * (a + a);
+        let b4 = (a + a) * (a + a); let b5 = (a + a) * (a + a);
+        let b6 = (a + a) * (a + a); let b7 = (a + a) * (a + a);
+        let b8 = (a + a) * (a + a); let b9 = (a + a) * (a + a);
     }";
 
     /// Recursion, a loop and a match together: what a reuse bug would break.
@@ -2586,5 +2590,89 @@ fn two_recursive_calls_in_one_expression_keep_both_answers() {
         mc.call("test:main");
         assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
         assert_eq!(harness::local(&mc, "main", "a"), Some(13), "{profile:?}");
+    }
+}
+
+/// Writing an expression straight into its destination (spec section 6.37).
+mod destinations {
+    use super::harness::{local, run};
+    use mwlc::emit::{Options, Profile};
+
+    fn main_body(src: &str) -> String {
+        let options = Options {
+            profile: Profile::Release,
+            ..Options::default()
+        };
+        let pack = mwlc::driver::compile(src, "myns", &options).expect("compiles");
+        pack.files["data/myns/function/main.mcfunction"].clone()
+    }
+
+    fn lines(src: &str) -> usize {
+        main_body(src).lines().count()
+    }
+
+    #[test]
+    fn a_call_names_where_its_answer_goes() {
+        // Setting the argument and the call itself; no temporary in between.
+        let body = main_body(
+            "fn twice(n: i32) -> i32 { return n + n; } #[load] fn main() { let a = twice(3); }",
+        );
+        assert_eq!(body.lines().count(), 2, "{body}");
+        assert!(
+            body.contains("execute store result score $main.a myns.v run function myns:twice"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn an_arithmetic_chain_needs_no_temporary() {
+        assert_eq!(
+            lines("#[load] fn main() { let a = 1; let b = 2; let c = a + b + a; }"),
+            5
+        );
+    }
+
+    #[test]
+    fn a_binding_that_shadows_its_own_source_still_reads_it_first() {
+        // Both bindings are `$main.x`, so writing the destination first would lose
+        // the value being read.
+        let mc = run("#[load] fn main() { let x = 1; let x = x + 1; }");
+        assert_eq!(local(&mc, "main", "x"), Some(2));
+    }
+
+    #[test]
+    fn assignment_is_left_alone() {
+        // `x = y + x` would read the destination after writing it.
+        let mc = run("#[load] fn main() { let y = 3; let mut x = 4; x = y + x; }");
+        assert_eq!(local(&mc, "main", "x"), Some(7));
+    }
+}
+
+/// `nbt!` where its type comes from a parameter (spec section 6.37).
+mod nbt_arguments {
+    use super::harness::{local, run};
+
+    #[test]
+    fn a_parameter_says_what_the_literal_is_written_into() {
+        let mc = run(r#"struct Mob { hp: i32 }
+               fn hp_of(m: Mob) -> i32 { return m.hp; }
+               #[load] fn main() { let n = hp_of(nbt!({ hp: 7 })); }"#);
+        assert_eq!(local(&mc, "main", "n"), Some(7));
+    }
+
+    #[test]
+    fn a_key_the_struct_does_not_have_is_still_caught() {
+        let src = r#"struct Mob { hp: i32 }
+                     fn hp_of(m: Mob) -> i32 { return m.hp; }
+                     #[load] fn main() { let n = hp_of(nbt!({ hpp: 7 })); }"#;
+        let options = mwlc::emit::Options::default();
+        assert!(mwlc::driver::compile(src, "test", &options).is_err());
+    }
+
+    #[test]
+    fn without_a_type_to_check_against_it_is_refused() {
+        let src = "#[load] fn main() { let m = nbt!({ hp: 7 }); }";
+        let options = mwlc::emit::Options::default();
+        assert!(mwlc::driver::compile(src, "test", &options).is_err());
     }
 }

@@ -2142,3 +2142,37 @@ arena:setup                                35
 - `mwl build` が `target/cost.txt` に書き、閾値を超えた関数は stderr に警告する
 - **検証は `tinymcf` の実測との突き合わせ。** ループもガードの分岐も無い例では
   静的な数と実測が**完全に一致する**（`examples/arena` の `setup` で 35）
+
+---
+
+### 6.37 宛先駆動の式 lowering — 確定（M9）
+
+```rust
+fn twice(n: i32) -> i32 { return n + n; }
+#[load] fn main() { let a = twice(3); let b = a + a + a; }
+```
+
+```
+scoreboard players set $twice.n myns.v 3
+execute store result score $main.a myns.v run function myns:twice
+scoreboard players operation $main.b myns.v = $main.a myns.v
+scoreboard players operation $main.b myns.v += $main.a myns.v
+scoreboard players operation $main.b myns.v += $main.a myns.v
+```
+
+- **`let` の新規束縛だけが宛先になる。** そこはまだ誰も読んでおらず、
+  再帰の退避リストにも入っていない（`initialised` に積むのは値を降ろした後）
+- 書ける形は 2 つだけ:
+  - **呼び出しそのもの** — `execute store result score <宛先> run function …`。
+    呼び出しの後には何も走らないので、答えを壊すものがない
+  - **定数と束縛だけでできた算術の連なり** — 左端を宛先に書いてから右へ足していく。
+    `&&` / `||` も 0/1 の min / max なので同じ形に乗る（[§6.14](#614-短絡評価63-の見直し)）
+- **右側に呼び出しがあるときは従来どおりテンポラリを使う。** `f(a) + g(b)` で
+  `g` が再帰すると、宛先に入っている `f` の答えを呼び先が自分の同名レジスタとして潰す
+- **宛先が被演算子に現れる形も従来どおり。** 同じ名前の束縛は同じレジスタなので、
+  `let x = x + 1;`（外側の `x` を読む）は先に宛先を書くと読む値が消える
+- 代入（`x = …`）は対象外。`x = y + x` が同じ理由で壊れる
+
+**期待型は引数にも配る。** 引数は仮引数の型を期待として読まれるので、
+`f(nbt!({ .. }))` が書けるようになった（[§4.18](#418-nbt--確定m8)）。
+型引数（`Type::Param`）のままの仮引数では、まだ照合先が決まらないので拒否する。

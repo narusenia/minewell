@@ -762,8 +762,10 @@ mod tests {
     fn the_objectives_are_created_by_a_generated_load_function() {
         // Nothing works if these do not exist, and vanilla rejects the command rather
         // than failing quietly, so creating them cannot be left to the author.
+        // The nested sum on the right cannot be written through the destination, so
+        // this one still takes a temporary (spec section 6.37).
         let pack = compile(
-            "#[load] fn main() { let a = 1; let b = a + a; }",
+            "#[load] fn main() { let a = 1; let b = (a + a) * (a + a); }",
             &release(),
         );
         let init = &pack.files["data/myns/function/__init.mcfunction"];
