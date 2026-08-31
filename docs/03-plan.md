@@ -18,8 +18,8 @@
 | M7 | 複合型 | **完了** | 9 / 9 |
 | M8 | 数値拡張 | **完了** | 7 / 7 |
 | M9 | 仕上げ | **完了** | 11 / 11 |
-| — | 横断（CI・文書・エディタ） | 進行中 | 6 / 7 |
-| | **合計** | | **91 / 92** |
+| — | 横断（CI・文書・エディタ） | **完了** | 7 / 7 |
+| | **合計** | | **92 / 92** |
 
 状態は `未着手` / `進行中` / `完了` / `保留`。
 タスクを閉じたらチェックボックスと上表の両方を更新する。
@@ -791,8 +791,20 @@ JDK は M6（`toolchain build-from-jar`）で必要になった時点で `[tools
 - [x] **X-1** CI（`cargo test` / `clippy` / `fmt`）
   - `.github/workflows/ci.yml`。mise-action + `Swatinem/rust-cache`
   - ガードは M0-1 で除去済み
-- [ ] **X-2** toolchain 生成 CI
-  - `server.jar` の data generator を実行して Releases へ公開。M6 と同時
+- [x] **X-2** toolchain 生成 CI
+  - `server.jar` の data generator を実行して Releases へ公開
+  - `scripts/build-toolchain.sh <version>` が本体。マニフェストから server.jar を引き、
+    `--reports` を走らせ、`commands.json` と `toolchain.json` を
+    `mwlc::toolchain` が読む形で置く。**pack_format は jar の中の `version.json`** から採る
+  - `.github/workflows/toolchain.yml` は **`workflow_dispatch` のみ**。
+    server.jar のダウンロードとリリース作成が push で起きてよいことではない。
+    入力はシェルに貼らず環境変数経由で渡す
+  - **手元で 1.21.4 を実際に生成して検証した。** `pack_format` は 61、
+    `commands.json` は 400KB。**`examples/arena` が実物のコマンド表でそのまま通り**、
+    出力は手書き toolchain と 1 バイトも変わらなかった（`playsound <sound> master <targets>`
+    の語順も含めて）。M6 の設計が実データで裏付けられたのはこれが初めて
+  - **`mwl toolchain install` はまだ。** リリースが 1 本も無いので、HTTP クライアントを
+    足しても突き合わせる相手がいない。最初のリリースを切ってから
 - [x] **X-3a** `tinymcf` の対象サブセット仕様 `crates/tinymcf/SPEC.md`
   - モデル化する mcfunction の範囲、バニラとの意図的な差異、失敗モデル、決定性の保証
   - **`docs/` ではなく crate 同梱。** `tinymcf` は独立公開するので契約もコードと一緒に動く

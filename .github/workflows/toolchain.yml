@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: MIT
+
+# Builds a toolchain from Minecraft's own data generator and publishes it.
+#
+# Manual only. It downloads a server.jar and cuts a release, and neither of those
+# should happen because someone pushed a commit.
+
+name: toolchain
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Minecraft version, as the launcher spells it (e.g. 1.21.4)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # Through the environment rather than into the script text: an input is not
+      # something to paste into a shell command.
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Build the toolchain
+        run: ./scripts/build-toolchain.sh "$VERSION" toolchains
+
+      - name: Install the tools the check below needs
+        uses: jdx/mise-action@v2
+        with:
+          cache: true
+
+      - name: Compile an example with it
+        env:
+          MINEWELL_HOME: ${{ github.workspace }}
+        run: |
+          cd examples/arena
+          cargo run -p mwl -- build --release
+
+      - name: Package
+        run: tar -czf "mwl-toolchain-$VERSION.tar.gz" -C toolchains "$VERSION"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "toolchain-$VERSION" \
+            --title "toolchain $VERSION" \
+            --notes "Command table generated from Minecraft $VERSION's own data generator. Unpack into \$MINEWELL_HOME/toolchains." \
+            "mwl-toolchain-$VERSION.tar.gz"
