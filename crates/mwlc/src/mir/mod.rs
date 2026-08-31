@@ -2680,6 +2680,15 @@ impl<'p> Lowering<'_, 'p> {
                 present: Some(self.program.temps.next()),
             }),
         };
+        // The answer is a temporary like any other, and a later call in the same
+        // statement has to save it: the callee runs this same code and writes the same
+        // name, so without this `f(a) + f(b)` loses the left half.
+        if let Some(called) = &result {
+            self.program.used.push(called.value.clone());
+            if let Some(ok) = &called.present {
+                self.program.used.push(ok.clone());
+            }
+        }
         match &result {
             Some(Called {
                 value,

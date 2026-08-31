@@ -2571,3 +2571,20 @@ mod costs {
         assert!(table.contains("test:main"), "{table}");
     }
 }
+
+/// Two recursive calls in one expression.
+///
+/// The answer of the first has to survive the second: the callee runs the same code
+/// and writes the same temporary, so it has to be on the save list like any other.
+/// `factorial` never caught this — it only calls itself once per statement.
+#[test]
+fn two_recursive_calls_in_one_expression_keep_both_answers() {
+    let src = "fn fib(n: i32) -> i32 { if n <= 1 { return n; } return fib(n - 1) + fib(n - 2); } \
+               #[load] fn main() { let a = fib(7); }";
+    for profile in [mwlc::emit::Profile::Debug, mwlc::emit::Profile::Release] {
+        let mut mc = harness::load_with(src, profile);
+        mc.call("test:main");
+        assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
+        assert_eq!(harness::local(&mc, "main", "a"), Some(13), "{profile:?}");
+    }
+}
