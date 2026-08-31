@@ -1,0 +1,13 @@
+---
+source: crates/mwlc/tests/benchmarks.rs
+expression: table(INVENTORY)
+---
+# commands per call, callees included, counting every guard as taken.
+# '+' means the number is one pass: a loop, a recursive call or an
+# 'execute as' over several entities repeats part of it, and how often
+# depends on the data.
+# maxCommandChainLength is 65536 per tick by default; over it, Minecraft stops
+# the chain without saying so.
+
+bench:tick        20 +
+bench:tick/for_0  9 +
