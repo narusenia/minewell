@@ -5,16 +5,21 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use mwlc::cost;
 use mwlc::driver::{self, OUTPUT_DIR};
 use mwlc::emit::Profile;
 use mwlc::toolchain::Toolchains;
+
+/// Where the cost table lands, under `target/`.
+const COST_FILE: &str = "cost.txt";
 
 const USAGE: &str = "\
 mwl — the minewell compiler
 
 usage:
     mwl build [--release]
-        compile the project into target/datapack
+        compile the project into target/datapack, and write the per-function
+        command counts to target/cost.txt
 
     mwl toolchain list
         show the installed Minecraft versions
@@ -94,9 +99,30 @@ fn build(profile: Profile) -> miette::Result<String> {
     let out = root.join(OUTPUT_DIR);
     pack.write_to(&out)
         .map_err(|source| miette::miette!("could not write to {}: {source}", out.display()))?;
+
+    // Going over `maxCommandChainLength` is not an error in Minecraft: the chain stops
+    // and the rest of the tick silently does not happen. Saying so here is the only
+    // warning anyone gets (requirements section 16.1).
+    let costs = root.join("target").join(COST_FILE);
+    std::fs::write(&costs, cost::table(&pack.costs))
+        .map_err(|source| miette::miette!("could not write to {}: {source}", costs.display()))?;
+    for over in pack
+        .costs
+        .iter()
+        .filter(|cost| !cost.loops && cost.commands > cost::MAX_COMMAND_CHAIN)
+    {
+        eprintln!(
+            "warning: {} runs {} commands, over maxCommandChainLength ({})",
+            over.path,
+            over.commands,
+            cost::MAX_COMMAND_CHAIN
+        );
+    }
+
     Ok(format!(
-        "wrote {} file(s) to {}",
+        "wrote {} file(s) to {}, and costs to {}",
         pack.files.len(),
-        out.display()
+        out.display(),
+        costs.display()
     ))
 }

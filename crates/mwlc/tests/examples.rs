@@ -121,6 +121,7 @@ fn the_arena_example_does_what_it_says() {
     // A radius of 8 gives an area of about 201.088, which is over the threshold, and
     // the name matches the literal it is compared against.
     mc.effects.clear();
+    mc.commands_run = 0;
     mc.call("arena:setup");
     let said: Vec<&str> = mc
         .effects
@@ -130,6 +131,17 @@ fn the_arena_example_does_what_it_says() {
         .collect();
     assert!(said.contains(&"a big arena"), "{said:?}");
     assert!(said.contains(&"the pit is open"), "{said:?}");
+
+    // The static count is what `target/cost.txt` reports, and it assumes every guard
+    // holds. `setup` has no loop and every one of its guards does hold here, so the
+    // two numbers are the same (requirements section 16.1).
+    let stated = pack
+        .costs
+        .iter()
+        .find(|cost| cost.path == "arena:setup")
+        .expect("setup is in the table");
+    assert!(!stated.loops, "setup has no loop in it");
+    assert_eq!(stated.commands, mc.commands_run, "{:?}", stated);
 }
 
 #[test]

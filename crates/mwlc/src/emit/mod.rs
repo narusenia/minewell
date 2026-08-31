@@ -65,6 +65,9 @@ impl Default for Options {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Datapack {
     pub files: BTreeMap<String, String>,
+    /// What each function costs to run (requirements section 16.1). Not part of the
+    /// pack — `mwl build` writes it beside it, as `target/cost.txt`.
+    pub costs: Vec<crate::cost::Cost>,
 }
 
 impl Datapack {
@@ -81,6 +84,7 @@ impl Datapack {
 }
 
 pub fn emit(mir: &Mir, options: &Options) -> Datapack {
+    let costs = crate::cost::costs(mir);
     let mut files = BTreeMap::new();
     files.insert("pack.mcmeta".to_owned(), pack_mcmeta(options));
 
@@ -117,7 +121,7 @@ pub fn emit(mir: &Mir, options: &Options) -> Datapack {
         );
     }
 
-    Datapack { files }
+    Datapack { files, costs }
 }
 
 fn tagged<'a>(mir: &'a Mir, attr: &'a Attr) -> impl Iterator<Item = String> + 'a {

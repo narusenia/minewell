@@ -2475,3 +2475,99 @@ mod registers {
         }
     }
 }
+
+/// Static command counts (spec section 6.36).
+mod costs {
+    use super::harness::{NS, load_with};
+    use mwlc::emit::{Options, Profile};
+
+    /// What the compiler says one call to `main` costs.
+    fn stated(src: &str) -> u64 {
+        let options = Options {
+            profile: Profile::Release,
+            ..Options::default()
+        };
+        let pack = mwlc::driver::compile(src, NS, &options).expect("compiles");
+        let cost = pack
+            .costs
+            .iter()
+            .find(|cost| cost.path == format!("{NS}:main"))
+            .expect("main is in the table");
+        assert!(!cost.loops, "this case is meant to be loop free");
+        cost.commands
+    }
+
+    /// What running it actually costs.
+    fn measured(src: &str) -> u64 {
+        let mut mc = load_with(src, Profile::Release);
+        mc.call(&format!("{NS}:main"));
+        assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
+        mc.commands_run
+    }
+
+    fn agree(src: &str) {
+        assert_eq!(stated(src), measured(src), "{src}");
+    }
+
+    #[test]
+    fn straight_line_code_is_counted_exactly() {
+        agree("#[load] fn main() { let a = 1; let b = a + a; let c = b + b; }");
+    }
+
+    #[test]
+    fn a_call_carries_the_callee_with_it() {
+        agree(
+            "fn twice(n: i32) -> i32 { return n + n; } \
+               #[load] fn main() { let a = twice(3); let b = twice(a); }",
+        );
+    }
+
+    #[test]
+    fn storage_and_strings_are_counted_too() {
+        agree(
+            r#"struct Mob { hp: i32 }
+               #[load] fn main() { let m = Mob { hp: 3 }; let h = m.hp;
+                                   let s = "pit"; let n = s.len(); }"#,
+        );
+    }
+
+    #[test]
+    fn a_taken_guard_costs_what_was_counted() {
+        // The count assumes every guard holds, which is the number the chain limit
+        // cares about. Here it does hold, so the two agree exactly.
+        agree("#[load] fn main() { let a = 1; if a == 1 { let b = a + a; } }");
+    }
+
+    #[test]
+    fn a_loop_is_reported_as_one_pass() {
+        let options = Options {
+            profile: Profile::Release,
+            ..Options::default()
+        };
+        let pack = mwlc::driver::compile(
+            "#[load] fn main() { let mut i = 0; while i < 3 { i = i + 1; } }",
+            NS,
+            &options,
+        )
+        .expect("compiles");
+        let main = pack
+            .costs
+            .iter()
+            .find(|cost| cost.path == format!("{NS}:main"))
+            .expect("main is in the table");
+        assert!(main.loops, "{:?}", pack.costs);
+    }
+
+    #[test]
+    fn the_table_says_what_the_numbers_mean() {
+        let options = Options {
+            profile: Profile::Release,
+            ..Options::default()
+        };
+        let pack =
+            mwlc::driver::compile("#[load] fn main() { let a = 1; }", NS, &options).expect("ok");
+        let table = mwlc::cost::table(&pack.costs);
+        assert!(table.contains("maxCommandChainLength"), "{table}");
+        assert!(table.contains("test:main"), "{table}");
+    }
+}

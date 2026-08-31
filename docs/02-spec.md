@@ -2086,3 +2086,34 @@ scoreboard players operation $t0 myns.t = $main.a myns.v
 - これが M8-6 で見つけた無駄の正体。`if` の中でだけ使う束縛が、
   **その `if` を通らなかった経路でも退避対象に入り**、`scoreboard players get` が
   失敗していた。上の `f(4)` の例で **94 コマンド・失敗 3 件 → 82 コマンド・失敗 0 件**
+
+---
+
+### 6.36 コマンド数の静的検査 — 確定（M9）
+
+```
+# commands per call, callees included, counting every guard as taken.
+# '+' means the number is one pass: a loop, a recursive call or an
+# 'execute as' over several entities repeats part of it, and how often
+# depends on the data.
+# maxCommandChainLength is 65536 per tick by default; over it, Minecraft stops
+# the chain without saying so.
+
+arena:tick                                 85 +
+arena:tick/for_0                           35
+arena:setup                                35
+```
+
+- **1 命令 1 コマンドだから数えられる**（[§6.1](#61-名前) 以来の建て付け）。
+  `execute … run <cmd>` は 2、`$` のマクロ行は 1、`run` の無い
+  `execute store success … if …` も 1（[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §5）
+- **ガードは通る前提で数える。** `maxCommandChainLength` が気にするのは最悪値だから
+- 呼び出しは**呼び先の合計を足し込む**。同じ関数を 2 回呼べば 2 回分
+- **`+` が付くのは「1 周分の数」であるとき。** ループ・再帰に加えて、
+  **複数一致しうるセレクタの `execute as`** も対象 — 本体が一致した数だけ走る。
+  `@s` / `@p` / `@r` と `limit=1` は 1 体しか見つけないので付かない
+- 循環はメモ化せずに歩く。**上から来た経路によって答えが変わる**ので、
+  メモ化すると次の呼び出し元に嘘をつく。データパックの呼び出しグラフは小さい
+- `mwl build` が `target/cost.txt` に書き、閾値を超えた関数は stderr に警告する
+- **検証は `tinymcf` の実測との突き合わせ。** ループもガードの分岐も無い例では
+  静的な数と実測が**完全に一致する**（`examples/arena` の `setup` で 35）
