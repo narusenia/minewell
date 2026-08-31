@@ -14,7 +14,7 @@
 //!   is the class of silent failure minewell exists to remove.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::schema::{ArgType, Part, Schema};
 use crate::syntax::SyntaxError;
@@ -79,6 +79,9 @@ pub enum Type {
     Resource,
     /// `pos!(~ ~1 ~)`. Compile-time only.
     Pos,
+    /// `text!(..)`: chat JSON put together while compiling (spec section 3.22).
+    /// Compile-time only, like a selector.
+    Component,
     /// An immutable string in storage (spec section 4.17).
     Str,
     /// A composite value. It lives in storage rather than in a register, which is a
@@ -121,7 +124,7 @@ impl Type {
     pub fn is_compile_time(&self) -> bool {
         matches!(
             self,
-            Type::Selector | Type::Resource | Type::Pos | Type::View(_)
+            Type::Selector | Type::Resource | Type::Pos | Type::Component | Type::View(_)
         )
     }
 
@@ -164,6 +167,7 @@ impl Type {
             Type::Selector => "selector",
             Type::Resource => "ResourceLocation",
             Type::Pos => "Pos",
+            Type::Component => "TextComponent",
             // Only reachable where the type table is out of reach; every diagnostic
             // that can name the type goes through `Types::name_of` instead.
             Type::Struct(_) => "struct",
@@ -918,6 +922,91 @@ impl RawCommand {
     }
 }
 
+/// A chat component while it is being put together (spec section 6.32).
+///
+/// The members are already rendered as JSON values, so `"text"` maps to `"\"hi\""`
+/// and `"bold"` to `true`. Keeping them in a map is what lets `.red().bold()` add one
+/// at a time, and what makes `.red().blue()` mean blue.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Component {
+    members: BTreeMap<&'static str, String>,
+    /// The components appended after this one, which inherit its style.
+    extra: Vec<Component>,
+}
+
+impl Component {
+    /// A literal run of text.
+    fn text(value: &str) -> Self {
+        let mut component = Self::default();
+        component.set("text", quoted_json(value));
+        component
+    }
+
+    fn set(&mut self, key: &'static str, value: String) {
+        self.members.insert(key, value);
+    }
+
+    /// The JSON. `extra` sorts in among the members so that the output of a given
+    /// component is always spelled the same way.
+    pub fn render(&self) -> String {
+        let mut members: BTreeMap<&str, String> = self
+            .members
+            .iter()
+            .map(|(key, value)| (*key, value.clone()))
+            .collect();
+        if !self.extra.is_empty() {
+            let parts: Vec<String> = self.extra.iter().map(Component::render).collect();
+            members.insert("extra", format!("[{}]", parts.join(",")));
+        }
+        let body: Vec<String> = members
+            .iter()
+            .map(|(key, value)| format!("\"{key}\":{value}"))
+            .collect();
+        format!("{{{}}}", body.join(","))
+    }
+}
+
+/// A string as a JSON value, quotes included.
+fn quoted_json(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+/// What a style method sets: its JSON key, and the value it stands for. `None` means
+/// the method takes the value as an argument, which only `.color("#rrggbb")` does.
+fn style_member(method: &str) -> Option<(&'static str, Option<String>)> {
+    const COLOURS: &[&str] = &[
+        "black",
+        "dark_blue",
+        "dark_green",
+        "dark_aqua",
+        "dark_red",
+        "dark_purple",
+        "gold",
+        "gray",
+        "dark_gray",
+        "blue",
+        "green",
+        "aqua",
+        "red",
+        "light_purple",
+        "yellow",
+        "white",
+    ];
+    if let Some(name) = COLOURS.iter().find(|name| **name == method) {
+        return Some(("color", Some(format!("\"{name}\""))));
+    }
+    match method {
+        "color" => Some(("color", None)),
+        "bold" => Some(("bold", Some("true".to_owned()))),
+        "italic" => Some(("italic", Some("true".to_owned()))),
+        "underlined" => Some(("underlined", Some("true".to_owned()))),
+        "strikethrough" => Some(("strikethrough", Some("true".to_owned()))),
+        "obfuscated" => Some(("obfuscated", Some("true".to_owned()))),
+        _ => None,
+    }
+}
+
 /// What a `{name}` in a `raw!` string turned out to be.
 enum Interpolated {
     /// A compile-time value: it goes into the string and costs nothing.
@@ -947,6 +1036,9 @@ pub enum ExprKind {
     },
     /// A compile-time selector. Never evaluated into a register.
     Selector(String),
+    /// A chat component, fully built (spec section 3.22). Compile-time only: it ends
+    /// up as JSON inside a command's text and costs nothing to run.
+    Component(Component),
     Resource(String),
     Pos(String),
     /// A whole command, already rendered. One command, one line.
@@ -1447,6 +1539,7 @@ fn lower_function(
     {
         let mut cx = FnLowering {
             locals: Vec::new(),
+            namespace,
             function: name.clone(),
             place_aliases: HashMap::new(),
             types,
@@ -2146,6 +2239,8 @@ fn always_returns(stmts: &[Stmt]) -> bool {
 
 struct FnLowering<'a> {
     locals: Vec<Local>,
+    /// The pack's namespace, which `text!` writes into the JSON it builds.
+    namespace: &'a str,
     /// The name of the function being lowered: what a borrow lent from here records
     /// as its owner.
     function: String,
@@ -3250,7 +3345,142 @@ impl FnLowering<'_> {
         })
     }
 
+    /// `text!(a, b, c)` (spec section 3.22).
+    fn text_macro(&mut self, call: &ast::TextMacro) -> Option<Component> {
+        let mut parts = Vec::new();
+        let mut ok = true;
+        for arg in &call.args {
+            match self.component(arg) {
+                Some(part) => parts.push(part),
+                None => ok = false,
+            }
+        }
+        if !ok {
+            return None;
+        }
+        if parts.len() == 1 {
+            return parts.pop();
+        }
+        // The head is empty on purpose: the first element of a list is what the rest
+        // inherit style from, so writing anything there would colour its siblings.
+        let mut joined = Component::text("");
+        joined.extra = parts;
+        Some(joined)
+    }
+
+    /// One argument of `text!`, as a component.
+    fn component(&mut self, expr: &AstExpr) -> Option<Component> {
+        let value = self.expr(expr)?;
+        match (&value.kind, value.ty) {
+            (ExprKind::Component(component), _) => Some(component.clone()),
+            (ExprKind::Str(text), _) => Some(Component::text(text)),
+            (ExprKind::Int(n), _) => Some(Component::text(&n.to_string())),
+            (ExprKind::Bool(b), _) => Some(Component::text(&b.to_string())),
+            // A binding is *named*, not read: vanilla's JSON can point at a score or a
+            // storage path itself, which is why `text!` costs no commands at all.
+            (ExprKind::Local(local), ty) => self.binding_component(*local, ty, value.span),
+            _ => {
+                self.error(
+                    value.span,
+                    "text! can only show a literal or a binding; bind this to a name \
+                     first and write the name",
+                );
+                None
+            }
+        }
+    }
+
+    /// The component that names where a binding's value lives.
+    fn binding_component(&mut self, local: LocalId, ty: Type, span: Span) -> Option<Component> {
+        let binding = self.locals[local.0 as usize].name.clone();
+        let mut component = Component::default();
+        match ty {
+            // Vanilla's score component has no scale, so the digits on the board are
+            // what would be shown: 3142 for 3.142 (spec section 3.21 says the same of
+            // `raw!`).
+            Type::Fix(_) => {
+                self.error(
+                    span,
+                    format!(
+                        "'{binding}' is a fixed-point number, which holds scaled units; \
+                         a score component cannot divide it back"
+                    ),
+                );
+                None
+            }
+            Type::I32 | Type::Bool => {
+                let player = crate::names::fake_player(&self.function, &binding);
+                let objective = crate::names::var_objective(self.namespace);
+                component.set(
+                    "score",
+                    format!(
+                        "{{\"name\":{},\"objective\":{}}}",
+                        quoted_json(&player),
+                        quoted_json(&objective)
+                    ),
+                );
+                Some(component)
+            }
+            ty if ty.is_storage_scalar() => {
+                let path = crate::names::var_path(&self.function, &binding);
+                component.set("nbt", quoted_json(&path));
+                component.set(
+                    "storage",
+                    quoted_json(&crate::names::storage(self.namespace)),
+                );
+                Some(component)
+            }
+            ty => {
+                let found = self.ty(ty);
+                self.error(span, format!("a {found} cannot be shown by text!"));
+                None
+            }
+        }
+    }
+
+    /// `"a".red()` and `text!(..).bold()`: styling, which makes its receiver a
+    /// component (spec section 3.22).
+    fn style_method(
+        &mut self,
+        call: &ast::MethodCall,
+        key: &'static str,
+        fixed: Option<String>,
+    ) -> Option<Expr> {
+        let name = &call.name.name;
+        let value = match fixed {
+            Some(value) => {
+                if !call.args.is_empty() {
+                    self.error(call.span, format!("'{name}' takes no arguments"));
+                    return None;
+                }
+                value
+            }
+            None => match call.args.as_slice() {
+                [AstExpr::Str(lit)] => quoted_json(&lit.value),
+                _ => {
+                    self.error(
+                        call.span,
+                        format!("'{name}' takes one string, as in '.color(\"#ff8800\")'"),
+                    );
+                    return None;
+                }
+            },
+        };
+        let mut component = self.component(&call.receiver)?;
+        component.set(key, value);
+        Some(Expr {
+            kind: ExprKind::Component(component),
+            ty: Type::Component,
+            span: call.span,
+        })
+    }
+
     fn method_call(&mut self, call: &ast::MethodCall, as_statement: bool) -> Option<MethodOutcome> {
+        // Style method names are reserved: they are what turns a value into a chat
+        // component, and their receiver need not be a place (spec section 3.22).
+        if let Some((key, fixed)) = style_member(&call.name.name) {
+            return Some(MethodOutcome::Value(self.style_method(call, key, fixed)?));
+        }
         let place = self.place(&call.receiver)?;
         // An inherent method wins: `impl` is how a type gets behaviour of its own.
         let key = format!("{}::{}", self.types.name_of(place.ty), call.name.name);
@@ -3505,6 +3735,14 @@ impl FnLowering<'_> {
                 Some(Expr {
                     kind: ExprKind::Call { callee, args },
                     ty,
+                    span,
+                })
+            }
+            AstExpr::Text(call) => {
+                let component = self.text_macro(call)?;
+                Some(Expr {
+                    kind: ExprKind::Component(component),
+                    ty: Type::Component,
                     span,
                 })
             }
@@ -3863,6 +4101,7 @@ impl FnLowering<'_> {
     fn command_arg(&mut self, arg: &ast::Expr, want: ArgType) -> Option<String> {
         let value = self.expr(arg)?;
         let rendered = match (&value.kind, want) {
+            (ExprKind::Component(component), ArgType::Component) => component.render(),
             (ExprKind::Pos(text), ArgType::Pos) => text.clone(),
             (ExprKind::Resource(text), ArgType::Resource) => text.clone(),
             (ExprKind::Selector(text), ArgType::Selector) => text.clone(),
@@ -4868,6 +5107,10 @@ mod tests {
         Schema::parse(include_str!("../../tests/fixtures/commands.json")).expect("fixture")
     }
 
+    fn lower_err_with_toolchain(src: &str) -> Vec<SyntaxError> {
+        with_toolchain(src).expect_err("expected an error")
+    }
+
     fn with_toolchain(src: &str) -> Result<Hir, Vec<SyntaxError>> {
         let (file, errors) = parse(src);
         assert!(errors.is_empty(), "{errors:?}");
@@ -4881,9 +5124,13 @@ mod tests {
 
     fn command_text(src: &str) -> String {
         let hir = with_toolchain(src).expect("compiles");
-        match &hir.functions[0].body[0] {
-            Stmt::Raw(raw) => raw.as_text().expect("a command is literal").to_owned(),
-            other => panic!("expected a command, found {other:?}"),
+        let body = &hir.functions[0].body;
+        match body.iter().find_map(|stmt| match stmt {
+            Stmt::Raw(raw) => Some(raw),
+            _ => None,
+        }) {
+            Some(raw) => raw.as_text().expect("a command is literal").to_owned(),
+            None => panic!("expected a command, found {body:?}"),
         }
     }
 
@@ -5049,6 +5296,90 @@ mod tests {
         );
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("Mob"), "{errors:?}");
+    }
+
+    #[test]
+    fn text_turns_a_binding_into_a_score_component() {
+        let text = command_text(r#"fn main() { let hp = 3; tellraw(@a, text!("HP: ", hp)); }"#);
+        assert!(
+            text.contains(r#"{"score":{"name":"$main.hp","objective":"myns.v"}}"#),
+            "{text}"
+        );
+        assert!(text.starts_with("tellraw @a "), "{text}");
+    }
+
+    #[test]
+    fn text_joins_its_arguments_under_an_unstyled_head() {
+        // The first element of a list is what the rest inherit style from, so it has
+        // to be empty or ' HP: ' would come out red too.
+        let text = command_text(
+            r#"fn main() { let hp = 3; tellraw(@a, text!("Danger".red().bold(), " HP: ", hp)); }"#,
+        );
+        assert!(text.contains(r#""text":""#), "{text}");
+        assert!(
+            text.contains(r#"{"bold":true,"color":"red","text":"Danger"}"#),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn one_argument_needs_no_wrapper() {
+        let text = command_text(r#"fn main() { tellraw(@a, text!("hi")); }"#);
+        assert_eq!(text, r#"tellraw @a {"text":"hi"}"#);
+    }
+
+    #[test]
+    fn a_string_binding_becomes_an_nbt_component() {
+        let text = command_text(r#"fn main() { let s = "pit"; tellraw(@a, text!(s)); }"#);
+        assert_eq!(
+            text,
+            r#"tellraw @a {"nbt":"mw.vars.main.s","storage":"myns:mw"}"#
+        );
+    }
+
+    #[test]
+    fn a_hex_colour_is_written_through() {
+        let text = command_text(r##"fn main() { tellraw(@a, text!("hi".color("#ff8800"))); }"##);
+        assert!(text.contains(r##""color":"#ff8800""##), "{text}");
+    }
+
+    #[test]
+    fn a_quote_in_a_text_literal_is_escaped() {
+        let text = command_text(r#"fn main() { tellraw(@a, text!("a \"b\"")); }"#);
+        assert!(text.contains(r#"\"b\""#), "{text}");
+    }
+
+    #[test]
+    fn text_can_nest() {
+        let text = command_text(r#"fn main() { tellraw(@a, text!(text!("a", "b").red())); }"#);
+        assert!(text.contains(r#""color":"red""#), "{text}");
+        assert!(text.contains(r#"{"text":"a"}"#), "{text}");
+    }
+
+    #[test]
+    fn a_fixed_point_binding_cannot_be_shown() {
+        let errors = lower_err_with_toolchain(
+            r#"fn main() { let r = fix::<1000>(1500); tellraw(@a, text!(r)); }"#,
+        );
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("scaled"), "{errors:?}");
+    }
+
+    #[test]
+    fn a_place_has_to_be_bound_first() {
+        let errors = lower_err_with_toolchain(
+            r#"struct Mob { hp: i32 }
+               fn main() { let m = Mob { hp: 1 }; tellraw(@a, text!(m.hp)); }"#,
+        );
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("bind"), "{errors:?}");
+    }
+
+    #[test]
+    fn a_component_cannot_be_bound_to_a_name() {
+        let errors = lower_err_with_toolchain(r#"fn main() { let t = text!("hi"); }"#);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("TextComponent"), "{errors:?}");
     }
 
     #[test]

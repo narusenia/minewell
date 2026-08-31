@@ -159,7 +159,14 @@ fn tick() {
         }
         Threat::Swarm => {
             play_sound(minecraft:entity.wither.spawn, @a);
-            tellraw(@a, "{\"text\":\"the arena is swarming\",\"color\":\"red\"}");
+            // `text!` writes the JSON, including the fake player name the score lives
+            // under. Nothing here costs a command: the component names the score, it
+            // does not read it.
+            let count = seen.seen;
+            tellraw(
+                @a,
+                text!("the arena is swarming".red().bold(), " (", count, " of them)"),
+            );
         }
     }
 }

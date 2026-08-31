@@ -1237,6 +1237,18 @@ impl Parser {
                 },
             }));
         }
+        // `text!` takes expressions too: its arguments are values and method chains
+        // written in the language (spec section 3.22).
+        if name.name == "text" {
+            let args = self.call_args()?;
+            return Some(Expr::Text(TextMacro {
+                args,
+                span: Span {
+                    start,
+                    end: self.previous_end(),
+                },
+            }));
+        }
         let open = match self.peek() {
             Some(TokenKind::Punct(p @ (Punct::LParen | Punct::LBracket | Punct::LBrace))) => *p,
             _ => {

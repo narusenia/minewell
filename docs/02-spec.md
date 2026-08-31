@@ -570,6 +570,40 @@ raw!("summon zombie ~ ~ ~ {{NoAI:1b}}");
 - `struct` / `Vec` / `Option` / ビューも書けない。compound をコマンド文字列に
   埋めても意味を持たない
 
+### 3.22 `text!` と `TextComponent` — 確定（M9）
+
+```
+primary  += "text" "!" "(" [expr {"," expr} [","]] ")"
+primary  += expr "." style_method "(" [STRING] ")"
+```
+
+```rust
+tellraw(@a, text!("Danger".red().bold(), " HP: ", hp));
+```
+
+- 引数は左から連結される。`TextComponent` は**コンパイル時だけの型**で、
+  `Selector` と同じ分類（束縛にも引数にもフィールドにも書けない）
+- 自動変換:
+
+| 引数 | JSON |
+|---|---|
+| 文字列リテラル | `{"text":"..."}` |
+| `i32` / `bool` の束縛 | `{"score":{"name":"$<関数>.<束縛>","objective":"<ns>.v"}}` |
+| `String` の束縛 | `{"nbt":"mw.vars.<関数>.<束縛>","storage":"<ns>:mw"}` |
+| `TextComponent` | そのまま（ネスト可） |
+
+- 装飾メソッドは 16 色（`.red()` 等）と `.color("#rrggbb")`、`.bold()` `.italic()`
+  `.underlined()` `.strikethrough()` `.obfuscated()`。**これらの名前は予約**され、
+  同名の固有メソッドは書けない
+- **書けるのは束縛そのものだけ。** `m.hp` や `a + b` は書けず、先に `let` で受ける。
+  場所のパスを組み立てるのは MIR の仕事で、`text!` はコンパイル時に閉じている
+- **`fix<S>` は書けない。** score にあるのはスケール後の整数で、バニラの score
+  コンポーネントには倍率が無い（[§3.21](#321-raw-の補間--確定m9) と同じ理由）
+- **`.on_click` / `.on_hover` / `translate!` は持たない。** クリックとホバーの JSON は
+  1.21.5 で形が変わっており、版差は toolchain が持つもので、コンパイラに
+  埋め込むものではない（AGENTS.md）。要件定義 §10.3 のこの部分は、toolchain が
+  イベントの形を記述できるようになってから
+
 ### 3.5 未定
 
 以降のタスクが、実装の直前に確定させる。
@@ -1913,3 +1947,31 @@ main/raw_0:
   **関数そのものを昇格させる案**が前提で、その案は局所変数を補間できない
   （呼び出し元が値を知らない）ので採らない
 - コストは実行時の値 1 つにつきマーシャル 1 + 呼び出し 1 + マクロ行 1
+
+---
+
+### 6.32 `text!` — 確定（M9）
+
+```rust
+fn main() {
+    let hp = 12;
+    let name = "pit";
+    tellraw(@a, text!("Danger".red().bold(), " HP: ", hp, " @ ", name));
+}
+```
+
+```
+tellraw @a {"extra":[{"bold":true,"color":"red","text":"Danger"},{"text":" HP: "},\
+    {"score":{"name":"$main.hp","objective":"myns.v"}},{"text":" @ "},\
+    {"nbt":"mw.vars.main.name","storage":"myns:mw"}],"text":""}
+```
+
+- **コマンドは 1 つ。実行時コストはゼロ**（要件定義 §10.3）。JSON が score と storage を
+  直接指せるので、`raw!` と違ってマクロ関数が要らない。ここが両者の分かれ目
+- 連結は `{"text":"","extra":[…]}`。**先頭を空にする**のは、リストの先頭要素の装飾を
+  後続が受け継ぐため。`text!("a".red(), "b")` の `"b"` まで赤くならない
+- `text!` 自身への装飾（`text!(…).red()`）はこの空の先頭に付き、全体に効く
+- 引数が 1 つで `text!` 自身に装飾が無いときは、その 1 つをそのまま書く
+- 名前は [`names`](#) モジュールが 1 か所で決める。フェイクプレイヤー名と
+  `mw.vars` のパスは MIR、objective と storage の id は emit と共有していて、
+  **JSON の中の名前が実際の出力とずれない**ことをそこで担保する

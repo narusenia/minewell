@@ -291,6 +291,15 @@ pub enum Expr {
     /// `debug_assert!(c, "m")`: a check that only debug builds carry
     /// (spec section 3.20).
     Assert(AssertExpr),
+    /// `text!(a, b)`: a chat component put together while compiling
+    /// (spec section 3.22).
+    Text(TextMacro),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextMacro {
+    pub args: Vec<Expr>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -417,6 +426,7 @@ impl Expr {
             Expr::Try(e) => e.span,
             Expr::ViewOf(e) => e.span,
             Expr::Assert(e) => e.span,
+            Expr::Text(e) => e.span,
             Expr::Bool(e) => e.span,
             Expr::Str(e) => e.span,
             Expr::Path(e) => e.span,

@@ -1,26 +1,6 @@
 {
   "type": "root",
   "children": {
-    "reload": {
-      "type": "literal",
-      "executable": true
-    },
-    "setblock": {
-      "type": "literal",
-      "children": {
-        "pos": {
-          "type": "argument",
-          "parser": "minecraft:block_pos",
-          "children": {
-            "block": {
-              "type": "argument",
-              "parser": "minecraft:block_state",
-              "executable": true
-            }
-          }
-        }
-      }
-    },
     "data": {
       "type": "literal",
       "children": {
@@ -48,13 +28,13 @@
         }
       }
     },
-    "function": {
+    "execute": {
       "type": "literal",
       "children": {
-        "name": {
-          "type": "argument",
-          "parser": "minecraft:function",
-          "executable": true
+        "run": {
+          "type": "literal",
+          "executable": true,
+          "redirect": []
         }
       }
     },
@@ -68,13 +48,13 @@
         }
       }
     },
-    "execute": {
+    "function": {
       "type": "literal",
       "children": {
-        "run": {
-          "type": "literal",
-          "executable": true,
-          "redirect": []
+        "name": {
+          "type": "argument",
+          "parser": "minecraft:function",
+          "executable": true
         }
       }
     },
@@ -94,6 +74,42 @@
                   "executable": true
                 }
               }
+            }
+          }
+        }
+      }
+    },
+    "reload": {
+      "type": "literal",
+      "executable": true
+    },
+    "setblock": {
+      "type": "literal",
+      "children": {
+        "pos": {
+          "type": "argument",
+          "parser": "minecraft:block_pos",
+          "children": {
+            "block": {
+              "type": "argument",
+              "parser": "minecraft:block_state",
+              "executable": true
+            }
+          }
+        }
+      }
+    },
+    "tellraw": {
+      "type": "literal",
+      "children": {
+        "targets": {
+          "type": "argument",
+          "parser": "minecraft:entity",
+          "children": {
+            "message": {
+              "type": "argument",
+              "parser": "minecraft:component",
+              "executable": true
             }
           }
         }

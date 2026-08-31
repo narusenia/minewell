@@ -145,8 +145,8 @@ fn function_tag(values: &[String]) -> String {
 
 fn objective(namespace: &str, reg: &Reg) -> String {
     match reg.kind {
-        RegKind::Var => format!("{namespace}.v"),
-        RegKind::Temp => format!("{namespace}.t"),
+        RegKind::Var => crate::names::var_objective(namespace),
+        RegKind::Temp => crate::names::temp_objective(namespace),
     }
 }
 
@@ -414,7 +414,7 @@ fn command(inst: &Inst, ns: &str, options: &Options) -> String {
 fn target(reference: &DataRef, ns: &str) -> String {
     let path = &reference.path;
     match &reference.target {
-        DataTarget::Storage => format!("storage {ns}:mw {path}"),
+        DataTarget::Storage => format!("storage {} {path}", crate::names::storage(ns)),
         DataTarget::Entity(selector) => format!("entity {selector} {path}"),
     }
 }

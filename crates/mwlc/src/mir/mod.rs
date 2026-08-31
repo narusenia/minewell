@@ -796,11 +796,7 @@ fn is_pure(expr: &hir::Expr) -> bool {
 
 fn local_reg(function: &hir::Function, local: LocalId) -> Reg {
     Reg {
-        // Qualified by function so two functions' locals cannot collide.
-        holder: format!(
-            "${}.{}",
-            function.name, function.locals[local.0 as usize].name
-        ),
+        holder: crate::names::fake_player(&function.name, &function.locals[local.0 as usize].name),
         kind: RegKind::Var,
     }
 }
@@ -812,10 +808,7 @@ fn param_reg(function: &hir::Function, local: LocalId) -> Reg {
 /// Where a composite binding lives: `mw.vars.<function>.<binding>` in `<ns>:mw`
 /// (spec section 6.18). Qualified by function for the same reason a register is.
 fn local_path(function: &hir::Function, local: LocalId) -> String {
-    format!(
-        "mw.vars.{}.{}",
-        function.name, function.locals[local.0 as usize].name
-    )
+    crate::names::var_path(&function.name, &function.locals[local.0 as usize].name)
 }
 
 /// Where a place lives: the binding's path with one step per field or index.
@@ -827,7 +820,7 @@ fn place_path(function: &hir::Function, place: &hir::Place) -> DataRef {
         hir::Root::Local(local) => (DataTarget::Storage, local_path(function, *local)),
         // A borrowed place belongs to the caller, and says so by name.
         hir::Root::Lent { owner, local, .. } => {
-            (DataTarget::Storage, format!("mw.vars.{owner}.{local}"))
+            (DataTarget::Storage, crate::names::var_path(owner, local))
         }
         // A view names an entity, and the path is written on the command itself.
         hir::Root::Entity { selector } => (DataTarget::Entity(selector.clone()), String::new()),
@@ -857,7 +850,7 @@ fn place_reg(function: &hir::Function, place: &hir::Place) -> Reg {
         // A view's fields are in the entity's NBT; none of them is a register.
         Root::Entity { .. } => unreachable!("a view has no register"),
         Root::Lent { owner, local, .. } => Reg {
-            holder: format!("${owner}.{local}"),
+            holder: crate::names::fake_player(owner, local),
             kind: RegKind::Var,
         },
     }
@@ -2712,6 +2705,8 @@ impl<'p> Lowering<'_, 'p> {
 
     fn expr(&mut self, expr: &hir::Expr) -> Value {
         match &expr.kind {
+            // A component is JSON inside a command's text; it never reaches a register.
+            hir::ExprKind::Component(_) => unreachable!("a component is part of a command"),
             hir::ExprKind::Int(n) => Value::Const(*n),
             hir::ExprKind::Bool(b) => Value::Const(i32::from(*b)),
             hir::ExprKind::Local(local) => Value::Reg(self.local(*local)),

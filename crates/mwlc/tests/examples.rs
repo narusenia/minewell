@@ -103,10 +103,19 @@ fn the_arena_example_does_what_it_says() {
         effects.contains(&("playsound", "minecraft:entity.wither.spawn master @a")),
         "{effects:?}"
     );
+    // `text!` named the score rather than reading it, so the JSON carries the fake
+    // player the binding lives under (spec section 6.32).
+    let told: Vec<&str> = effects
+        .iter()
+        .filter(|(name, _)| *name == "tellraw")
+        .map(|(_, args)| *args)
+        .collect();
+    assert_eq!(told.len(), 1, "{effects:?}");
     assert!(
-        effects.iter().any(|(name, _)| *name == "tellraw"),
-        "{effects:?}"
+        told[0].contains(r#"{"score":{"name":"$tick.count","objective":"arena.v"}}"#),
+        "{told:?}"
     );
+    assert!(told[0].contains(r#""color":"red""#), "{told:?}");
 
     // The load function is where the fixed-point arithmetic and the nbt! literal are.
     // A radius of 8 gives an area of about 201.088, which is over the threshold, and
