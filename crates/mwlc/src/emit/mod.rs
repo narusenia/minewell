@@ -68,6 +68,9 @@ pub struct Datapack {
     /// What each function costs to run (requirements section 16.1). Not part of the
     /// pack — `mwl build` writes it beside it, as `target/cost.txt`.
     pub costs: Vec<crate::cost::Cost>,
+    /// The `#[test]` functions, by the id a `function` command would name
+    /// (spec section 3.23). `mwl test` calls each one.
+    pub tests: Vec<String>,
 }
 
 impl Datapack {
@@ -121,7 +124,11 @@ pub fn emit(mir: &Mir, options: &Options) -> Datapack {
         );
     }
 
-    Datapack { files, costs }
+    Datapack {
+        files,
+        costs,
+        tests: tagged(mir, &Attr::Test).collect(),
+    }
 }
 
 fn tagged<'a>(mir: &'a Mir, attr: &'a Attr) -> impl Iterator<Item = String> + 'a {
@@ -663,6 +670,20 @@ mod tests {
         );
         let init = &pack.files["data/myns/function/__init.mcfunction"];
         assert!(init.contains("myns.v"), "{init}");
+    }
+
+    #[test]
+    fn tests_do_not_ship_in_a_release_build() {
+        // Nothing calls them from a function tag, so dead code elimination takes them.
+        let pack = compile("#[test] fn t() {} #[load] fn main() {}", &release());
+        assert!(!pack.files.contains_key("data/myns/function/t.mcfunction"));
+
+        let debug = compile(
+            "#[test] fn t() {} #[load] fn main() {}",
+            &Options::default(),
+        );
+        assert!(debug.files.contains_key("data/myns/function/t.mcfunction"));
+        assert_eq!(debug.tests, vec!["myns:t".to_owned()]);
     }
 
     #[test]

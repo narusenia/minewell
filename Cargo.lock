@@ -212,6 +212,8 @@ version = "0.0.0"
 dependencies = [
  "miette",
  "mwlc",
+ "tempfile",
+ "tinymcf",
 ]
 
 [[package]]

@@ -1106,6 +1106,9 @@ pub enum ExprKind {
 pub enum Attr {
     Tick,
     Load,
+    /// `#[test]`: a function `mwl test` runs (spec section 3.23). Called with no
+    /// executor, like a tag, and left out of a release build.
+    Test,
     Inline,
     NoInline,
     /// What execution context this function requires of its caller.
@@ -1142,6 +1145,7 @@ impl Attr {
         Some(match name {
             "tick" => Attr::Tick,
             "load" => Attr::Load,
+            "test" => Attr::Test,
             "inline" => Attr::Inline,
             "no_inline" => Attr::NoInline,
             _ => return None,
@@ -1569,12 +1573,23 @@ fn lower_function(
         // A function tag invokes with no executor, so a tick or load function that
         // needs one is guaranteed to do nothing at runtime — silently. Vanilla can
         // never tell you this.
-        let tagged = attrs.iter().any(|a| matches!(a, Attr::Tick | Attr::Load));
+        let tagged = attrs
+            .iter()
+            .any(|a| matches!(a, Attr::Tick | Attr::Load | Attr::Test));
         if tagged && !cx.provided.is_empty() {
             cx.error(
                 f.name.span,
-                "a #[tick] or #[load] function cannot require a context: function tags \
-                 invoke it with no executor, so it would silently do nothing",
+                "a #[tick], #[load] or #[test] function cannot require a context: it is \
+                 invoked with no executor, so it would silently do nothing",
+            );
+        }
+        // Nothing hands a test arguments or reads its answer, so a signature that
+        // wants either is a mistake that would never show up at runtime.
+        if attrs.contains(&Attr::Test) && (!f.params.is_empty() || f.ret.is_some()) {
+            cx.error(
+                f.name.span,
+                "a #[test] function takes no arguments and returns nothing: \
+                 it is called on its own",
             );
         }
         // The receiver is a parameter like any other, under the name `self`.
@@ -5380,6 +5395,21 @@ mod tests {
         let errors = lower_err_with_toolchain(r#"fn main() { let t = text!("hi"); }"#);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("TextComponent"), "{errors:?}");
+    }
+
+    #[test]
+    fn a_test_function_takes_nothing_and_answers_nothing() {
+        assert!(!lower_err("#[test] fn t(n: i32) {}").is_empty());
+        assert!(!lower_err("#[test] fn t() -> i32 { return 1; }").is_empty());
+        assert!(lower_err("#[test] fn t() {}").is_empty());
+    }
+
+    #[test]
+    fn a_test_function_cannot_require_a_context() {
+        // Nothing gives it an executor, so it would silently do nothing.
+        let errors = lower_err("#[test] #[ctx(entity)] fn t() {}");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("#[test]"), "{errors:?}");
     }
 
     #[test]
