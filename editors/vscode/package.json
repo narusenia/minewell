@@ -1,0 +1,26 @@
+{
+  "name": "minewell",
+  "displayName": "minewell",
+  "description": "Syntax highlighting for .mwl",
+  "version": "0.0.0",
+  "license": "MIT",
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "mwl",
+        "aliases": ["minewell", "mwl"],
+        "extensions": [".mwl"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "mwl",
+        "scopeName": "source.mwl",
+        "path": "./syntaxes/mwl.tmLanguage.json"
+      }
+    ]
+  }
+}

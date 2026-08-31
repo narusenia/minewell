@@ -1,0 +1,111 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "minewell",
+  "scopeName": "source.mwl",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#selectors" },
+    { "include": "#resources" },
+    { "include": "#strings" },
+    { "include": "#attributes" },
+    { "include": "#macros" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#numbers" },
+    { "include": "#functions" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        { "name": "comment.line.double-slash.mwl", "match": "//.*$" },
+        {
+          "name": "comment.block.mwl",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "selectors": {
+      "comment": "@e[...] is one token, and a ] inside a string does not end it (spec section 2.7)",
+      "name": "constant.language.selector.mwl",
+      "match": "@[aeprs](\\[(?:[^\\[\\]\"]|\"[^\"]*\")*\\])?"
+    },
+    "resources": {
+      "comment": "minecraft:block.note_block.pling is one token, dots included (spec section 2.8)",
+      "name": "string.unquoted.resource.mwl",
+      "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?:/[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z0-9_.\\-]+(?:/[A-Za-z0-9_.\\-]+)*"
+    },
+    "strings": {
+      "name": "string.quoted.double.mwl",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [{ "name": "constant.character.escape.mwl", "match": "\\\\." }]
+    },
+    "attributes": {
+      "name": "meta.attribute.mwl",
+      "begin": "#\\[",
+      "end": "\\]",
+      "beginCaptures": { "0": { "name": "entity.name.tag.mwl" } },
+      "endCaptures": { "0": { "name": "entity.name.tag.mwl" } },
+      "patterns": [
+        { "include": "#strings" },
+        { "name": "entity.name.tag.mwl", "match": "[A-Za-z_][A-Za-z0-9_]*" }
+      ]
+    },
+    "macros": {
+      "name": "entity.name.function.macro.mwl",
+      "match": "\\b[A-Za-z_][A-Za-z0-9_]*!"
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.mwl",
+          "match": "\\b(if|else|match|while|loop|for|in|break|continue|return)\\b"
+        },
+        {
+          "comment": "as and at are execution contexts here, not casts",
+          "name": "keyword.other.context.mwl",
+          "match": "\\b(as|at)\\b"
+        },
+        {
+          "name": "storage.type.mwl",
+          "match": "\\b(fn|let|mut|const|struct|enum|impl|mod|use|pub)\\b"
+        },
+        { "name": "constant.language.mwl", "match": "\\b(true|false|Some|None)\\b" }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.mwl",
+          "match": "\\b(i8|i16|i32|i64|f32|f64|bool|String|Vec|Option|fix)\\b"
+        },
+        { "name": "entity.name.type.mwl", "match": "\\b[A-Z][A-Za-z0-9_]*\\b" }
+      ]
+    },
+    "numbers": {
+      "name": "constant.numeric.mwl",
+      "match": "\\b(0x[0-9a-fA-F_]+|0b[01_]+|[0-9][0-9_]*)\\b"
+    },
+    "functions": {
+      "patterns": [
+        {
+          "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.mwl" },
+            "2": { "name": "entity.name.function.mwl" }
+          }
+        },
+        {
+          "name": "entity.name.function.call.mwl",
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*\\()"
+        }
+      ]
+    },
+    "operators": {
+      "name": "keyword.operator.mwl",
+      "match": "(\\+=|-=|\\*=|/=|%=|==|!=|<=|>=|&&|\\|\\||->|=>|\\.\\.=|\\.\\.|::|[-+*/%<>=!&?])"
+    }
+  }
+}

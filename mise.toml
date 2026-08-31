@@ -5,6 +5,9 @@
 # and clippy are absent unless named here.
 rust = { version = "stable", components = "rustfmt,clippy" }
 "cargo-insta" = "latest"
+# For the editor grammar (`editors/`). The generated parser is not committed, so the
+# CLI is needed to build and test it.
+"tree-sitter" = "0.26"
 # M6 will add `java` here, for `mwl toolchain build-from-jar`. Not needed before that.
 
 [env]
@@ -42,6 +45,14 @@ run = "cargo test -p tinymcf"
 description = "Compiler only"
 run = "cargo test -p mwlc"
 
+[tasks.grammar]
+description = "Build the tree-sitter grammar and parse every example with it"
+dir = "editors/tree-sitter-mwl"
+run = [
+  "tree-sitter generate",
+  "tree-sitter parse --quiet ../../examples/*/src/*.mwl",
+]
+
 [tasks.snap]
 description = "Review insta snapshots"
 run = "cargo insta review"
@@ -54,7 +65,7 @@ run = "cargo insta accept"
 
 [tasks.ci]
 description = "Same checks as CI. Run before pushing"
-depends = ["fmt:check", "lint", "test"]
+depends = ["fmt:check", "lint", "test", "grammar"]
 
 [tasks."fmt:check"]
 run = "cargo fmt --all -- --check"

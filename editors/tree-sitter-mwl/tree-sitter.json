@@ -1,0 +1,19 @@
+{
+  "grammars": [
+    {
+      "name": "mwl",
+      "camelcase": "Mwl",
+      "scope": "source.mwl",
+      "path": ".",
+      "file-types": ["mwl"],
+      "highlights": ["queries/highlights.scm"],
+      "injection-regex": "^mwl$"
+    }
+  ],
+  "metadata": {
+    "version": "0.0.0",
+    "license": "MIT",
+    "description": "minewell grammar for tree-sitter",
+    "authors": [{ "name": "minewell" }]
+  }
+}

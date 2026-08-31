@@ -8,3 +8,4 @@ target/
 
 # build output
 /dist
+editors/tree-sitter-mwl/src/

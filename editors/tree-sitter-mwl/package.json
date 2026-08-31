@@ -1,0 +1,13 @@
+{
+  "name": "tree-sitter-mwl",
+  "version": "0.0.0",
+  "description": "minewell grammar for tree-sitter",
+  "license": "MIT",
+  "main": "bindings/node",
+  "keywords": ["parser", "minewell", "minecraft", "datapack"],
+  "files": ["grammar.js", "queries", "src"],
+  "scripts": {
+    "build": "tree-sitter generate",
+    "test": "tree-sitter parse --quiet ../../examples/**/*.mwl"
+  }
+}

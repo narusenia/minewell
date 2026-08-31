@@ -1,0 +1,12 @@
+id = "minewell"
+name = "minewell"
+description = "Syntax highlighting for .mwl"
+version = "0.0.0"
+schema_version = 1
+authors = ["minewell"]
+repository = "https://github.com/NaruseNia/minewell"
+
+[grammars.mwl]
+repository = "https://github.com/NaruseNia/minewell"
+commit = "HEAD"
+path = "editors/tree-sitter-mwl"
