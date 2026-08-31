@@ -293,14 +293,14 @@ mod tests {
 
     #[test]
     fn a_project_builds_into_a_datapack() {
-        let dir = project(SIMPLE, r#"fn main() { raw!("say hi"); }"#);
+        let dir = project(SIMPLE, r#"#[load] fn main() { raw!("say hi"); }"#);
         let pack = build(dir.path(), Profile::Release).expect("builds");
         assert_eq!(pack.files["data/myns/function/main.mcfunction"], "say hi\n");
     }
 
     #[test]
     fn the_namespace_defaults_to_the_package_name() {
-        let dir = project("[package]\nname = \"mypack\"\n", "fn main() {}");
+        let dir = project("[package]\nname = \"mypack\"\n", "#[load] fn main() {}");
         let pack = build(dir.path(), Profile::Release).expect("builds");
         assert!(
             pack.files
@@ -362,7 +362,7 @@ mod tests {
 
     #[test]
     fn a_hand_written_file_cannot_shadow_a_generated_one() {
-        let dir = project(SIMPLE, "fn main() {}");
+        let dir = project(SIMPLE, "#[load] fn main() {}");
         std::fs::create_dir_all(dir.path().join("data/myns/function")).unwrap();
         std::fs::write(
             dir.path().join("data/myns/function/main.mcfunction"),

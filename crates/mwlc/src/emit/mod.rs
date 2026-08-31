@@ -84,10 +84,9 @@ pub fn emit(mir: &Mir, options: &Options) -> Datapack {
     let mut files = BTreeMap::new();
     files.insert("pack.mcmeta".to_owned(), pack_mcmeta(options));
 
-    let mut namespace = "minecraft";
+    let namespace = mir.namespace.as_str();
     for function in &mir.functions {
         let (ns, path) = split_id(&function.path);
-        namespace = ns;
         files.insert(
             format!("data/{ns}/{FUNCTION_DIR}/{path}.mcfunction"),
             function_body(function, options, ns),
@@ -99,7 +98,7 @@ pub fn emit(mir: &Mir, options: &Options) -> Datapack {
     // bug. Creating them is therefore not optional and not the author's job.
     files.insert(
         format!("data/{namespace}/{FUNCTION_DIR}/{INIT_FUNCTION}.mcfunction"),
-        init_body(namespace),
+        init_body(namespace, options.profile, &files),
     );
 
     let load = std::iter::once(format!("{namespace}:{INIT_FUNCTION}"))
@@ -128,10 +127,28 @@ fn tagged<'a>(mir: &'a Mir, attr: &'a Attr) -> impl Iterator<Item = String> + 'a
         .map(|f| f.path.clone())
 }
 
-fn init_body(namespace: &str) -> String {
-    format!(
-        "scoreboard objectives add {namespace}.v dummy\nscoreboard objectives add {namespace}.t dummy\n"
-    )
+/// The objectives to create, one `scoreboard objectives add` each.
+///
+/// A release build creates only the ones something names (requirements section 15).
+/// The test is the rendered commands rather than the MIR: a `raw!` naming an objective
+/// itself is a use, and reading the text is what sees it.
+fn init_body(namespace: &str, profile: Profile, bodies: &BTreeMap<String, String>) -> String {
+    let mut out = String::new();
+    for objective in [
+        crate::names::var_objective(namespace),
+        crate::names::temp_objective(namespace),
+    ] {
+        // A whole word, not a substring: the objective is its own argument wherever it
+        // is written, and it can be the last one on a line.
+        let used = profile == Profile::Debug
+            || bodies
+                .values()
+                .any(|body| body.split_whitespace().any(|word| word == objective));
+        if used {
+            out.push_str(&format!("scoreboard objectives add {objective} dummy\n"));
+        }
+    }
+    out
 }
 
 fn function_tag(values: &[String]) -> String {
@@ -558,7 +575,8 @@ mod tests {
 
     #[test]
     fn the_layout_is_what_minecraft_expects() {
-        let pack = compile(r#"fn main() { raw!("say hi"); }"#, &release());
+        // Tagged: a release build keeps only what a function tag can reach.
+        let pack = compile(r#"#[load] fn main() { raw!("say hi"); }"#, &release());
         assert_eq!(
             pack.files.keys().collect::<Vec<_>>(),
             vec![
@@ -571,9 +589,82 @@ mod tests {
     }
 
     #[test]
+    fn an_uncalled_function_is_left_out_of_a_release_build() {
+        let pack = compile(
+            r#"#[tick] fn main() { raw!("say hi"); } fn other() { raw!("say x"); }"#,
+            &release(),
+        );
+        assert!(
+            !pack
+                .files
+                .contains_key("data/myns/function/other.mcfunction"),
+            "{:?}",
+            pack.files.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            pack.files
+                .contains_key("data/myns/function/main.mcfunction")
+        );
+    }
+
+    #[test]
+    fn a_debug_build_keeps_every_function() {
+        // Requirements section 15: debug keeps source and output one to one.
+        let pack = compile(
+            r#"#[tick] fn main() { raw!("say hi"); } fn other() { raw!("say x"); }"#,
+            &Options::default(),
+        );
+        assert!(
+            pack.files
+                .contains_key("data/myns/function/other.mcfunction")
+        );
+    }
+
+    #[test]
+    fn a_function_named_only_in_a_raw_command_is_kept() {
+        // `raw!` is text the compiler does not read, so anything it names counts.
+        let pack = compile(
+            r#"#[tick] fn main() { raw!("function myns:other"); } fn other() { raw!("say x"); }"#,
+            &release(),
+        );
+        assert!(
+            pack.files
+                .contains_key("data/myns/function/other.mcfunction"),
+            "{:?}",
+            pack.files.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_objective_nothing_touches_is_not_created() {
+        let pack = compile(r#"#[tick] fn main() { raw!("say hi"); }"#, &release());
+        assert_eq!(pack.files["data/myns/function/__init.mcfunction"], "");
+    }
+
+    #[test]
+    fn the_objective_a_binding_needs_is_created() {
+        let pack = compile("#[tick] fn main() { let a = 1; }", &release());
+        let init = &pack.files["data/myns/function/__init.mcfunction"];
+        assert!(init.contains("myns.v"), "{init}");
+        assert!(!init.contains("myns.t"), "{init}");
+    }
+
+    #[test]
+    fn an_objective_named_last_on_a_line_still_counts() {
+        // A `raw!` is why the objectives are looked for in the text: this one names
+        // `myns.v` as the last word of a line that is not the last line.
+        let pack = compile(
+            r#"#[load] fn main() { raw!("scoreboard players get $x myns.v"); raw!("say hi"); }"#,
+            &release(),
+        );
+        let init = &pack.files["data/myns/function/__init.mcfunction"];
+        assert!(init.contains("myns.v"), "{init}");
+    }
+
+    #[test]
     fn the_whole_pack() {
         let pack = compile(
-            r#"fn main() { raw!("say hi"); raw!("say bye"); } fn other() { raw!("say x"); }"#,
+            r#"#[load] fn main() { raw!("say hi"); raw!("say bye"); } #[tick] fn other() { raw!("say x"); }"#,
             &release(),
         );
         insta::assert_debug_snapshot!(pack.files);
@@ -600,7 +691,7 @@ mod tests {
 
     #[test]
     fn a_release_build_does_not() {
-        let src = "fn main() {\n    raw!(\"say hi\");\n}";
+        let src = "#[load] fn main() {\n    raw!(\"say hi\");\n}";
         let pack = compile(
             src,
             &Options {
@@ -632,7 +723,7 @@ mod tests {
 
     #[test]
     fn writing_creates_the_directories() {
-        let pack = compile(r#"fn main() { raw!("say hi"); }"#, &release());
+        let pack = compile(r#"#[load] fn main() { raw!("say hi"); }"#, &release());
         let dir = tempfile::tempdir().expect("temp dir");
         pack.write_to(dir.path()).expect("write");
         assert_eq!(
@@ -646,7 +737,10 @@ mod tests {
     fn the_objectives_are_created_by_a_generated_load_function() {
         // Nothing works if these do not exist, and vanilla rejects the command rather
         // than failing quietly, so creating them cannot be left to the author.
-        let pack = compile("fn main() {}", &release());
+        let pack = compile(
+            "#[load] fn main() { let a = 1; let b = a + a; }",
+            &release(),
+        );
         let init = &pack.files["data/myns/function/__init.mcfunction"];
         assert!(
             init.contains("scoreboard objectives add myns.v dummy"),
@@ -681,7 +775,8 @@ mod tests {
 
     #[test]
     fn a_debug_build_checks_that_the_executor_is_really_there() {
-        let src = "#[ctx(entity)] fn hurt() {} fn main() { as @e[type=zombie] { hurt(); } }";
+        let src =
+            "#[ctx(entity)] fn hurt() {} #[tick] fn main() { as @e[type=zombie] { hurt(); } }";
         let debug = compile(src, &Options::default()).files;
         assert!(
             debug["data/myns/function/hurt.mcfunction"].contains("unless entity @s"),

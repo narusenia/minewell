@@ -2194,7 +2194,7 @@ mod checks {
         // Not "no tellraw in the output": no commands at all. The condition is not
         // evaluated either.
         let mc = run_in(
-            r#"fn main() { let hp = 0; debug_assert!(hp > 0, "hp went negative"); }"#,
+            r#"#[load] fn main() { let hp = 0; debug_assert!(hp > 0, "hp went negative"); }"#,
             Profile::Release,
         );
         assert!(mc.effects.is_empty(), "{:?}", mc.effects);
@@ -2222,8 +2222,8 @@ mod checks {
     fn a_release_expect_just_reads() {
         let mc = run_in(
             r#"struct Mob { hp: Option<i32> }
-               fn main() { let m = Mob { hp: Some(7) };
-                           let x = m.hp.expect("always there"); }"#,
+               #[load] fn main() { let m = Mob { hp: Some(7) };
+                                   let x = m.hp.expect("always there"); }"#,
             Profile::Release,
         );
         assert!(mc.effects.is_empty(), "{:?}", mc.effects);
@@ -2301,7 +2301,7 @@ mod folding {
     use tinymcf::Interpreter;
 
     /// Every arm of the folder, all of it constant.
-    const CONSTANTS: &str = r"fn main() {
+    const CONSTANTS: &str = r"#[load] fn main() {
         let add = 2 + 3 * 4;
         let sub = 10 - 3;
         let div = (0 - 7) / 2;
@@ -2353,14 +2353,14 @@ mod folding {
 
     #[test]
     fn a_folded_binding_is_one_command() {
-        let mc = run_in("fn main() { let a = 2 + 3 * 4; }", Profile::Release);
+        let mc = run_in("#[load] fn main() { let a = 2 + 3 * 4; }", Profile::Release);
         assert_eq!(mc.commands_run, 1);
     }
 
     #[test]
     fn a_debug_build_is_not_folded() {
         // Requirements section 15: debug keeps source and output one to one.
-        let mc = run_in("fn main() { let a = 2 + 3 * 4; }", Profile::Debug);
+        let mc = run_in("#[load] fn main() { let a = 2 + 3 * 4; }", Profile::Debug);
         assert!(mc.commands_run > 1, "{}", mc.commands_run);
     }
 
@@ -2368,7 +2368,7 @@ mod folding {
     fn dividing_by_a_constant_zero_still_fails_at_runtime() {
         // Vanilla leaves the target alone and says so; deciding the answer while
         // compiling would lose that.
-        let mut mc = load_with("fn main() { let a = 1 / 0; }", Profile::Release);
+        let mut mc = load_with("#[load] fn main() { let a = 1 / 0; }", Profile::Release);
         mc.call(&format!("{NS}:main"));
         assert!(!mc.diagnostics.is_empty(), "expected a division diagnostic");
     }

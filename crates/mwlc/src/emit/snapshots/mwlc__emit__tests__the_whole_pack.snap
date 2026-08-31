@@ -3,8 +3,9 @@ source: crates/mwlc/src/emit/mod.rs
 expression: pack.files
 ---
 {
-    "data/minecraft/tags/function/load.json": "{\n  \"values\": [\n    \"myns:__init\"\n  ]\n}\n",
-    "data/myns/function/__init.mcfunction": "scoreboard objectives add myns.v dummy\nscoreboard objectives add myns.t dummy\n",
+    "data/minecraft/tags/function/load.json": "{\n  \"values\": [\n    \"myns:__init\",\n    \"myns:main\"\n  ]\n}\n",
+    "data/minecraft/tags/function/tick.json": "{\n  \"values\": [\n    \"myns:other\"\n  ]\n}\n",
+    "data/myns/function/__init.mcfunction": "",
     "data/myns/function/main.mcfunction": "say hi\nsay bye\n",
     "data/myns/function/other.mcfunction": "say x\n",
     "pack.mcmeta": "{\n  \"pack\": {\n    \"pack_format\": 48,\n    \"description\": \"a test pack\"\n  }\n}\n",

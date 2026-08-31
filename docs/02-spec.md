@@ -2014,3 +2014,35 @@ scoreboard players set $main.b myns.v 150
   決めてしまうとその挙動が消える。判定できるのは除数が定数のときだけなので、
   そこだけ畳み込みを見送る
 - 単項の `-` と `!`、比較も同じ規則で畳む
+
+---
+
+### 6.34 デッドコード除去 — 確定（M9）
+
+```rust
+#[tick] fn tick() { hurt(); }
+fn hurt() { raw!("say ouch"); }
+fn unused() { raw!("say nothing"); }
+```
+
+```
+# release — unused.mcfunction は出力されない
+data/myns/function/tick.mcfunction
+data/myns/function/hurt.mcfunction
+data/myns/function/__init.mcfunction
+```
+
+- **根は function タグの関数だけ。** バニラがパックに入る道は function タグしかないので、
+  `#[tick]` / `#[load]` から辿れない関数は誰も呼べない
+- **`raw!` の中で名前が出てくる関数も根**。`raw!` はこのコンパイラが読まないテキストで、
+  そこに `function myns:foo` と書けるため。**多く残すのはファイル 1 つの無駄、
+  消し過ぎは実行時の沈黙**なので、迷ったら残す
+- **objective も、何かが名前を書いているものだけ作る。** 判定は MIR ではなく
+  **生成済みのコマンド文字列**に対して行う。`raw!` が objective を直に書く場合があり、
+  それを使用と数えられるのはテキストを読む側だけだから
+- **debug では何も落とさない**（要件定義 §15）
+
+**この結果、release では `#[tick]` / `#[load]` の付かない関数が出力から消える。**
+`/function myns:foo` を手で打って呼ぶ、あるいは他のパックから呼ぶつもりの関数を
+「外から入る口」だと宣言する手段は v1 にまだ無い（§3.12 の `pub` / `extern fn` は未定）。
+それが入るまで、そういう関数はタグを付けるか debug で出す。

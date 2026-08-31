@@ -13,6 +13,8 @@
 //!
 //! Today every function is one block. Control flow arrives in M3.
 
+use std::collections::HashMap;
+
 use crate::hir::{self, FnId, Hir, LocalId, NbtTag, Root, Step, TAG_KEY, Type, Types};
 use crate::syntax::ast::{BinaryOp, UnaryOp};
 use crate::syntax::lexer::Span;
@@ -39,6 +41,9 @@ pub enum RegKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mir {
     pub functions: Vec<Function>,
+    /// The pack's namespace. Kept here rather than read back off a function path,
+    /// because dead code elimination can leave no functions to read it from.
+    pub namespace: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -570,7 +575,80 @@ pub fn lower(hir: &Hir, debug: bool) -> Mir {
         });
         functions.extend(generated);
     }
-    Mir { functions }
+    let namespace = hir
+        .functions
+        .first()
+        .and_then(|f| f.path.split_once(':'))
+        .map_or_else(|| "minecraft".to_owned(), |(ns, _)| ns.to_owned());
+    let mut mir = Mir {
+        functions,
+        namespace,
+    };
+    if !debug {
+        prune(&mut mir);
+    }
+    mir
+}
+
+/// Drops the functions nothing can reach (requirements section 15).
+///
+/// A function tag is the only way vanilla enters a pack, so the tagged functions are
+/// the roots. `raw!` is text this compiler does not read, so a function whose id
+/// appears in one counts as reached as well: keeping a function too many wastes a
+/// file, dropping one that is called fails silently in game.
+fn prune(mir: &mut Mir) {
+    let mut keep = vec![false; mir.functions.len()];
+    {
+        let paths: Vec<&str> = mir.functions.iter().map(|f| f.path.as_str()).collect();
+        let index: HashMap<&str, usize> = paths.iter().copied().zip(0..).collect();
+        let mut queue = Vec::new();
+        for (i, f) in mir.functions.iter().enumerate() {
+            if f.attrs
+                .iter()
+                .any(|attr| matches!(attr, hir::Attr::Tick | hir::Attr::Load))
+            {
+                keep[i] = true;
+                queue.push(i);
+            }
+        }
+        let mut reached = Vec::new();
+        while let Some(i) = queue.pop() {
+            reached.clear();
+            for block in &mir.functions[i].blocks {
+                for inst in &block.insts {
+                    reaches(inst, &paths, &mut reached);
+                }
+            }
+            for path in &reached {
+                let Some(&j) = index.get(*path) else { continue };
+                if !keep[j] {
+                    keep[j] = true;
+                    queue.push(j);
+                }
+            }
+        }
+    }
+    let mut alive = keep.into_iter();
+    mir.functions.retain(|_| alive.next().unwrap_or(true));
+}
+
+/// The functions one instruction can hand control to.
+fn reaches<'a>(inst: &'a Inst, paths: &[&'a str], out: &mut Vec<&'a str>) {
+    match inst {
+        Inst::Call { path } | Inst::CallWithArgs { path } => out.push(path.as_str()),
+        // Not parsed, so anything that looks like a function id in it is one.
+        Inst::Raw { text, .. } => out.extend(paths.iter().filter(|path| text.contains(**path))),
+        Inst::StoreResult { inst, .. }
+        | Inst::ReturnRun { inst }
+        | Inst::Macro { inst }
+        | Inst::StoreData { inst, .. }
+        | Inst::StoreScaled { inst, .. }
+        | Inst::StoreBoth { inst, .. }
+        | Inst::Guarded { inst, .. }
+        | Inst::Otherwise { inst, .. }
+        | Inst::Context { inst, .. } => reaches(inst, paths, out),
+        _ => {}
+    }
 }
 
 /// Temporary names, counted across the whole program.
