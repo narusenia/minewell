@@ -7,12 +7,10 @@ M0〜M9 と横断（X-1〜X-6）がすべて閉じた。**v1 の計画に残っ�
 どちらも下の積み残し表に理由つきで並べてある。**次にやることは自分で決める段階。**
 手をつけるならこのあたり:
 
-1. **`mwl toolchain install`** — X-2 の CI ができたので、リリースを 1 本切れば
-   実装して突き合わせられる。§17 で唯一まだ無いサブコマンド
-2. **座標とブロックのモデル** — `positioned` / `if block` / ブロック NBT / raycast が
+1. **座標とブロックのモデル** — `positioned` / `if block` / ブロック NBT / raycast が
    まとめてここで開く。tinymcf 側（SPEC §4）と言語側の両方が要る
-3. **`text!` のイベント** — toolchain がクリック/ホバーの JSON 形を持てるようになってから
-4. **LSP** — 要件定義 §19 のとおり v1 後。診断は既に span 付きで出ているので薄い
+2. **`text!` のイベント** — toolchain がクリック/ホバーの JSON 形を持てるようになってから
+3. **LSP** — 要件定義 §19 のとおり v1 後。診断は既に span 付きで出ているので薄い
 
 ---
 
@@ -66,7 +64,7 @@ toolchain 由来のコマンド呼び出し / `#[tick]`・`#[load]` タグ / `da
 `struct`・フィールド読み書き・`#[nbt(...)]`・`enum`・`match` /
 `Vec<T>`・`for x in vec`・ジェネリクス（単相化）・`impl` の固有メソッド・`&`/`&mut` /
 `raw!` の補間・`text!`・`#[test]` と `mwl test` / `target/cost.txt` /
-CLI（`new`・`check`・`build`・`test`・`install`・`toolchain list|add`）/
+CLI（`new`・`check`・`build`・`test`・`install`・`toolchain list|add|install`）/
 エディタのハイライト（tree-sitter と TextMate）。
 
 M9-5〜M9-7 で足したもの（**release のみ**。debug は要件定義 §15 のとおり無最適化）:
@@ -104,7 +102,7 @@ M8 で足したもの:
 
 動かないもの: ブロックの NBT と座標（`positioned` / `if block` / raycast）・
 `enum` のジェネリクス・`text!` のイベント（`.on_click` / `.on_hover` / `translate!`）・
-コマンド引数への実行時値（`raw!` の補間が逃げ道）・`mwl toolchain install`・LSP。
+コマンド引数への実行時値（`raw!` の補間が逃げ道）・LSP。
 
 **意図して入れていないもの**（診断が理由を言う）:
 `struct`/`enum` を関数の戻り値にすること（バニラの戻り値は整数 1 つ）、
@@ -269,7 +267,6 @@ compound どうしの `==`、タプル型バリアント（`V(i32)`）、
 | **`text!` に場所を書く**（`m.hp`） | 場所のパスを組み立てるのは MIR の仕事で、`text!` は HIR に閉じている。いまは `let` で受ければ書ける | `place_path` を共有する形が要るとき |
 | **コマンド引数への実行時値** | `raw!` の補間で書けるようになった。コマンド呼び出しの引数に直接書くには、シグネチャごとにどの引数を昇格できるか決める必要がある。エスケープハッチがあるうちは急がない | 必要になった時 |
 | **`positioned`/`in`/`if block`/`if predicate`**（tinymcf） | 座標・次元・ブロック・predicate のモデルが要り、まだ誰も使わない | 必要になった時 |
-| **`mwl toolchain install`** | X-2 の CI はできたが Release がまだ 1 本も無く、HTTP クライアントを足しても突き合わせる相手がいない | 最初のリリースを切ってから |
 | **predicate / loot table の ID 検査** | 実物の `commands.json` は X-2 で入手できるようになった。あとは parser 名ごとの写像を決めるだけ | 必要になった時 |
 | **`async`/`trait`/`Result`/ユーザ定義マクロ/借用検査/LSP** | v1 スコープ外。予約語だけ確保済み | v1 後 |
 

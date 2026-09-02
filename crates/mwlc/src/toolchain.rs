@@ -90,6 +90,18 @@ pub enum Error {
         source: serde_json::Error,
     },
 
+    #[error("could not fetch {url}")]
+    #[diagnostic(help(
+        "if the version is not published yet, build it yourself:\n  \
+         scripts/build-toolchain.sh <version>\n  \
+         mwl toolchain add <version> <commands.json> --pack-format <n>"
+    ))]
+    Download { url: String },
+
+    #[error("'{tool}' is not on the PATH")]
+    #[diagnostic(help("installing a published toolchain needs curl and tar"))]
+    MissingTool { tool: &'static str },
+
     #[error("{path} is not valid TOML")]
     Toml {
         path: PathBuf,
@@ -97,6 +109,9 @@ pub enum Error {
         source: toml::de::Error,
     },
 }
+
+/// Where the published toolchains live (plan X-2).
+pub const RELEASES: &str = "https://github.com/narusenia/minewell/releases/download";
 
 const METADATA: &str = "toolchain.json";
 const COMMANDS: &str = "commands.json";
@@ -157,6 +172,58 @@ impl Toolchains {
         })
     }
 
+    /// Downloads a published toolchain and installs it.
+    ///
+    /// `curl` and `tar` do the work rather than a HTTP client and a gzip crate. The
+    /// archive is what `scripts/build-toolchain.sh` and the workflow beside it
+    /// produced with `tar -czf`, so unpacking it is the same operation backwards, and
+    /// a compiler is a strange place to grow a TLS stack. Both tools ship with macOS,
+    /// Linux and Windows 10 and later; where they do not, `add` is the way in.
+    ///
+    /// `base` is the release directory to fetch from, so a test can point at a
+    /// `file://` copy instead of the network.
+    pub fn install(&self, version: &str, base: &str) -> Result<PathBuf, Error> {
+        for tool in ["curl", "tar"] {
+            if which(tool).is_none() {
+                return Err(Error::MissingTool { tool });
+            }
+        }
+        let url = format!("{base}/toolchain-{version}/mwl-toolchain-{version}.tar.gz");
+        std::fs::create_dir_all(&self.root).map_err(|source| Error::Io {
+            path: self.root.clone(),
+            source,
+        })?;
+        let archive = self.root.join(format!(".{version}.tar.gz"));
+
+        let fetched = std::process::Command::new("curl")
+            .args(["-fsSL", "-o"])
+            .arg(&archive)
+            .arg(&url)
+            // Its complaint would be the second one printed, and the worse of the two.
+            .stderr(std::process::Stdio::null())
+            .status();
+        if !matches!(fetched, Ok(status) if status.success()) {
+            let _ = std::fs::remove_file(&archive);
+            return Err(Error::Download { url });
+        }
+
+        let unpacked = std::process::Command::new("tar")
+            .arg("-xzf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&self.root)
+            .status();
+        let _ = std::fs::remove_file(&archive);
+        if !matches!(unpacked, Ok(status) if status.success()) {
+            return Err(Error::Download { url });
+        }
+
+        // The archive said what it is; this proves it. A toolchain that does not load
+        // is worse than one that is not there, because it fails later and elsewhere.
+        self.load(version)?;
+        Ok(self.root.join(version))
+    }
+
     /// Installs a toolchain from a `commands.json` the caller already has.
     ///
     /// Producing that file needs Minecraft's data generator and a JVM:
@@ -199,6 +266,14 @@ impl Toolchains {
     }
 }
 
+/// Whether a program is on the `PATH`, without running it.
+fn which(tool: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(tool))
+        .find(|candidate| candidate.is_file())
+}
+
 fn read(path: &Path) -> Result<String, Error> {
     std::fs::read_to_string(path).map_err(|source| Error::Io {
         path: path.to_owned(),
@@ -239,6 +314,51 @@ mod tests {
 
     fn commands() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/commands.json")
+    }
+
+    #[test]
+    fn installing_unpacks_an_archive_and_checks_it() {
+        // Served from disk rather than the network: the fetch is the same, and a test
+        // that needs GitHub to be up is a test that fails for the wrong reason.
+        let (_dir, tc) = empty();
+        let published = tempfile::tempdir().expect("temp dir");
+        let staged = published.path().join("1.21.4");
+        std::fs::create_dir_all(&staged).expect("stage");
+        std::fs::copy(commands(), staged.join(COMMANDS)).expect("commands");
+        std::fs::write(
+            staged.join(METADATA),
+            r#"{"pack_format":61,"minecraft_version":"1.21.4"}"#,
+        )
+        .expect("metadata");
+        let release = published.path().join("toolchain-1.21.4");
+        std::fs::create_dir_all(&release).expect("release");
+        assert!(
+            std::process::Command::new("tar")
+                .arg("-czf")
+                .arg(release.join("mwl-toolchain-1.21.4.tar.gz"))
+                .arg("-C")
+                .arg(published.path())
+                .arg("1.21.4")
+                .status()
+                .expect("tar runs")
+                .success()
+        );
+
+        let base = format!("file://{}", published.path().display());
+        tc.install("1.21.4", &base).expect("installs");
+        assert_eq!(tc.installed(), vec!["1.21.4"]);
+        assert_eq!(tc.load("1.21.4").expect("loads").metadata.pack_format, 61);
+    }
+
+    #[test]
+    fn a_version_that_is_not_published_says_how_to_build_it() {
+        let (_dir, tc) = empty();
+        let published = tempfile::tempdir().expect("temp dir");
+        let base = format!("file://{}", published.path().display());
+        let err = tc.install("1.99.9", &base).expect_err("nothing to fetch");
+        assert!(matches!(err, Error::Download { .. }), "{err:?}");
+        // Nothing half-installed is left behind.
+        assert!(tc.installed().is_empty());
     }
 
     #[test]

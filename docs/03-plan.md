@@ -803,8 +803,14 @@ JDK は M6（`toolchain build-from-jar`）で必要になった時点で `[tools
     `commands.json` は 400KB。**`examples/arena` が実物のコマンド表でそのまま通り**、
     出力は手書き toolchain と 1 バイトも変わらなかった（`playsound <sound> master <targets>`
     の語順も含めて）。M6 の設計が実データで裏付けられたのはこれが初めて
-  - **`mwl toolchain install` はまだ。** リリースが 1 本も無いので、HTTP クライアントを
-    足しても突き合わせる相手がいない。最初のリリースを切ってから
+  - **最初のリリース（`toolchain-1.21.4`）を切って `mwl toolchain install` を実装した。**
+    取得は `curl` と `tar` に任せる — 書庫はこのスクリプトが `tar -czf` で作ったものなので、
+    展開は同じ操作の逆で、**コンパイラに TLS スタックを生やす場所ではない**。
+    どちらも macOS / Linux / Windows 10 以降に付いてくる。無い環境には `add` がある
+  - 入れた直後に `load` して**中身を確かめる**。読めない toolchain は、無いものより悪い
+    （後で、別の場所で失敗する）
+  - テストは `file://` から取る。**GitHub が落ちていると落ちるテストは、
+    間違った理由で落ちるテスト**
 - [x] **X-3a** `tinymcf` の対象サブセット仕様 `crates/tinymcf/SPEC.md`
   - モデル化する mcfunction の範囲、バニラとの意図的な差異、失敗モデル、決定性の保証
   - **`docs/` ではなく crate 同梱。** `tinymcf` は独立公開するので契約もコードと一緒に動く

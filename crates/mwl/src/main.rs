@@ -36,6 +36,9 @@ usage:
     mwl toolchain list
         show the installed Minecraft versions
 
+    mwl toolchain install <version>
+        download a published toolchain and install it
+
     mwl toolchain add <version> <commands.json> --pack-format <n>
         install a version's command set
 
@@ -61,6 +64,7 @@ fn main() -> ExitCode {
         },
         ["install", world, rest @ ..] => report(install(world, profile_of(rest))),
         ["build", rest @ ..] => report(build(profile_of(rest))),
+        ["toolchain", "install", version] => report(install_toolchain(version)),
         ["toolchain", "list"] => {
             let installed = Toolchains::default().installed();
             if installed.is_empty() {
@@ -261,6 +265,11 @@ fn function_id(path: &str) -> Option<String> {
         .strip_prefix("function/")?
         .strip_suffix(".mcfunction")?;
     Some(format!("{namespace}:{name}"))
+}
+
+fn install_toolchain(version: &str) -> miette::Result<String> {
+    let dir = Toolchains::default().install(version, mwlc::toolchain::RELEASES)?;
+    Ok(format!("installed {version} into {}", dir.display()))
 }
 
 fn add_toolchain(version: &str, path: &str, format: &str) -> miette::Result<String> {
