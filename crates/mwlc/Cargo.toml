@@ -2,7 +2,7 @@
 
 [package]
 name = "mwlc"
-version = "0.0.0"
+version.workspace = true
 description = "The minewell compiler: .mwl to Minecraft datapack"
 edition.workspace = true
 license.workspace = true

@@ -90,9 +90,41 @@ assert_eq!(mc.world.scoreboard.get("obj", "$result"), Ok(Some(120)));
 
 It models scoreboards, storage, NBT paths, `execute`, `function`/`return` and macro
 functions — and counts commands, because that number is a requirement. It does not
-model a world: entities and blocks are recorded, not simulated.
+model much of a world: entities are declared by the harness rather than simulated,
+though blocks are real enough for `if block` to answer.
 [`SPEC.md`](crates/tinymcf/SPEC.md) states exactly what it promises and where it
 knowingly departs from vanilla.
+
+## Installing
+
+Binaries for macOS and Linux are attached to each
+[release](https://github.com/narusenia/minewell/releases):
+
+```sh
+tar -xzf mwl-0.1.0-aarch64-apple-darwin.tar.gz
+install -m755 mwl /usr/local/bin
+```
+
+Or from source, with a Rust toolchain:
+
+```sh
+cargo install --git https://github.com/narusenia/minewell mwl
+```
+
+Then take the command table for the Minecraft version you target. It is data rather
+than something the compiler embeds, so it is installed separately:
+
+```sh
+mwl toolchain install 1.21.4
+mwl toolchain list
+```
+
+```sh
+mwl new my-pack
+cd my-pack
+mwl build --release
+mwl install ~/Library/Application\ Support/minecraft/saves/My\ World
+```
 
 ## Building
 

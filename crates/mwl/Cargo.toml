@@ -2,7 +2,7 @@
 
 [package]
 name = "mwl"
-version = "0.0.0"
+version.workspace = true
 description = "The minewell command-line interface"
 edition.workspace = true
 license.workspace = true

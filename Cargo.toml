@@ -5,6 +5,7 @@ resolver = "3"
 members = ["crates/mwl", "crates/mwlc", "crates/tinymcf"]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/narusenia/minewell"
