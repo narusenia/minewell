@@ -72,7 +72,7 @@ fn spot(text: &str, offset: usize) -> serde_json::Value {
 /// Opens the arena example, which has a `minewell.toml` naming a real toolchain, and
 /// asks about a position in it. The toolchain lives in `examples/`, passed to the
 /// child rather than set in this process.
-fn asked(offset_of: &str, nudge: usize) -> (String, String) {
+fn asked(offset_of: &str, nudge: usize) -> Asked {
     let examples = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
     let file = format!("{examples}/arena/src/lib.mwl");
     let text = std::fs::read_to_string(&file).expect("the example is there");
@@ -121,13 +121,18 @@ fn asked(offset_of: &str, nudge: usize) -> (String, String) {
     let completed = read(&mut out);
     let hovered = read(&mut out);
     server.wait().expect("the server exits");
-    (completed, hovered)
+    Asked { completed, hovered }
+}
+
+struct Asked {
+    completed: String,
+    hovered: String,
 }
 
 #[test]
 fn a_command_is_completed_from_the_toolchain() {
     // Halfway through the word: an editor asks with the cursor inside it.
-    let (completed, _) = asked("play_sound(minecraft:block", 4);
+    let completed = asked("play_sound(minecraft:block", 4).completed;
     assert!(completed.contains(r#""label":"play_sound""#), "{completed}");
     // Not everything the table has — the prefix narrows it.
     assert!(!completed.contains(r#""label":"setblock""#), "{completed}");
@@ -135,7 +140,7 @@ fn a_command_is_completed_from_the_toolchain() {
 
 #[test]
 fn hovering_a_command_spells_it_the_way_vanilla_wants() {
-    let (_, hovered) = asked("play_sound(minecraft:block", 4);
+    let hovered = asked("play_sound(minecraft:block", 4).hovered;
     assert!(
         hovered.contains("playsound <sound> master <targets>"),
         "{hovered}"
@@ -145,9 +150,36 @@ fn hovering_a_command_spells_it_the_way_vanilla_wants() {
 }
 
 #[test]
-fn hovering_something_that_is_not_a_command_says_nothing() {
-    let (_, hovered) = asked("fn tick()", 3);
+fn hovering_something_that_is_not_a_name_or_a_command_says_nothing() {
+    // The `fn` keyword: not a binding, not a command.
+    let hovered = asked("fn tick()", 1).hovered;
     assert!(hovered.contains(r#""result":null"#), "{hovered}");
+}
+
+#[test]
+fn a_name_in_scope_is_completed_and_a_name_out_of_it_is_not() {
+    // Inside `setup`, where `arena` is bound and `size` follows it.
+    let completed = asked("arena.radius", 3).completed;
+    assert!(completed.contains(r#""label":"arena""#), "{completed}");
+    // The function is in scope everywhere, and its name shares the prefix.
+    assert!(completed.contains(r#""label":"area""#), "{completed}");
+    // `seen` is a binding in `tick`, a different function.
+    assert!(!completed.contains(r#""label":"seen""#), "{completed}");
+}
+
+#[test]
+fn hovering_a_binding_gives_its_type() {
+    let hovered = asked("arena.radius", 3).hovered;
+    assert!(hovered.contains("arena: Arena"), "{hovered}");
+}
+
+#[test]
+fn hovering_a_function_gives_its_signature() {
+    let hovered = asked("area(fix::<1000>(arena", 2).hovered;
+    assert!(
+        hovered.contains("fn area(r: fix<1000>) -> fix<1000>"),
+        "{hovered}"
+    );
 }
 
 #[test]

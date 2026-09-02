@@ -2,11 +2,13 @@
 
 //! A language server, as small as one can be and still be worth running.
 //!
-//! Diagnostics, plus completion and hover for the commands. `mwlc` already answers
+//! Diagnostics, plus completion and hover. `mwlc` already answers
 //! with problems and spans, so the diagnostics half is a loop: read a document, compile
 //! it, write the problems back. The other half is the toolchain's command table
 //! reformatted — which is the part nobody can hold in their head, and it costs the
-//! compiler nothing. Names, types and definition jumps come after.
+//! compiler nothing. The names come from `driver::symbols`, which lowers the file and
+//! answers with what it declared — best effort, because a file being typed into does
+//! not compile. Definition jumps come after.
 //!
 //! The wire format is `Content-Length` framing around JSON-RPC, which is little enough
 //! to write out. A compiler is a strange place to grow an async runtime, and the same
@@ -18,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use mwlc::driver;
 use mwlc::emit::{Options, Profile, Source};
+use mwlc::hir::{Symbol, SymbolKind};
 use mwlc::schema::{Part, Schema, Signature};
 use mwlc::toolchain::Toolchains;
 use serde_json::{Value, json};
@@ -173,51 +176,75 @@ impl Server {
         Some((path_of(uri), text, at))
     }
 
-    /// The commands whose name starts with what has been typed.
+    /// The names in scope and the commands, narrowed to what has been typed.
     ///
     /// A client filters again on its own, but narrowing here is what makes the answer
-    /// worth reading: the table holds a few hundred commands.
+    /// worth reading: the command table alone holds a few hundred entries.
     fn complete(&mut self, params: &Value) -> Value {
         let Some((path, text, at)) = self.spot(params) else {
             return json!([]);
         };
         let (start, _) = word(&text, at);
-        let (_, Some(schema)) = self.project(path.as_deref()) else {
-            return json!([]);
-        };
-        let prefix = &text[start..at];
-        let items: Vec<Value> = schema
-            .commands
-            .values()
-            .filter(|signature| signature.name.starts_with(prefix))
-            .map(|signature| {
+        let prefix = text[start..at].to_owned();
+        let (namespace, schema) = self.project(path.as_deref());
+
+        let mut items: Vec<Value> = visible(&text, &namespace, schema.as_ref(), at)
+            .filter(|symbol| symbol.name.starts_with(&prefix))
+            .map(|symbol| {
                 json!({
-                    "label": signature.name,
-                    // A function, as far as an editor is concerned.
-                    "kind": 3,
-                    "detail": spelling(signature),
+                    "label": symbol.name,
+                    // A function or a variable, as an editor counts them.
+                    "kind": if symbol.kind == SymbolKind::Function { 3 } else { 6 },
+                    "detail": symbol.ty,
                 })
             })
             .collect();
+        if let Some(schema) = &schema {
+            items.extend(
+                schema
+                    .commands
+                    .values()
+                    .filter(|signature| signature.name.starts_with(&prefix))
+                    .map(|signature| {
+                        json!({
+                            "label": signature.name,
+                            "kind": 3,
+                            "detail": spelling(signature),
+                        })
+                    }),
+            );
+        }
         json!(items)
     }
 
-    /// What the command under the cursor is, in both spellings.
+    /// What the word under the cursor is: a name the file declares, or a command.
+    ///
+    /// Names first. A binding that shares a command's name shadows it here as it does
+    /// everywhere else.
     fn hover(&mut self, params: &Value) -> Value {
         let Some((path, text, at)) = self.spot(params) else {
             return Value::Null;
         };
         let (start, end) = word(&text, at);
-        let (_, Some(schema)) = self.project(path.as_deref()) else {
+        if start == end {
             return Value::Null;
+        }
+        let (namespace, schema) = self.project(path.as_deref());
+        let word = &text[start..end];
+        let range = json!({ "start": position(&text, start), "end": position(&text, end) });
+
+        let named = visible(&text, &namespace, schema.as_ref(), at)
+            .find(|symbol| symbol.name == word)
+            .map(|symbol| match symbol.kind {
+                SymbolKind::Function => symbol.ty.clone(),
+                _ => format!("{}: {}", symbol.name, symbol.ty),
+            });
+        let value = match (named, schema.as_ref().and_then(|schema| schema.get(word))) {
+            (Some(named), _) => format!("```mwl\n{named}\n```"),
+            (None, Some(signature)) => describe(signature),
+            (None, None) => return Value::Null,
         };
-        let Some(signature) = schema.get(&text[start..end]) else {
-            return Value::Null;
-        };
-        json!({
-            "contents": { "kind": "markdown", "value": describe(signature) },
-            "range": { "start": position(&text, start), "end": position(&text, end) },
-        })
+        json!({ "contents": { "kind": "markdown", "value": value }, "range": range })
     }
 
     /// The namespace and command table the file belongs to, from the nearest
@@ -284,6 +311,25 @@ fn position(text: &str, offset: usize) -> Value {
     let line = before.matches('\n').count();
     let column = before.rsplit_once('\n').map_or(before, |(_, rest)| rest);
     json!({ "line": line, "character": column.encode_utf16().count() })
+}
+
+/// The names that can be used at an offset, innermost first.
+///
+/// Declared before the cursor and still in scope at it. The scope of a binding is the
+/// block it was declared in, which is what makes a binding from another function — or
+/// from a block that has already closed — stay out of the list.
+fn visible<'a>(
+    text: &'a str,
+    namespace: &str,
+    schema: Option<&Schema>,
+    at: usize,
+) -> impl Iterator<Item = Symbol> + 'a {
+    let mut found = driver::symbols(text, namespace, schema);
+    // Innermost first: a shadowing `let` is the one that answers for the name.
+    found.sort_by_key(|symbol| std::cmp::Reverse(symbol.scope.start));
+    found.into_iter().filter(move |symbol| {
+        symbol.scope.start <= at && at <= symbol.scope.end && symbol.span.start <= at
+    })
 }
 
 /// How the command is called from minewell, and how vanilla wants it written.
