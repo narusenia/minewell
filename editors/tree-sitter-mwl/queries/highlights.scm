@@ -18,7 +18,7 @@
 ; ---- keywords ----
 
 [
-  "fn" "let" "mut" "const" "struct" "enum" "impl" "in"
+  "fn" "let" "mut" "const" "struct" "enum" "impl" "in" "pub"
 ] @keyword
 
 [ "if" "else" "match" "=>" ] @keyword.conditional

@@ -72,6 +72,7 @@ module.exports = grammar({
     function_item: ($) =>
       seq(
         repeat($.attribute),
+        optional('pub'),
         'fn',
         field('name', $.identifier),
         optional($.generic_parameters),

@@ -60,6 +60,13 @@ impl Parser {
     fn item(&mut self) -> Option<Item> {
         let start = self.span().start;
         let attrs = self.attributes();
+        // Only functions can be `pub` for now: it means "reachable from outside the
+        // pack", and nothing but a function is (spec section 3.26).
+        let public = self.eat_keyword(Keyword::Pub);
+        if public && self.peek() != Some(&TokenKind::Keyword(Keyword::Fn)) {
+            self.error("'pub' can only go on a function");
+            return None;
+        }
         match self.peek() {
             Some(TokenKind::Keyword(Keyword::Fn)) => {}
             Some(TokenKind::Keyword(Keyword::Struct)) => return self.struct_item(attrs, start),
@@ -107,6 +114,7 @@ impl Parser {
         Some(Item {
             attrs,
             kind: ItemKind::Fn(FnItem {
+                public,
                 name,
                 generics,
                 receiver,

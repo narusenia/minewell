@@ -71,6 +71,9 @@ pub struct FieldDef {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FnItem {
+    /// `pub fn`: something outside the pack may call it, so a release build has to
+    /// keep it (spec section 3.26).
+    pub public: bool,
     pub name: Ident,
     pub generics: Vec<GenericParam>,
     /// The receiver, for a method: `&self`, `&mut self` or `self`.

@@ -726,6 +726,9 @@ pub struct Function {
     /// Where this lands in the datapack: `<namespace>:<path>`.
     pub path: String,
     pub attrs: Vec<Attr>,
+    /// `pub fn`: something outside the pack may call it, so dead code elimination
+    /// keeps it (spec section 3.26).
+    pub public: bool,
     /// Parameters are locals the caller writes before calling, so they are the first
     /// entries in `locals`.
     pub params: Vec<LocalId>,
@@ -1652,6 +1655,7 @@ fn lower_function(
             ));
         }
         Function {
+            public: f.public,
             id,
             path: format!("{namespace}:{name}"),
             name,
@@ -5577,6 +5581,13 @@ mod tests {
         let errors = lower_err("#[test] #[ctx(entity)] fn t() {}");
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("#[test]"), "{errors:?}");
+    }
+
+    #[test]
+    fn pub_goes_on_functions_only() {
+        assert!(lower_err("pub fn f() {}").is_empty());
+        let (_, errors) = parse("pub struct S { a: i32 }");
+        assert!(!errors.is_empty());
     }
 
     #[test]

@@ -625,6 +625,32 @@ mod tests {
     }
 
     #[test]
+    fn a_public_function_survives_a_release_build() {
+        // Nothing in the pack calls it, but `/function` and another datapack can.
+        let pack = compile(
+            r#"#[tick] fn main() { raw!("say hi"); } pub fn api() { raw!("say x"); }"#,
+            &release(),
+        );
+        assert!(
+            pack.files.contains_key("data/myns/function/api.mcfunction"),
+            "{:?}",
+            pack.files.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn what_a_public_function_calls_survives_with_it() {
+        let pack = compile(
+            r#"#[tick] fn main() {} pub fn api() { helper(); } fn helper() { raw!("say x"); }"#,
+            &release(),
+        );
+        assert!(
+            pack.files
+                .contains_key("data/myns/function/helper.mcfunction")
+        );
+    }
+
+    #[test]
     fn a_debug_build_keeps_every_function() {
         // Requirements section 15: debug keeps source and output one to one.
         let pack = compile(

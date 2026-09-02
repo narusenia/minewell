@@ -52,6 +52,9 @@ pub struct Function {
     /// The datapack id this is written to.
     pub path: String,
     pub attrs: Vec<hir::Attr>,
+    /// Whether something outside the pack may call it (spec section 3.26). A root for
+    /// dead code elimination, like a tagged function.
+    pub public: bool,
     pub blocks: Vec<Block>,
 }
 
@@ -584,6 +587,7 @@ pub fn lower(hir: &Hir, debug: bool) -> Mir {
             id: f.id,
             path: f.path.clone(),
             attrs: f.attrs.clone(),
+            public: f.public,
             blocks: vec![Block {
                 id: BlockId(0),
                 insts,
@@ -619,9 +623,12 @@ fn prune(mir: &mut Mir) {
         let index: HashMap<&str, usize> = paths.iter().copied().zip(0..).collect();
         let mut queue = Vec::new();
         for (i, f) in mir.functions.iter().enumerate() {
-            if f.attrs
-                .iter()
-                .any(|attr| matches!(attr, hir::Attr::Tick | hir::Attr::Load))
+            // A function tag is one way in; `pub` is the author saying there is
+            // another one this compiler cannot see (spec section 3.26).
+            if f.public
+                || f.attrs
+                    .iter()
+                    .any(|attr| matches!(attr, hir::Attr::Tick | hir::Attr::Load))
             {
                 keep[i] = true;
                 queue.push(i);
@@ -3353,6 +3360,8 @@ impl<'p> Lowering<'_, 'p> {
             id: self.function.id,
             path,
             attrs: Vec::new(),
+            // A generated block is reached from its parent and nowhere else.
+            public: false,
             blocks: vec![Block {
                 id: BlockId(0),
                 insts,
