@@ -687,9 +687,38 @@ pub const TAG_KEY: &str = "tag";
 pub struct Hir {
     pub functions: Vec<Function>,
     pub types: Types,
+    /// Every name the source declares, with where it is written and what it turned out
+    /// to be. An editor's business, not the compiler's: nothing below this stage reads
+    /// it (`docs/03-plan.md` M12).
+    pub symbols: Vec<Symbol>,
     /// Ids the program names but does not define. Checked once the datapack is known
     /// (`driver`), because whether one resolves depends on files this stage cannot see.
     pub references: Vec<Reference>,
+}
+
+/// A declared name, for whoever is reading the source rather than compiling it.
+///
+/// The type comes already spelled, so a reader does not need `Types` — and the language
+/// server does not need to learn how minewell writes a type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Symbol {
+    /// The name itself, so a hint can sit at the end of it.
+    pub span: Span,
+    /// Where the name can be used: the block it was declared in, or the whole file for
+    /// a function.
+    pub scope: Span,
+    pub name: String,
+    pub ty: String,
+    pub kind: SymbolKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolKind {
+    /// A binding whose type the source never states, so stating it adds something.
+    Inferred,
+    /// A binding that states its own type: an annotated `let`, or a parameter.
+    Declared,
+    Function,
 }
 
 /// A reference to something that has to exist somewhere in the pack.
@@ -1296,6 +1325,7 @@ pub fn lower(
 ) -> (Hir, Vec<SyntaxError>) {
     let mut errors = Vec::new();
     let mut references = Vec::new();
+    let mut symbols: Vec<Symbol> = Vec::new();
     let types = collect_types(file, &mut errors);
     let mut signatures: HashMap<String, Signature> = HashMap::new();
     let mut items: Vec<(&ast::Item, &ast::FnItem, String)> = Vec::new();
@@ -1431,6 +1461,34 @@ pub fn lower(
         if id.is_some() {
             concrete += 1;
         }
+        // How the function reads, for whoever is looking at a call to it. A generic
+        // shows its type parameters as written, because that is what the source says.
+        symbols.push(Symbol {
+            span: f.name.span,
+            // A function is callable from anywhere in the file, including above where
+            // it is written.
+            scope: Span {
+                start: 0,
+                end: usize::MAX,
+            },
+            name: f.name.name.clone(),
+            ty: format!(
+                "fn {}({}){}",
+                name,
+                f.params
+                    .iter()
+                    .zip(&params)
+                    .map(|(written, param)| format!(
+                        "{}: {}",
+                        written.name.name,
+                        types.name_of(param.ty)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                ret.map_or_else(String::new, |ty| format!(" -> {}", types.name_of(ty))),
+            ),
+            kind: SymbolKind::Function,
+        });
         signatures.insert(
             name.clone(),
             Signature {
@@ -1472,6 +1530,7 @@ pub fn lower(
             toolchain,
             &mut instances,
             &mut references,
+            &mut symbols,
             &mut errors,
         );
         functions.push(lowered);
@@ -1520,6 +1579,7 @@ pub fn lower(
             toolchain,
             &mut instances,
             &mut references,
+            &mut symbols,
             &mut errors,
         );
         functions.push(lowered);
@@ -1528,6 +1588,14 @@ pub fn lower(
         Hir {
             functions,
             types,
+            // A generic is lowered once per instance, so the same `let` can be seen
+            // several times. The first wins: an editor wants the name, not one
+            // instance's substitution of it.
+            symbols: {
+                symbols.sort_by_key(|symbol| (symbol.span.start, symbol.span.end));
+                symbols.dedup_by_key(|symbol| symbol.span);
+                symbols
+            },
             references,
         },
         errors,
@@ -1557,6 +1625,7 @@ fn lower_function(
     toolchain: Option<&Schema>,
     instances: &mut Instances,
     references: &mut Vec<Reference>,
+    symbols: &mut Vec<Symbol>,
     errors: &mut Vec<SyntaxError>,
 ) -> Function {
     let LowerOne {
@@ -1577,7 +1646,10 @@ fn lower_function(
             types,
             type_params,
             instances,
-            scopes: vec![HashMap::new()],
+            scopes: vec![Scope {
+                names: HashMap::new(),
+                span: f.body.span,
+            }],
             selector_aliases: HashMap::new(),
             expected: None,
             provided: Vec::new(),
@@ -1587,6 +1659,7 @@ fn lower_function(
             signatures,
             toolchain,
             references,
+            symbols,
             errors,
         };
         let attrs = cx.attrs(&item.attrs);
@@ -1629,11 +1702,16 @@ fn lower_function(
             .collect();
         let mut params = Vec::new();
         for (index, (name, param)) in names.iter().zip(&signature.params).enumerate() {
+            // The receiver has no written name of its own, so `self` points at where
+            // it was elided.
+            let at = f
+                .receiver
+                .map_or_else(|| f.params[index].name.span, |receiver| receiver.span);
             match param.borrow {
                 // Borrowed: the name stands for the caller's place, and nothing is
                 // written before the call (spec section 6.24).
                 Some(borrow) => {
-                    let local = cx.declare(name, param.ty, false);
+                    let local = cx.declare(name, param.ty, false, at, SymbolKind::Declared);
                     if let Some(Some(place)) = borrows.get(index) {
                         let mut place = place.clone();
                         place.mutable = borrow == ast::Borrow::Mutable;
@@ -1641,7 +1719,7 @@ fn lower_function(
                         cx.place_aliases.insert(local, place);
                     }
                 }
-                None => params.push(cx.declare(name, param.ty, false)),
+                None => params.push(cx.declare(name, param.ty, false, at, SymbolKind::Declared)),
             }
         }
         let body = cx.block(&f.body);
@@ -2309,8 +2387,10 @@ struct FnLowering<'a> {
     /// The command surface of the configured Minecraft version, if there is one.
     toolchain: Option<&'a Schema>,
     references: &'a mut Vec<Reference>,
+    /// Declared names, for an editor. Appended to; nothing here reads it back.
+    symbols: &'a mut Vec<Symbol>,
     /// Innermost scope last. A `let` shadows an outer binding of the same name.
-    scopes: Vec<HashMap<String, LocalId>>,
+    scopes: Vec<Scope>,
     /// Bindings that stand for a selector rather than a value.
     selector_aliases: HashMap<LocalId, String>,
     /// The type the expression being lowered is going into, where one is known.
@@ -2326,6 +2406,15 @@ struct FnLowering<'a> {
     /// error, and it is only detectable here.
     loop_depth: u32,
     errors: &'a mut Vec<SyntaxError>,
+}
+
+/// One nesting level of names, and the source range it covers.
+///
+/// The range is an editor's need rather than the lowering's, but this is the only place
+/// that knows where a scope opens and closes.
+struct Scope {
+    names: HashMap<String, LocalId>,
+    span: Span,
 }
 
 impl FnLowering<'_> {
@@ -2394,7 +2483,7 @@ impl FnLowering<'_> {
     }
 
     fn block(&mut self, block: &ast::Block) -> Vec<Stmt> {
-        self.scopes.push(HashMap::new());
+        self.open(block.span);
         let stmts = block
             .stmts
             .iter()
@@ -2749,11 +2838,13 @@ impl FnLowering<'_> {
         path: String,
         body: &ast::Block,
     ) -> Arm {
-        self.scopes.push(HashMap::new());
+        self.open(body.span);
         let bindings = bindings
             .into_iter()
             .map(|(name, nbt, ty, tag)| Binding {
-                local: self.declare(&name, ty, false),
+                // A pattern's field has no span of its own to point at, so the arm
+                // stands in for it: enough to be in scope, not enough for a hint.
+                local: self.declare(&name, ty, false, body.span, SymbolKind::Declared),
                 nbt,
                 ty,
                 tag,
@@ -2791,7 +2882,7 @@ impl FnLowering<'_> {
         };
         let inline = self.inline_attr(&stmt.attrs)?;
         self.provided.push(Ctx::Position);
-        self.scopes.push(HashMap::new());
+        self.open(stmt.body.span);
         let body = stmt
             .body
             .stmts
@@ -2841,10 +2932,16 @@ impl FnLowering<'_> {
             ContextKind::At => Ctx::Position,
             _ => Ctx::Entity,
         });
-        self.scopes.push(HashMap::new());
+        self.open(stmt.body.span);
         if let Some(binding) = &stmt.binding {
             // The binding is a compile-time alias for `@s` inside the body.
-            let local = self.declare(&binding.name, Type::Selector, false);
+            let local = self.declare(
+                &binding.name,
+                Type::Selector,
+                false,
+                binding.span,
+                SymbolKind::Declared,
+            );
             self.selector_aliases.insert(local, "@s".to_owned());
         }
         // All three iterate over what the selector found, so `break` and `continue`
@@ -2915,8 +3012,8 @@ impl FnLowering<'_> {
             return None;
         }
         let name = stmt.binding.as_ref().expect("'for' always binds a name");
-        self.scopes.push(HashMap::new());
-        let binding = self.declare(&name.name, elem, false);
+        self.open(stmt.body.span);
+        let binding = self.declare(&name.name, elem, false, name.span, SymbolKind::Inferred);
         self.loop_depth += 1;
         // Not an entity loop: `continue` here means the next element, which is the
         // same thing `while` means by it.
@@ -3143,7 +3240,16 @@ impl FnLowering<'_> {
                 ty
             }
         };
-        let local = self.declare(&stmt.name.name, ty, stmt.mutable);
+        let local = self.declare(
+            &stmt.name.name,
+            ty,
+            stmt.mutable,
+            stmt.name.span,
+            match stmt.ty {
+                Some(_) => SymbolKind::Declared,
+                None => SymbolKind::Inferred,
+            },
+        );
         // A compile-time value has nothing to put anywhere: the binding is a name for
         // it, and the `let` itself is not a statement at all.
         match &value.kind {
@@ -5216,7 +5322,22 @@ impl FnLowering<'_> {
         Some(values.into_iter().flatten().collect())
     }
 
-    fn declare(&mut self, name: &str, ty: Type, mutable: bool) -> LocalId {
+    /// Opens a scope covering `span`.
+    fn open(&mut self, span: Span) {
+        self.scopes.push(Scope {
+            names: HashMap::new(),
+            span,
+        });
+    }
+
+    fn declare(
+        &mut self,
+        name: &str,
+        ty: Type,
+        mutable: bool,
+        at: Span,
+        kind: SymbolKind,
+    ) -> LocalId {
         let id = LocalId(self.locals.len() as u32);
         self.locals.push(Local {
             id,
@@ -5224,10 +5345,16 @@ impl FnLowering<'_> {
             ty,
             mutable,
         });
-        self.scopes
-            .last_mut()
-            .expect("a scope is always open")
-            .insert(name.to_owned(), id);
+        let scope = self.scopes.last_mut().expect("a scope is always open");
+        let visible = scope.span;
+        scope.names.insert(name.to_owned(), id);
+        self.symbols.push(Symbol {
+            span: at,
+            scope: visible,
+            name: name.to_owned(),
+            ty: self.types.name_of(ty),
+            kind,
+        });
         id
     }
 
@@ -5262,7 +5389,7 @@ impl FnLowering<'_> {
         self.scopes
             .iter()
             .rev()
-            .find_map(|scope| scope.get(&name.name).copied())
+            .find_map(|scope| scope.names.get(&name.name).copied())
     }
 
     fn error(&mut self, span: Span, message: impl Into<String>) {
@@ -5291,6 +5418,60 @@ mod tests {
 
     fn schema() -> Schema {
         Schema::parse(include_str!("../../tests/fixtures/commands.json")).expect("fixture")
+    }
+
+    fn symbol<'a>(hir: &'a Hir, name: &str) -> &'a Symbol {
+        hir.symbols
+            .iter()
+            .find(|symbol| symbol.name == name)
+            .unwrap_or_else(|| panic!("no symbol '{name}' in {:?}", hir.symbols))
+    }
+
+    #[test]
+    fn a_let_records_the_name_its_type_and_where_it_is() {
+        let src = "fn main() { let a = 1; let b: bool = true; }";
+        let hir = lower_ok(src);
+        let a = symbol(&hir, "a");
+        assert_eq!(a.ty, "i32");
+        // The span is the name itself, so an inlay hint can sit at the end of it.
+        assert_eq!(&src[a.span.range()], "a");
+        // Nothing in the source says `a` is an `i32`; `b` says so itself.
+        assert_eq!(a.kind, SymbolKind::Inferred);
+        assert_eq!(symbol(&hir, "b").kind, SymbolKind::Declared);
+    }
+
+    #[test]
+    fn a_binding_is_in_scope_for_its_block_only() {
+        let src = "fn main() { if true { let inner = 1; } let outer = 2; }";
+        let hir = lower_ok(src);
+        let inner = symbol(&hir, "inner");
+        let outer = symbol(&hir, "outer");
+        // The scope is the block it was declared in, which for `inner` is the `if`.
+        assert!(
+            inner.scope.end < src.find("let outer").expect("there"),
+            "{inner:?}"
+        );
+        assert!(outer.scope.end > inner.scope.end, "{outer:?}");
+    }
+
+    #[test]
+    fn a_parameter_and_a_function_are_symbols_too() {
+        let hir = lower_ok("fn area(r: i32) -> i32 { return r; }");
+        // A parameter says its own type, so there is nothing to add to it.
+        assert_eq!(symbol(&hir, "r").kind, SymbolKind::Declared);
+        let area = symbol(&hir, "area");
+        assert_eq!(area.kind, SymbolKind::Function);
+        assert_eq!(area.ty, "fn area(r: i32) -> i32");
+    }
+
+    #[test]
+    fn one_symbol_per_name_even_when_a_generic_is_lowered_twice() {
+        let hir = lower_ok(
+            "fn first<T>(v: Vec<T>) -> i32 { let n = v.len(); return n; }\n\
+             fn main() { let a = [1, 2]; let b = first(a); }",
+        );
+        let ns: Vec<&Symbol> = hir.symbols.iter().filter(|s| s.name == "n").collect();
+        assert_eq!(ns.len(), 1, "{ns:?}");
     }
 
     fn lower_err_with_toolchain(src: &str) -> Vec<SyntaxError> {

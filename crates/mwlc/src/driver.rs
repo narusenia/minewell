@@ -193,6 +193,19 @@ fn walk(dir: &Path) -> Result<Vec<PathBuf>, BuildError> {
 ///
 /// The whole compiler between the two I/O edges. Tests drive this directly, which is
 /// what lets the vertical harness compile and run a program without a project on disk.
+/// The names a source declares, with where they are written and what type they got.
+///
+/// Best effort by design, and the reason this is not `compile_with`: a file being typed
+/// into does not compile, and "what is in scope here" still has to have an answer.
+pub fn symbols(
+    text: &str,
+    namespace: &str,
+    toolchain: Option<&crate::schema::Schema>,
+) -> Vec<crate::hir::Symbol> {
+    let (file, _) = crate::syntax::parser::parse(text);
+    crate::hir::lower(&file, namespace, toolchain).0.symbols
+}
+
 pub fn compile(text: &str, namespace: &str, options: &Options) -> Result<Datapack, Report> {
     compile_with(text, namespace, options, None)
 }
