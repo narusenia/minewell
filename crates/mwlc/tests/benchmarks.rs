@@ -68,6 +68,23 @@ fn tick() {
 }
 "#;
 
+/// A raycast: coordinates, blocks and recursion. What the coordinate model is for.
+const RAYCAST: &str = r#"
+#[ctx(position)]
+fn step(left: i32) {
+    if left <= 0 { return; }
+    if block(pos!(~ ~ ~), minecraft:stone) { raw!("say stone"); return; }
+    positioned pos!(^ ^ ^1) { step(left - 1); }
+}
+
+#[tick]
+fn tick() {
+    for shooter in @e[type=marker] {
+        at @s { step(8); }
+    }
+}
+"#;
+
 fn table(src: &str) -> String {
     let options = Options {
         profile: Profile::Release,
@@ -90,4 +107,9 @@ fn an_inventory() {
 #[test]
 fn recursion() {
     insta::assert_snapshot!(table(RECURSION));
+}
+
+#[test]
+fn a_raycast() {
+    insta::assert_snapshot!(table(RAYCAST));
 }

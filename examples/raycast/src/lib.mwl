@@ -1,0 +1,66 @@
+// A raycast, the way mcfunction does one.
+//
+// Nothing here computes a coordinate. `^ ^ ^1` steps one block along the direction the
+// caller is facing, and recursion is the loop — so the whole ray is compile-time
+// coordinates and the only runtime value is how many steps are left. That is what the
+// coordinate model buys: `Pos` never needs a runtime representation.
+//
+// Worth reading in the output (`target/datapack`):
+//
+// - `raycast:step`. The step is `execute positioned ^ ^ ^1 run function raycast:step/positioned_0`,
+//   which is two commands per block of range, plus the block test.
+// - `if block(..)` never touches a register. `execute if block ~ ~ ~ minecraft:stone`
+//   is the whole test.
+
+/// What the ray found, if anything. `#[block]` makes this a window onto a position
+/// rather than a value: reading `Locked` is `data get block ~ ~ ~ Locked`.
+#[block]
+struct Chest {
+    #[nbt(byte, rename = "Locked")]
+    locked: Option<i32>,
+}
+
+/// One step. `#[ctx(position)]` says the caller has to have put us somewhere —
+/// `^ ^ ^1` and `~ ~ ~` are both read where the command runs.
+///
+/// Rotation comes along with the position: vanilla's `execute at` moves both, which is
+/// what makes `^` mean "ahead of where it is looking".
+#[ctx(position)]
+fn step(left: i32) {
+    if left <= 0 {
+        raw!("say the ray ran out");
+        return;
+    }
+    if block(pos!(~ ~ ~), minecraft:stone) {
+        raw!("say stone");
+        return;
+    }
+    if block(pos!(~ ~ ~), minecraft:chest) {
+        // The block is there, so its NBT is too.
+        let c = Chest::of(pos!(~ ~ ~));
+        match c.locked {
+            Some(v) => {
+                raw!("say a locked chest");
+            }
+            None => {
+                raw!("say a chest");
+            }
+        }
+        return;
+    }
+    // The step itself. One `execute positioned` per block of range, and no arithmetic
+    // on coordinates anywhere.
+    positioned pos!(^ ^ ^1) {
+        step(left - 1);
+    }
+}
+
+#[tick]
+fn tick() {
+    // `at @s` takes the position *and* the rotation, which is what `^` needs.
+    for shooter in @e[type=marker] {
+        at @s {
+            step(8);
+        }
+    }
+}

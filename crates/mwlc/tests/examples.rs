@@ -144,10 +144,61 @@ fn the_arena_example_does_what_it_says() {
     assert_eq!(stated.commands, mc.commands_run, "{:?}", stated);
 }
 
+/// The raycast example, run against a world with something in the way.
+#[test]
+fn the_raycast_example_finds_what_is_in_front_of_it() {
+    let pack = driver::build_with(
+        &examples_dir().join("raycast"),
+        Profile::Release,
+        &toolchains(),
+    )
+    .expect("compiles");
+    let mut mc = tinymcf::Interpreter::default();
+    for (path, text) in &pack.files {
+        if let Some(rest) = path.strip_prefix("data/raycast/function/") {
+            let id = format!(
+                "raycast:{}",
+                rest.strip_suffix(".mcfunction").expect("a function")
+            );
+            mc.load(&id, text).expect("parses as mcfunction");
+        }
+    }
+    mc.call("raycast:__init");
+
+    // A marker at the origin, facing +Z, with stone three blocks ahead of it.
+    mc.world.spawn("m", [0.0, 64.0, 0.0]);
+    mc.world.bind_selector("@e[type=marker]", ["m"]);
+    mc.world.place([0, 64, 3], "stone");
+    mc.call("raycast:tick");
+    assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
+
+    let said: Vec<&str> = mc
+        .effects
+        .iter()
+        .filter(|e| e.name == "say")
+        .map(|e| e.args.as_str())
+        .collect();
+    assert_eq!(said, vec!["stone"], "{:?}", mc.effects);
+    // It stopped where the block is, rather than walking past it.
+    assert_eq!(mc.effects[0].position, [0.0, 64.0, 3.0]);
+
+    // Nothing in the way: the ray runs out instead of finding something.
+    mc.effects.clear();
+    mc.world.place([0, 64, 3], "air");
+    mc.call("raycast:tick");
+    let said: Vec<&str> = mc
+        .effects
+        .iter()
+        .filter(|e| e.name == "say")
+        .map(|e| e.args.as_str())
+        .collect();
+    assert_eq!(said, vec!["the ray ran out"], "{:?}", mc.effects);
+}
+
 #[test]
 fn there_are_examples_to_check() {
     // Otherwise the test below passes by finding nothing.
-    assert!(projects().len() >= 5, "{:?}", projects());
+    assert!(projects().len() >= 6, "{:?}", projects());
 }
 
 #[test]

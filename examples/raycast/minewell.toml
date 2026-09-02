@@ -1,0 +1,5 @@
+[package]
+name = "raycast"
+namespace = "raycast"
+description = "A worked example: coordinates, blocks and recursion"
+toolchain = "1.21.4"
