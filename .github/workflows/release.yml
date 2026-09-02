@@ -35,29 +35,42 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - runner: macos-latest
             target: aarch64-apple-darwin
-          - runner: macos-13
+          # Apple ships both slices, so the Intel build cross-compiles from the arm64
+          # runner. There is no Intel macOS runner any more.
+          - runner: macos-latest
             target: x86_64-apple-darwin
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: jdx/mise-action@v2
+      # Not mise: this job wants a compiler and nothing else, and one that works the
+      # same way on all three operating systems is worth more here than the task list.
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          cache: true
+          targets: ${{ matrix.target }}
 
       - name: Build
         run: cargo build --release -p mwl --target ${{ matrix.target }}
 
+      # `tar` is bsdtar on the Windows runners and on macOS, so one command covers all
+      # three. Windows 10 and later ship it, which is what unpacks the result.
       - name: Package
+        shell: bash
         env:
           TAG: ${{ github.ref_name }}
           TARGET: ${{ matrix.target }}
         run: |
           version="${TAG#v}"
-          tar -czf "mwl-$version-$TARGET.tar.gz" -C "target/$TARGET/release" mwl
-          echo "ASSET=mwl-$version-$TARGET.tar.gz" >> "$GITHUB_ENV"
+          binary=mwl
+          if [ "$RUNNER_OS" = "Windows" ]; then binary=mwl.exe; fi
+          asset="mwl-$version-$TARGET.tar.gz"
+          tar -czf "$asset" -C "target/$TARGET/release" "$binary"
+          echo "ASSET=$asset" >> "$GITHUB_ENV"
 
       - name: Upload
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}

@@ -97,7 +97,7 @@ knowingly departs from vanilla.
 
 ## Installing
 
-Binaries for macOS and Linux are attached to each
+Binaries for macOS (Apple silicon and Intel), Linux and Windows are attached to each
 [release](https://github.com/narusenia/minewell/releases):
 
 ```sh
