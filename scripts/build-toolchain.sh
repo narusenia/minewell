@@ -35,7 +35,11 @@ curl -fsSL -o "$work/server.jar" "$server"
 
 # The pack format lives in the jar rather than in the reports, and it is what a
 # generated pack.mcmeta has to declare.
-pack_format="$(unzip -p "$work/server.jar" version.json | jq -r '.pack_version.data')"
+pack_format="$(unzip -p "$work/server.jar" version.json | jq -r '.pack_version.data // empty')"
+if [ -z "$pack_format" ]; then
+  echo "no pack_version.data in this version's version.json; the field moved" >&2
+  exit 1
+fi
 echo "pack_format $pack_format"
 
 echo "running the data generator"
