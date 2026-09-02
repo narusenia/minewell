@@ -25,6 +25,9 @@ pub struct World {
 pub struct Entity {
     pub id: String,
     pub pos: [f64; 3],
+    /// Yaw and pitch, in degrees. `at` moves this along with the position, which is
+    /// what makes `^` mean anything (`SPEC.md` section 4.4).
+    pub rot: [f64; 2],
     pub nbt: NbtValue,
 }
 
@@ -42,6 +45,7 @@ impl World {
         self.entities.entry(id.to_owned()).or_insert(Entity {
             id: id.to_owned(),
             pos,
+            rot: [0.0, 0.0],
             nbt: NbtValue::Compound(Default::default()),
         })
     }

@@ -329,12 +329,36 @@ finds no entities runs its command zero times and reports 0.
 Every logged side effect records the executor it ran as, so a test can assert not only
 that something happened but who it happened for.
 
+#### Coordinates — **done** (M10-1)
+
+```
+clause += positioned <x> <y> <z> | rotated <yaw> <pitch>
+coord  := <number> | ~[<number>] | ^[<number>]
+```
+
+The context carries a rotation as well as a position, because `^` is measured from it.
+
+- **absolute** — the number, as written
+- **`~`** — an offset from the context's position (`~` alone is `~0`)
+- **`^`** — an offset along the direction the context faces: `^left ^up ^forward`.
+  All three have to be `^` or none of them, which is what vanilla requires
+
+`at <selector>` moves the position **and the rotation**, which is what vanilla does and
+what makes `at @s` followed by `^ ^ ^1` mean "one block ahead of where it is looking".
+`as` moves neither.
+
+The basis is the usual one: with yaw 0 and pitch 0 an entity faces `+Z`, its up is
+`+Y`, and its left is `+X`.
+
+    forward = (-sin y · cos p,  -sin p,   cos y · cos p)
+    up      = (-sin y · sin p,   cos p,   cos y · sin p)
+    left    = ( cos y,           0,       sin y)
+
 #### Still deferred
 
-`positioned`, `in`, `if block` and `if predicate` parse and fail with a diagnostic
-naming themselves. Nothing needs them yet: `positioned` and `in` want coordinate and
-dimension models, and the two conditions want a block and predicate registry. They will
-arrive with the first task that has a use for them.
+`in`, `anchored`, `align`, `facing`, `on`, `positioned as` and `rotated as` parse and
+fail with a diagnostic naming themselves. `in` wants a dimension model and the rest
+want more of the world than anything has asked for.
 
 ### 4.5 Macro functions — **done**
 

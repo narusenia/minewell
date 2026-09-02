@@ -17,6 +17,7 @@ fn hello_world_goes_all_the_way_through() {
             name: "say".into(),
             args: "hi".into(),
             executor: None,
+            position: [0.0; 3],
         }]
     );
 }

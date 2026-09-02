@@ -211,13 +211,16 @@ pub struct Report {
 }
 
 /// A command outside the modelled subset, recorded rather than simulated.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Effect {
     pub name: String,
     pub args: String,
     /// Who it ran as, if anyone. Lets a test assert not just that something happened
     /// but who it happened for.
     pub executor: Option<String>,
+    /// Where it ran. The arguments keep the coordinates as written (`~ ~1 ~`), so
+    /// this is the only place the resolved position shows up.
+    pub position: [f64; 3],
 }
 
 /// What a command runs in: an executor and a position.
@@ -228,6 +231,9 @@ pub struct Effect {
 pub struct Context {
     pub executor: Option<String>,
     pub pos: [f64; 3],
+    /// Yaw and pitch in degrees, which is what `^` is measured from
+    /// (`SPEC.md` section 4.4).
+    pub rot: [f64; 2],
 }
 
 /// One line of a loaded function.
@@ -433,6 +439,7 @@ impl Interpreter {
                     name: name.clone(),
                     args: args.clone(),
                     executor: self.context.executor.clone(),
+                    position: self.context.pos,
                 });
                 Flow::Next(Outcome::ok(1))
             }
@@ -483,6 +490,9 @@ impl Interpreter {
                         })
                         .collect();
                 }
+                // Vanilla's `at` moves the rotation as well as the position, which
+                // is what makes `at @s` then `^ ^ ^1` mean "a block ahead of where it
+                // is looking".
                 Clause::At(selector) => {
                     contexts = contexts
                         .into_iter()
@@ -491,11 +501,25 @@ impl Interpreter {
                             world
                                 .resolve(selector, ctx.executor.as_deref())
                                 .into_iter()
-                                .filter_map(|id| world.entity(&id).map(|e| e.pos))
-                                .map(move |pos| Context { pos, ..ctx.clone() })
+                                .filter_map(|id| world.entity(&id).map(|e| (e.pos, e.rot)))
+                                .map(move |(pos, rot)| Context {
+                                    pos,
+                                    rot,
+                                    ..ctx.clone()
+                                })
                                 .collect::<Vec<_>>()
                         })
                         .collect();
+                }
+                Clause::Positioned(coords) => {
+                    for ctx in &mut contexts {
+                        ctx.pos = coords.resolve(ctx.pos, ctx.rot);
+                    }
+                }
+                Clause::Rotated(yaw, pitch) => {
+                    for ctx in &mut contexts {
+                        ctx.rot = [*yaw, *pitch];
+                    }
                 }
                 Clause::Cond { negated, cond } => {
                     let mut kept = Vec::new();
@@ -1663,8 +1687,8 @@ mod execute_tests {
     fn the_clauses_that_need_a_world_say_they_are_deferred() {
         let mut it = setup();
         for line in [
-            "execute positioned 0 0 0 run say hi",
             "execute in minecraft:overworld run say hi",
+            "execute anchored eyes run say hi",
             "execute if block 0 0 0 stone run say hi",
             "execute if predicate ns:p run say hi",
         ] {
@@ -1785,11 +1809,13 @@ mod effect_tests {
                     name: "say".into(),
                     args: "hello  world".into(),
                     executor: None,
+                    position: [0.0; 3],
                 },
                 Effect {
                     name: "setblock".into(),
                     args: "~ ~1 ~ minecraft:stone".into(),
                     executor: None,
+                    position: [0.0; 3],
                 },
             ]
         );
@@ -1959,11 +1985,73 @@ mod context_tests {
     }
 
     #[test]
+    fn positioned_moves_where_a_command_runs() {
+        let mut it = zombies();
+        it.run_line("execute positioned 1 2 3 run say a");
+        it.run_line("execute positioned 1 2 3 positioned ~ ~1 ~ run say b");
+        let at: Vec<[f64; 3]> = it.effects.iter().map(|e| e.position).collect();
+        assert_eq!(at, vec![[1.0, 2.0, 3.0], [1.0, 3.0, 3.0]]);
+    }
+
+    #[test]
+    fn a_bare_tilde_is_no_offset_at_all() {
+        let mut it = zombies();
+        it.run_line("execute positioned 4 5 6 positioned ~ ~ ~ run say a");
+        assert_eq!(it.effects[0].position, [4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn local_coordinates_follow_the_rotation_at_moved_to() {
+        let mut it = zombies();
+        // Facing yaw 90 is facing -X, so a step forward is a step west.
+        let z1 = it.world.entity_mut("z1").expect("spawned");
+        z1.rot = [90.0, 0.0];
+        z1.pos = [0.0, 64.0, 0.0];
+        it.world.bind_selector("@e[type=zombie]", ["z1"]);
+        it.run_line("execute as @e[type=zombie] at @s positioned ^ ^ ^1 run say ahead");
+        let at = it.effects[0].position;
+        assert!((at[0] - -1.0).abs() < 1e-9, "{at:?}");
+        assert!((at[1] - 64.0).abs() < 1e-9, "{at:?}");
+        assert!(at[2].abs() < 1e-9, "{at:?}");
+    }
+
+    #[test]
+    fn looking_up_makes_forward_up() {
+        let mut it = zombies();
+        let z1 = it.world.entity_mut("z1").expect("spawned");
+        z1.rot = [0.0, -90.0];
+        z1.pos = [0.0, 64.0, 0.0];
+        it.world.bind_selector("@e[type=zombie]", ["z1"]);
+        it.run_line("execute as @e[type=zombie] at @s positioned ^ ^ ^2 run say up");
+        let at = it.effects[0].position;
+        assert!(at[0].abs() < 1e-9, "{at:?}");
+        assert!((at[1] - 66.0).abs() < 1e-9, "{at:?}");
+        assert!(at[2].abs() < 1e-9, "{at:?}");
+    }
+
+    #[test]
+    fn mixing_local_with_the_others_is_refused() {
+        let mut it = zombies();
+        assert_eq!(
+            it.run_line("execute positioned ^ ~1 ^ run say hi"),
+            Outcome::FAILED
+        );
+    }
+
+    #[test]
+    fn rotated_sets_the_frame_local_coordinates_use() {
+        let mut it = zombies();
+        it.run_line("execute positioned 0 0 0 rotated 180 0 positioned ^ ^ ^1 run say back");
+        let at = it.effects[0].position;
+        assert!((at[2] - -1.0).abs() < 1e-9, "{at:?}");
+    }
+
+    #[test]
     fn the_still_deferred_clauses_name_themselves() {
         let mut it = zombies();
         for line in [
-            "execute positioned 0 0 0 run say hi",
             "execute in minecraft:overworld run say hi",
+            "execute anchored eyes run say hi",
             "execute if block 0 0 0 stone run say hi",
             "execute if predicate ns:p run say hi",
         ] {

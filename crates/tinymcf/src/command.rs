@@ -59,8 +59,12 @@ pub enum Clause {
     },
     /// `as <selector>`: run once per entity found, as that entity.
     As(String),
-    /// `at <selector>`: run once per entity found, at its position.
+    /// `at <selector>`: run once per entity found, at its position and rotation.
     At(String),
+    /// `positioned <x> <y> <z>`.
+    Positioned(Coords),
+    /// `rotated <yaw> <pitch>`, in degrees.
+    Rotated(f64, f64),
     /// Parsed but not implemented; see `SPEC.md` §4.4.
     Deferred(String),
 }
@@ -390,10 +394,16 @@ fn clause(args: &mut Args) -> Result<Clause, ParseError> {
         }
         "as" => Ok(Clause::As(args.word()?.to_owned())),
         "at" => Ok(Clause::At(args.word()?.to_owned())),
+        "positioned" => Ok(Clause::Positioned(coords(args)?)),
+        "rotated" => {
+            let yaw = number(args.word()?)?;
+            let pitch = number(args.word()?)?;
+            Ok(Clause::Rotated(yaw, pitch))
+        }
         // Everything else that needs a world. Their argument shapes differ and none of
         // them run, so the rest of the line is swallowed whole rather than parsed into
         // a form nothing will read.
-        "positioned" | "rotated" | "in" | "anchored" | "align" | "facing" | "on" | "summon" => {
+        "in" | "anchored" | "align" | "facing" | "on" | "summon" => {
             args.rest();
             Ok(Clause::Deferred(word.to_owned()))
         }
@@ -687,6 +697,77 @@ fn scoreboard(args: &mut Args) -> Result<Scoreboard, ParseError> {
         }
         other => Err(unexpected(other)),
     }
+}
+
+/// One coordinate of a triple: absolute, relative to the context, or along the
+/// direction it faces (`SPEC.md` section 4.4).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Coord {
+    Absolute(f64),
+    Relative(f64),
+    Local(f64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Coords(pub [Coord; 3]);
+
+impl Coords {
+    /// Where these coordinates land, given where the context stands and faces.
+    ///
+    /// `^` is measured in the frame the rotation defines; the other two are measured
+    /// in the world's.
+    pub fn resolve(&self, pos: [f64; 3], rot: [f64; 2]) -> [f64; 3] {
+        let Coords([x, y, z]) = *self;
+        if let (Coord::Local(x), Coord::Local(y), Coord::Local(z)) = (x, y, z) {
+            let (sy, cy) = rot[0].to_radians().sin_cos();
+            let (sp, cp) = rot[1].to_radians().sin_cos();
+            let forward = [-sy * cp, -sp, cy * cp];
+            let up = [-sy * sp, cp, cy * sp];
+            let left = [cy, 0.0, sy];
+            return [0, 1, 2].map(|i| pos[i] + x * left[i] + y * up[i] + z * forward[i]);
+        }
+        let one = |coord: Coord, base: f64| match coord {
+            Coord::Absolute(n) => n,
+            Coord::Relative(n) => base + n,
+            // Mixing `^` with the others is a vanilla error; parsing rejects it.
+            Coord::Local(n) => base + n,
+        };
+        [one(x, pos[0]), one(y, pos[1]), one(z, pos[2])]
+    }
+}
+
+fn coords(args: &mut Args) -> Result<Coords, ParseError> {
+    let parts = [coord(args)?, coord(args)?, coord(args)?];
+    let locals = parts
+        .iter()
+        .filter(|part| matches!(part, Coord::Local(_)))
+        .count();
+    if locals != 0 && locals != 3 {
+        return Err(ParseError::new(
+            0,
+            "all three coordinates have to use '^', or none of them",
+        ));
+    }
+    Ok(Coords(parts))
+}
+
+fn coord(args: &mut Args) -> Result<Coord, ParseError> {
+    let word = args.word()?;
+    // `~` and `^` on their own mean no offset at all, which is the common case.
+    let (make, rest): (fn(f64) -> Coord, &str) = match word.split_at_checked(1) {
+        Some(("~", rest)) => (Coord::Relative, rest),
+        Some(("^", rest)) => (Coord::Local, rest),
+        _ => (Coord::Absolute, word),
+    };
+    if rest.is_empty() && !matches!(make(0.0), Coord::Absolute(_)) {
+        return Ok(make(0.0));
+    }
+    Ok(make(number(rest)?))
+}
+
+fn number(text: &str) -> Result<f64, ParseError> {
+    text.parse()
+        .map_err(|_| ParseError::new(0, format!("'{text}' is not a number")))
 }
 
 fn unexpected(token: &str) -> ParseError {
