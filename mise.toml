@@ -8,6 +8,8 @@ rust = { version = "stable", components = "rustfmt,clippy" }
 # For the editor grammar (`editors/`). The generated parser is not committed, so the
 # CLI is needed to build and test it.
 "tree-sitter" = "0.26"
+# The VS Code extension is JavaScript, and `mise run editors` checks it parses.
+node = "22"
 # M6 will add `java` here, for `mwl toolchain build-from-jar`. Not needed before that.
 
 [env]
@@ -53,6 +55,18 @@ run = [
   "tree-sitter parse --quiet ../../examples/*/src/*.mwl",
 ]
 
+[tasks.editors]
+description = "Check the editor extensions build"
+run = [
+  # The VS Code client is plain JavaScript, so this is the whole check short of
+  # installing VS Code.
+  "node --check editors/vscode/src/extension.js",
+  "node -e \"JSON.parse(require('fs').readFileSync('editors/vscode/package.json'))\"",
+  # Zed loads a WebAssembly extension, so the real check is that it still builds one.
+  "rustup target add wasm32-wasip1",
+  "cargo build --manifest-path editors/zed/Cargo.toml --target wasm32-wasip1",
+]
+
 [tasks.snap]
 description = "Review insta snapshots"
 run = "cargo insta review"
@@ -65,7 +79,7 @@ run = "cargo insta accept"
 
 [tasks.ci]
 description = "Same checks as CI. Run before pushing"
-depends = ["fmt:check", "lint", "test", "grammar"]
+depends = ["fmt:check", "lint", "test", "grammar", "editors"]
 
 [tasks."fmt:check"]
 run = "cargo fmt --all -- --check"

@@ -1,17 +1,26 @@
 {
   "name": "minewell",
   "displayName": "minewell",
-  "description": "Syntax highlighting for .mwl",
+  "description": "Syntax highlighting and diagnostics for .mwl",
   "version": "0.0.0",
   "license": "MIT",
-  "engines": { "vscode": "^1.75.0" },
-  "categories": ["Programming Languages"],
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
   "contributes": {
     "languages": [
       {
         "id": "mwl",
-        "aliases": ["minewell", "mwl"],
-        "extensions": [".mwl"],
+        "aliases": [
+          "minewell",
+          "mwl"
+        ],
+        "extensions": [
+          ".mwl"
+        ],
         "configuration": "./language-configuration.json"
       }
     ],
@@ -21,6 +30,26 @@
         "scopeName": "source.mwl",
         "path": "./syntaxes/mwl.tmLanguage.json"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "minewell",
+      "properties": {
+        "mwl.path": {
+          "type": "string",
+          "default": "mwl",
+          "description": "The mwl binary to run the language server with. A name is looked up on PATH."
+        }
+      }
+    }
+  },
+  "main": "./src/extension.js",
+  "activationEvents": [
+    "onLanguage:mwl"
+  ],
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "scripts": {
+    "build": "npm install"
   }
 }

@@ -6,6 +6,12 @@ schema_version = 1
 authors = ["minewell"]
 repository = "https://github.com/NaruseNia/minewell"
 
+# `mwl lsp` provides the diagnostics. The binary is found on PATH by `src/lib.rs`;
+# nothing here is pinned to a build of the compiler.
+[language_servers.mwl]
+name = "minewell"
+language = "minewell"
+
 [grammars.mwl]
 repository = "https://github.com/NaruseNia/minewell"
 commit = "HEAD"
