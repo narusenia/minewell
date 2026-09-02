@@ -1,6 +1,6 @@
 # エディタ支援
 
-**ハイライトだけ。LSP は v1 の後**（要件定義 §19）。
+ハイライトと、保存時の診断（LSP）。
 
 置いてあるもの:
 
@@ -11,7 +11,31 @@
 | `zed/` | Zed 拡張。grammar は `tree-sitter-mwl/` を指し、クエリはシンボリックリンク |
 | `nvim/` | nvim-treesitter へ登録する設定断片 |
 
-**どれもコンパイラに依存しない。** 依存させた瞬間に版の同期が発生する。
+**ハイライトの側はコンパイラに依存しない。** 依存させた瞬間に版の同期が発生する。
+LSP はもちろん依存する（それが仕事）ので、別物として扱う。
+
+## 診断（LSP）
+
+`mwl lsp` が stdin / stdout で喋る。**診断だけ**で、定義ジャンプと補完はまだ無い。
+
+```lua
+-- nvim
+vim.lsp.config.mwl = {
+  cmd = { "mwl", "lsp" },
+  filetypes = { "mwl" },
+  root_markers = { "minewell.toml" },
+}
+vim.lsp.enable("mwl")
+```
+
+```json
+// VS Code や Zed から起動するときも、コマンドは同じ
+{ "command": "mwl", "args": ["lsp"] }
+```
+
+近くの `minewell.toml` を見て namespace と toolchain を決めるので、
+**プロジェクトの中なら実物のコマンド表で検査する。** 外にある `.mwl` でも
+構文と型のエラーは出る。
 
 ## 作り方
 

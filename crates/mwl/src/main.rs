@@ -2,6 +2,8 @@
 
 //! The `mwl` command-line interface.
 
+mod lsp;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -33,6 +35,9 @@ usage:
         compile the project into target/datapack, and write the per-function
         command counts to target/cost.txt
 
+    mwl lsp
+        run the language server on stdin and stdout
+
     mwl toolchain list
         show the installed Minecraft versions
 
@@ -54,6 +59,13 @@ fn main() -> ExitCode {
     match flags.as_slice() {
         ["new", name] => report(new_project(name)),
         ["check"] => report(check()),
+        ["lsp"] => match lsp::serve() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        },
         ["test"] => match run_tests() {
             Ok(true) => ExitCode::SUCCESS,
             Ok(false) => ExitCode::FAILURE,

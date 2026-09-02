@@ -212,6 +212,7 @@ version = "0.1.0"
 dependencies = [
  "miette",
  "mwlc",
+ "serde_json",
  "tempfile",
  "tinymcf",
 ]

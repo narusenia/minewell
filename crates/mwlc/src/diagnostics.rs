@@ -32,6 +32,17 @@ pub struct Problem {
     span: SourceSpan,
 }
 
+impl Problem {
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Where it is, as a byte range into the source that was compiled.
+    pub fn range(&self) -> (usize, usize) {
+        (self.span.offset(), self.span.len())
+    }
+}
+
 impl Report {
     fn summary(&self) -> String {
         match self.problems.len() {
