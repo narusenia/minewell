@@ -1,6 +1,6 @@
 # 引き継ぎ
 
-2026-09-02 時点。**101 / 101 タスク完了、テスト 661、コミット 130。**
+2026-09-02 時点。**103 / 105 タスク完了。**
 v1（M0〜M9・横断）、M10（座標とブロック）、M11（ブロック状態・`pub`・LSP）すべて完了。
 
 **公開済み:**
@@ -12,9 +12,9 @@ v1（M0〜M9・横断）、M10（座標とブロック）、M11（ブロック�
 
 手をつけるならこのあたり:
 
-1. **LSP の補完とホバー（M12）** ← **次はここ。** `docs/03-plan.md` の M12 に
-   分解と「触る前に知っておくこと」を書いてある。エディタ側は何も要らない
-   （capabilities を足せば 3 つとも勝手に使う）
+1. **LSP の名前補完と型ホバー（M12-2・M12-3）** ← **次はここ。**
+   M12-1（コマンドの補完とホバー）は入った。残りは **HIR に span を足す**方針で確定
+   （`hir::Local` に `span`、`FnLowering` にスコープの範囲）
 2. **`text!` のイベント** — toolchain がクリック/ホバーの JSON 形を持てるようになってから
 3. **`in`（次元）と `if predicate`** — tinymcf SPEC §4.4 の「まだ保留」に残っている分
 4. **`mod` / `use`** — `pub` は入ったが、可視性ではなく「外から呼ばれうる」の意味だけ
@@ -71,7 +71,7 @@ toolchain 由来のコマンド呼び出し / `#[tick]`・`#[load]` タグ / `da
 `struct`・フィールド読み書き・`#[nbt(...)]`・`enum`・`match` /
 `Vec<T>`・`for x in vec`・ジェネリクス（単相化）・`impl` の固有メソッド・`&`/`&mut` /
 `positioned`・`^` ローカル座標・`block(..)`・ブロック状態・`#[block]` のブロック NBT /
-`pub fn` / `mwl lsp` の診断 /
+`pub fn` / `mwl lsp` の診断・コマンドの補完・コマンドのホバー /
 `raw!` の補間・`text!`・`#[test]` と `mwl test` / `target/cost.txt` /
 CLI（`new`・`check`・`build`・`test`・`install`・`toolchain list|add|install`）/
 エディタのハイライト（tree-sitter と TextMate）。
@@ -111,7 +111,7 @@ M8 で足したもの:
 
 動かないもの: `enum` のジェネリクス・`text!` のイベント（`.on_click` / `.on_hover` /
 `translate!`）・コマンド引数への実行時値（`raw!` の補間が逃げ道）・
-次元（`in`）と `if predicate`・`mod` / `use`・LSP の定義ジャンプと補完。
+次元（`in`）と `if predicate`・`mod` / `use`・LSP の定義ジャンプと、名前の補完・型のホバー。
 
 **意図して入れていないもの**（診断が理由を言う）:
 `struct`/`enum` を関数の戻り値にすること（バニラの戻り値は整数 1 つ）、
@@ -308,33 +308,29 @@ compound どうしの `==`、タプル型バリアント（`V(i32)`）、
 
 ---
 
-## 次の作業: M12（LSP の補完とホバー）
+## 次の作業: M12-2・M12-3（名前の補完と型のホバー）
 
-**`crates/mwl/src/lsp.rs` は診断だけ。** capabilities は `textDocumentSync` のみで、
-`textDocument/completion` と `textDocument/hover` は未実装。
+**M12-1 は完了。** `crates/mwl/src/lsp.rs` が `completionProvider` と `hoverProvider` を
+申告し、コマンドの補完（前方一致）とホバー（2 つの綴り）を答える。
+`offset()`（Position → byte offset、UTF-16 単位）と `word()`（カーソル下の語、字句）、
+`Server.documents`（開いている文書の本文）はそこで入った。
 
 ### いちばん重要な事実
 
 **`hir::Local` に span が無い**（`id` / `name` / `ty` / `mutable` だけ）。
-`hir::Function` にもスコープの範囲が無い。だから
-
-- **コマンドの補完とホバーは今日できる** — `schema::Signature` が `parts`（木の順の
-  リテラルと引数）と `params` を持っているので、コンパイラを触らずに綴りを組み立てられる。
-  しかも「覚えていられない部分」がそこなので、**効果も一番大きい**
-- **名前と型のホバーは HIR に span を足すか、字句で近似するかの選択**になる。
-  先にどちらかを決めること（M12-2 に 2 案を書いた）
+`hir::Function` にもスコープの範囲が無い。**選択肢は決まっていて、span を足す方**
+（字句近似は型を出せず、M12-3 で捨てることになる）。
 
 ### 手を入れる場所
 
 | やること | どこ |
 |---|---|
-| capabilities | `lsp.rs` の `"initialize"` の返り値 |
-| リクエストの処理 | `serve()` の `match method` に arm を足す |
-| Position → byte offset | **まだ無い。** `position()` の逆を書く（UTF-16 単位に注意） |
-| カーソル下の語 | 字句で足りる（`[A-Za-z_][A-Za-z0-9_]*` を左右に伸ばす） |
-| コマンド表 | `Server::project()` が `Schema` を返してキャッシュしている |
+| `Local` に span | `crates/mwlc/src/hir/mod.rs`。生成元は `syntax::ast` の `Let` |
+| スコープの範囲 | `FnLowering` が「この span の範囲でこの束縛が見える」を記録する |
+| span → 型の索引 | HIR に足す。返すのは**「span と型の対」まで** |
 | 型の綴り | `Types::name_of(ty)` がもうやる |
-| テスト | `crates/mwl/tests/lsp.rs`（バイナリを起動してパイプで喋らせる） |
+| リクエストの処理 | `serve()` の `match method`。補完とホバーの arm はもうある |
+| テスト | `crates/mwl/tests/lsp.rs`（`examples/arena` を開いて位置を訊く形が入っている） |
 
 ### 守ること
 
@@ -343,6 +339,8 @@ compound どうしの `==`、タプル型バリアント（`V(i32)`）、
 - **`mwlc` を LSP のことから自由に保つ。** span → 型の索引を足すなら、返すのは
   「span と型の対」まで。`Position` / `Range` は `mwl` 側で組む
 - **リクエストには必ず答える。** 答えないとクライアントが待ち続ける
+- **ホバーは呼び出し形とバニラの綴りの両方を出す**（M12-1 でそうした）。
+  型のホバーも「minewell の型名」で答える。バニラの NBT タグ名ではない
 
 ---
 

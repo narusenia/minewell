@@ -2,9 +2,11 @@
 
 //! A language server, as small as one can be and still be worth running.
 //!
-//! Diagnostics only. `mwlc` already answers with problems and spans, so the server is
-//! a loop: read a document, compile it, write the problems back. Definition jumps and
-//! completion come after (requirements section 19).
+//! Diagnostics, plus completion and hover for the commands. `mwlc` already answers
+//! with problems and spans, so the diagnostics half is a loop: read a document, compile
+//! it, write the problems back. The other half is the toolchain's command table
+//! reformatted — which is the part nobody can hold in their head, and it costs the
+//! compiler nothing. Names, types and definition jumps come after.
 //!
 //! The wire format is `Content-Length` framing around JSON-RPC, which is little enough
 //! to write out. A compiler is a strange place to grow an async runtime, and the same
@@ -16,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use mwlc::driver;
 use mwlc::emit::{Options, Profile, Source};
-use mwlc::schema::Schema;
+use mwlc::schema::{Part, Schema, Signature};
 use mwlc::toolchain::Toolchains;
 use serde_json::{Value, json};
 
@@ -47,6 +49,8 @@ pub fn serve() -> io::Result<()> {
                                 // compiler is fast, so there is nothing to gain from
                                 // tracking edits.
                                 "textDocumentSync": 1,
+                                "completionProvider": {},
+                                "hoverProvider": true,
                             },
                             "serverInfo": { "name": "mwl", "version": env!("CARGO_PKG_VERSION") },
                         }),
@@ -66,6 +70,19 @@ pub fn serve() -> io::Result<()> {
                 if let Some(text) = params.get("text") {
                     server.publish(&mut output, &params["textDocument"]["uri"], text)?;
                 }
+            }
+            "textDocument/didClose" => {
+                if let Some(uri) = params["textDocument"]["uri"].as_str() {
+                    server.documents.remove(uri);
+                }
+            }
+            "textDocument/completion" => {
+                let completions = server.complete(&params);
+                write(&mut output, &reply(id, completions))?;
+            }
+            "textDocument/hover" => {
+                let hover = server.hover(&params);
+                write(&mut output, &reply(id, hover))?;
             }
             "shutdown" => write(&mut output, &reply(id, Value::Null))?,
             "exit" => return Ok(()),
@@ -90,6 +107,9 @@ struct Server {
     /// Command tables, by version. Reading one is a few hundred kilobytes of JSON, and
     /// a keystroke should not pay for that twice.
     toolchains: HashMap<String, Option<Schema>>,
+    /// The text of every open document. Completion and hover ask about a position, and
+    /// a position means nothing without the text it points into.
+    documents: HashMap<String, String>,
 }
 
 impl Server {
@@ -97,6 +117,7 @@ impl Server {
         let (Some(uri), Some(text)) = (uri.as_str(), text.as_str()) else {
             return Ok(());
         };
+        self.documents.insert(uri.to_owned(), text.to_owned());
         let path = path_of(uri);
         let diagnostics = self.diagnose(path.as_deref(), text);
         write(
@@ -140,6 +161,63 @@ impl Server {
                 })
             })
             .collect()
+    }
+
+    /// The document a request points into, and where in it.
+    fn spot(&self, params: &Value) -> Option<(Option<PathBuf>, String, usize)> {
+        let uri = params["textDocument"]["uri"].as_str()?;
+        // Cloned because answering needs the command table too, and that is behind
+        // `&mut self`. A `.mwl` file is small.
+        let text = self.documents.get(uri)?.clone();
+        let at = offset(&text, &params["position"]);
+        Some((path_of(uri), text, at))
+    }
+
+    /// The commands whose name starts with what has been typed.
+    ///
+    /// A client filters again on its own, but narrowing here is what makes the answer
+    /// worth reading: the table holds a few hundred commands.
+    fn complete(&mut self, params: &Value) -> Value {
+        let Some((path, text, at)) = self.spot(params) else {
+            return json!([]);
+        };
+        let (start, _) = word(&text, at);
+        let (_, Some(schema)) = self.project(path.as_deref()) else {
+            return json!([]);
+        };
+        let prefix = &text[start..at];
+        let items: Vec<Value> = schema
+            .commands
+            .values()
+            .filter(|signature| signature.name.starts_with(prefix))
+            .map(|signature| {
+                json!({
+                    "label": signature.name,
+                    // A function, as far as an editor is concerned.
+                    "kind": 3,
+                    "detail": spelling(signature),
+                })
+            })
+            .collect();
+        json!(items)
+    }
+
+    /// What the command under the cursor is, in both spellings.
+    fn hover(&mut self, params: &Value) -> Value {
+        let Some((path, text, at)) = self.spot(params) else {
+            return Value::Null;
+        };
+        let (start, end) = word(&text, at);
+        let (_, Some(schema)) = self.project(path.as_deref()) else {
+            return Value::Null;
+        };
+        let Some(signature) = schema.get(&text[start..end]) else {
+            return Value::Null;
+        };
+        json!({
+            "contents": { "kind": "markdown", "value": describe(signature) },
+            "range": { "start": position(&text, start), "end": position(&text, end) },
+        })
     }
 
     /// The namespace and command table the file belongs to, from the nearest
@@ -208,6 +286,78 @@ fn position(text: &str, offset: usize) -> Value {
     json!({ "line": line, "character": column.encode_utf16().count() })
 }
 
+/// How the command is called from minewell, and how vanilla wants it written.
+///
+/// Both, because they do not agree: the name is the literal path joined up, the
+/// arguments come in the order the tree puts them, and a literal can sit between two
+/// of them.
+fn describe(signature: &Signature) -> String {
+    let params: Vec<String> = signature
+        .params
+        .iter()
+        .map(|param| format!("{}: {}", param.name, param.ty.name()))
+        .collect();
+    format!(
+        "```mwl\n{}({})\n```\n---\n```mcfunction\n{}\n```",
+        signature.name,
+        params.join(", "),
+        spelling(signature)
+    )
+}
+
+/// `playsound <sound> master <targets>`.
+fn spelling(signature: &Signature) -> String {
+    signature
+        .parts
+        .iter()
+        .map(|part| match part {
+            Part::Literal(word) => word.clone(),
+            Part::Arg(index) => format!("<{}>", signature.params[*index].name),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// An LSP position as a byte offset: the inverse of `position`, counting the character
+/// as UTF-16 code units for the same reason.
+fn offset(text: &str, position: &Value) -> usize {
+    let line = position["line"].as_u64().unwrap_or(0) as usize;
+    let character = position["character"].as_u64().unwrap_or(0) as usize;
+    let mut start = 0;
+    for _ in 0..line {
+        match text[start..].find('\n') {
+            Some(index) => start += index + 1,
+            None => return text.len(),
+        }
+    }
+    let mut units = 0;
+    for (index, c) in text[start..].char_indices() {
+        if units >= character || c == '\n' {
+            return start + index;
+        }
+        units += c.len_utf16();
+    }
+    text.len()
+}
+
+/// The byte range of the word the offset sits in.
+///
+/// Lexical, and that is enough: a command name is one identifier, and asking the
+/// compiler where the cursor is would need spans HIR does not carry yet.
+fn word(text: &str, offset: usize) -> (usize, usize) {
+    let part = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let offset = offset.min(text.len());
+    let start = text[..offset]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !part(*c))
+        .map_or(0, |(index, c)| index + c.len_utf8());
+    let end = text[offset..]
+        .find(|c| !part(c))
+        .map_or(text.len(), |index| offset + index);
+    (start, end)
+}
+
 fn reply(id: Option<Value>, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
@@ -269,6 +419,48 @@ mod tests {
         assert_eq!(position["line"], 1);
         // `é` is two bytes and one UTF-16 unit, so the column is not the byte offset.
         assert_eq!(position["character"], 16);
+    }
+
+    #[test]
+    fn an_offset_undoes_a_position() {
+        let text = "fn main() {\n    let x = \"é\" + 1;\n}";
+        let at = text.find('+').expect("there is one");
+        assert_eq!(offset(text, &position(text, at)), at);
+        // Past the end of a line stops at the newline rather than running on.
+        assert_eq!(
+            offset(text, &json!({ "line": 0, "character": 99 })),
+            text.find('\n').expect("there is one")
+        );
+    }
+
+    #[test]
+    fn a_word_is_the_identifier_the_cursor_is_in() {
+        let text = "    play_sound(minecraft:stone, @a);";
+        let at = text.find("sound").expect("there");
+        let (start, end) = word(text, at);
+        assert_eq!(&text[start..end], "play_sound");
+        // Not in a word at all: an empty range, and so an empty prefix.
+        let space = word(text, 0);
+        assert_eq!(space.0, space.1);
+    }
+
+    #[test]
+    fn a_command_is_spelled_in_the_order_the_tree_gives() {
+        // A literal after an argument, which is the case the two name lists lose.
+        let schema = Schema::parse(
+            r#"{"type":"root","children":{"playsound":{"type":"literal","children":{
+                "sound":{"type":"argument","parser":"minecraft:resource_location","children":{
+                "master":{"type":"literal","children":{
+                "targets":{"type":"argument","parser":"minecraft:entity","executable":true}}}}}}}}}"#,
+        )
+        .expect("it parses");
+        let signature = schema.get("playsound_master").expect("present");
+        assert_eq!(spelling(signature), "playsound <sound> master <targets>");
+        let described = describe(signature);
+        assert!(
+            described.contains("playsound_master(sound: ResourceLocation, targets: selector)"),
+            "{described}"
+        );
     }
 
     #[test]
