@@ -102,6 +102,15 @@ fn asked(offset_of: &str, nudge: usize) -> Asked {
     let hover = serde_json::json!({
         "jsonrpc": "2.0", "id": 3, "method": "textDocument/hover", "params": &position,
     });
+    let hints = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "textDocument/inlayHint",
+        "params": {
+            "textDocument": { "uri": &uri },
+            "range": { "start": { "line": 0, "character": 0 }, "end": spot(&text, text.len()) },
+        },
+    });
 
     let mut input = server.stdin.take().expect("stdin");
     for message in [
@@ -109,6 +118,7 @@ fn asked(offset_of: &str, nudge: usize) -> Asked {
         &document.to_string(),
         &completion.to_string(),
         &hover.to_string(),
+        &hints.to_string(),
         r#"{"jsonrpc":"2.0","method":"exit"}"#,
     ] {
         input.write_all(framed(message).as_bytes()).expect("write");
@@ -120,13 +130,19 @@ fn asked(offset_of: &str, nudge: usize) -> Asked {
     read(&mut out); // the diagnostics for the document
     let completed = read(&mut out);
     let hovered = read(&mut out);
+    let hinted = read(&mut out);
     server.wait().expect("the server exits");
-    Asked { completed, hovered }
+    Asked {
+        completed,
+        hovered,
+        hinted,
+    }
 }
 
 struct Asked {
     completed: String,
     hovered: String,
+    hinted: String,
 }
 
 #[test]
@@ -180,6 +196,15 @@ fn hovering_a_function_gives_its_signature() {
         hovered.contains("fn area(r: fix<1000>) -> fix<1000>"),
         "{hovered}"
     );
+}
+
+#[test]
+fn an_inferred_binding_gets_an_inlay_hint_and_a_written_one_does_not() {
+    let hinted = asked("fn tick()", 3).hinted;
+    // `let size = area(...)` says nothing about its own type.
+    assert!(hinted.contains(r#""label":": fix<1000>""#), "{hinted}");
+    // `let arena: Arena = ...` already says it; repeating it is noise.
+    assert!(!hinted.contains(r#""label":": Arena""#), "{hinted}");
 }
 
 #[test]

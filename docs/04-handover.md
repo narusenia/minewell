@@ -1,6 +1,6 @@
 # 引き継ぎ
 
-2026-09-02 時点。**103 / 105 タスク完了。**
+2026-09-02 時点。**106 / 107 タスク完了。**
 v1（M0〜M9・横断）、M10（座標とブロック）、M11（ブロック状態・`pub`・LSP）すべて完了。
 
 **公開済み:**
@@ -12,9 +12,8 @@ v1（M0〜M9・横断）、M10（座標とブロック）、M11（ブロック�
 
 手をつけるならこのあたり:
 
-1. **LSP の名前補完と型ホバー（M12-2・M12-3）** ← **次はここ。**
-   M12-1（コマンドの補完とホバー）は入った。残りは **HIR に span を足す**方針で確定
-   （`hir::Local` に `span`、`FnLowering` にスコープの範囲）
+1. **LSP の定義ジャンプ** — M12 の残り 1 つで、計画にはまだ書いていない。
+   `Hir.symbols` が宣言の span を持つので、足すのは**使用側の span** だけ
 2. **`text!` のイベント** — toolchain がクリック/ホバーの JSON 形を持てるようになってから
 3. **`in`（次元）と `if predicate`** — tinymcf SPEC §4.4 の「まだ保留」に残っている分
 4. **`mod` / `use`** — `pub` は入ったが、可視性ではなく「外から呼ばれうる」の意味だけ
@@ -71,7 +70,8 @@ toolchain 由来のコマンド呼び出し / `#[tick]`・`#[load]` タグ / `da
 `struct`・フィールド読み書き・`#[nbt(...)]`・`enum`・`match` /
 `Vec<T>`・`for x in vec`・ジェネリクス（単相化）・`impl` の固有メソッド・`&`/`&mut` /
 `positioned`・`^` ローカル座標・`block(..)`・ブロック状態・`#[block]` のブロック NBT /
-`pub fn` / `mwl lsp` の診断・コマンドの補完・コマンドのホバー /
+`pub fn` / `mwl lsp` の診断・補完（コマンドとスコープ内の名前）・
+ホバー（コマンドの綴りと型）・inlay hint（推論した型）/
 `raw!` の補間・`text!`・`#[test]` と `mwl test` / `target/cost.txt` /
 CLI（`new`・`check`・`build`・`test`・`install`・`toolchain list|add|install`）/
 エディタのハイライト（tree-sitter と TextMate）。
@@ -111,7 +111,7 @@ M8 で足したもの:
 
 動かないもの: `enum` のジェネリクス・`text!` のイベント（`.on_click` / `.on_hover` /
 `translate!`）・コマンド引数への実行時値（`raw!` の補間が逃げ道）・
-次元（`in`）と `if predicate`・`mod` / `use`・LSP の定義ジャンプと、名前の補完・型のホバー。
+次元（`in`）と `if predicate`・`mod` / `use`・LSP の定義ジャンプ。
 
 **意図して入れていないもの**（診断が理由を言う）:
 `struct`/`enum` を関数の戻り値にすること（バニラの戻り値は整数 1 つ）、
@@ -308,39 +308,27 @@ compound どうしの `==`、タプル型バリアント（`V(i32)`）、
 
 ---
 
-## 次の作業: M12-2・M12-3（名前の補完と型のホバー）
+## M12（LSP の補完・ホバー・inlay hint、完了）
 
-**M12-1 は完了。** `crates/mwl/src/lsp.rs` が `completionProvider` と `hoverProvider` を
-申告し、コマンドの補完（前方一致）とホバー（2 つの綴り）を答える。
-`offset()`（Position → byte offset、UTF-16 単位）と `word()`（カーソル下の語、字句）、
-`Server.documents`（開いている文書の本文）はそこで入った。
+`crates/mwl/src/lsp.rs` が診断・補完・ホバー・inlay hint を答える。**依存は `serde_json`
+だけ**で、プロトコルは手書きのまま。**エディタ側は 3 つとも無変更**（capabilities を
+足せばそのまま使う）。
 
-### いちばん重要な事実
+- **索引は `Hir.symbols`**（`Symbol { span, scope, name, ty, kind }`）。**`ty` は綴った
+  文字列**なので、読む側は `Types` を知らなくてよい。入口は `driver::symbols()` —
+  `compile_with` と別なのは、**打ちかけのファイルでも答えが要る**から（エラーは捨てる）
+- **スコープの範囲は `Scope { names, span }` が持つ。** push する側が span を渡さないと
+  コンパイルが通らないので、定義とあとから食い違わない
+- **`SymbolKind` が inlay hint の可否を決める。** `Inferred`（型がどこにも書いていない）
+  だけに出す。注釈付き `let` と引数は `Declared` で、出すと雑音になる
+- **`match` の腕の束縛だけ span が腕の本体のもの。** 腕の `bindings` が名前と型しか
+  持たないため。スコープには入るが、ヒントを吊る位置が無い
+- **ホバーは名前を先に見る。** コマンドと同名の束縛があれば束縛が勝つ
+- **単相化で同じ `let` が何度も来る**ので span で dedup し、最初を採る
+- **リクエストには必ず答える**（答えないとクライアントが待ち続ける）。
+  ここに async ランタイムを足さない
 
-**`hir::Local` に span が無い**（`id` / `name` / `ty` / `mutable` だけ）。
-`hir::Function` にもスコープの範囲が無い。**選択肢は決まっていて、span を足す方**
-（字句近似は型を出せず、M12-3 で捨てることになる）。
-
-### 手を入れる場所
-
-| やること | どこ |
-|---|---|
-| `Local` に span | `crates/mwlc/src/hir/mod.rs`。生成元は `syntax::ast` の `Let` |
-| スコープの範囲 | `FnLowering` が「この span の範囲でこの束縛が見える」を記録する |
-| span → 型の索引 | HIR に足す。返すのは**「span と型の対」まで** |
-| 型の綴り | `Types::name_of(ty)` がもうやる |
-| リクエストの処理 | `serve()` の `match method`。補完とホバーの arm はもうある |
-| テスト | `crates/mwl/tests/lsp.rs`（`examples/arena` を開いて位置を訊く形が入っている） |
-
-### 守ること
-
-- **依存を増やさない。** プロトコルは手書きで、`serde_json` だけ。
-  ここに async ランタイムを足さない（`toolchain install` で TLS を足さなかったのと同じ）
-- **`mwlc` を LSP のことから自由に保つ。** span → 型の索引を足すなら、返すのは
-  「span と型の対」まで。`Position` / `Range` は `mwl` 側で組む
-- **リクエストには必ず答える。** 答えないとクライアントが待ち続ける
-- **ホバーは呼び出し形とバニラの綴りの両方を出す**（M12-1 でそうした）。
-  型のホバーも「minewell の型名」で答える。バニラの NBT タグ名ではない
+**残っているのは定義ジャンプだけ。** 宣言の span はあり、使用側の span が無い。
 
 ---
 

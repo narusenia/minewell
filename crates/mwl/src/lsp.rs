@@ -2,7 +2,7 @@
 
 //! A language server, as small as one can be and still be worth running.
 //!
-//! Diagnostics, plus completion and hover. `mwlc` already answers
+//! Diagnostics, plus completion, hover and inlay hints. `mwlc` already answers
 //! with problems and spans, so the diagnostics half is a loop: read a document, compile
 //! it, write the problems back. The other half is the toolchain's command table
 //! reformatted — which is the part nobody can hold in their head, and it costs the
@@ -54,6 +54,7 @@ pub fn serve() -> io::Result<()> {
                                 "textDocumentSync": 1,
                                 "completionProvider": {},
                                 "hoverProvider": true,
+                                "inlayHintProvider": true,
                             },
                             "serverInfo": { "name": "mwl", "version": env!("CARGO_PKG_VERSION") },
                         }),
@@ -86,6 +87,10 @@ pub fn serve() -> io::Result<()> {
             "textDocument/hover" => {
                 let hover = server.hover(&params);
                 write(&mut output, &reply(id, hover))?;
+            }
+            "textDocument/inlayHint" => {
+                let hints = server.hints(&params);
+                write(&mut output, &reply(id, hints))?;
             }
             "shutdown" => write(&mut output, &reply(id, Value::Null))?,
             "exit" => return Ok(()),
@@ -245,6 +250,38 @@ impl Server {
             (None, None) => return Value::Null,
         };
         json!({ "contents": { "kind": "markdown", "value": value }, "range": range })
+    }
+
+    /// The types the source does not write, shown where they would go.
+    ///
+    /// Only the inferred bindings: repeating a type the reader already wrote is noise,
+    /// which is why `SymbolKind` tells the two apart.
+    fn hints(&mut self, params: &Value) -> Value {
+        let Some((path, text, _)) = self.spot(params) else {
+            return json!([]);
+        };
+        let from = offset(&text, &params["range"]["start"]);
+        let to = offset(&text, &params["range"]["end"]);
+        let (namespace, schema) = self.project(path.as_deref());
+        let hints: Vec<Value> = driver::symbols(&text, &namespace, schema.as_ref())
+            .into_iter()
+            .filter(|symbol| {
+                symbol.kind == SymbolKind::Inferred
+                    && symbol.span.start >= from
+                    && symbol.span.end <= to
+            })
+            .map(|symbol| {
+                json!({
+                    "position": position(&text, symbol.span.end),
+                    "label": format!(": {}", symbol.ty),
+                    // A type, which an editor may style differently from a parameter
+                    // name.
+                    "kind": 1,
+                    "paddingLeft": false,
+                })
+            })
+            .collect();
+        json!(hints)
     }
 
     /// The namespace and command table the file belongs to, from the nearest
