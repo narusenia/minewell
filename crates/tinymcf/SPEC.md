@@ -364,10 +364,17 @@ The world holds a block wherever something put one; everywhere else is air. A bl
 that is not there makes the condition **false rather than an error**, the same way an
 unset score does. `stone` and `minecraft:stone` are the same block.
 
+**Block states match partially** (M11): `chest[facing=north]` asks about `facing` and
+nothing else, so a chest that is also `waterlogged=false` still matches. That is what
+vanilla does — the argument is a predicate, not a value. Which states a block really
+has is registry data, and there is no registry here (§1), so whatever was written is
+what is stored.
+
 The harness lays a world out, and `setblock` puts blocks down too (§4.6):
 
 ```rust
 world.place([0, 64, 5], "stone");
+world.place([0, 64, 6], "chest[facing=north]");
 ```
 
 A position falls into the block it is inside — vanilla floors, so `0.5 64.9 0.5` is the
@@ -413,9 +420,9 @@ else inserts its SNBT.
 
 **`setblock` is the exception: it is applied as well as recorded** (M10-2). Without it
 `if block` could only ever see what the harness laid out, and a pack could not test
-what it built. Only the plain `<x> <y> <z> <block>` shape is applied; block states and
-the `destroy`/`keep` modes are recorded and not applied, because guessing at a shape
-nothing has asked for is worse than not knowing.
+what it built. The `<x> <y> <z> <block>` shape is applied, block states included; NBT in the command
+and the `destroy`/`keep` modes are recorded and not applied, because guessing at a
+shape nothing has asked for is worse than not knowing.
 
 `say`, `tellraw`, `setblock`, `summon`, `kill` and the like are **not** simulated. Each
 is appended to an ordered log as `(name, arguments)`, with the arguments exactly as

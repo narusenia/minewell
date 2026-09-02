@@ -143,6 +143,11 @@ SEG      := (letter | digit | "_" | "." | "-")+
 （`minecraft:block.note_block.pling` は 1 つの音声 ID）。リソースロケーションに
 フィールドは無いので、直後の `.` がフィールドアクセスと衝突することもない。
 
+リソースロケーションの後ろには**ブロック状態**が続けられる（M11）:
+`minecraft:chest[facing=north]` は 1 トークンで、中身は括弧の対応が取れた列として
+そのまま保持する（セレクタと同じ扱い。§2.7）。**リソースロケーションは添字を取らない**ので、
+直後の `[` が索引と衝突することはない。
+
 **`:` の両側に空白を書けない。** これが型注釈の `:` と区別する唯一の規則
 （要件定義 §10.2）。`minecraft:stone` は 1 トークン、`x: i32` は 3 トークン、
 `x:i32` は……**リソースロケーションとして字句解析される。**
@@ -2260,8 +2265,13 @@ execute positioned 0 64 0 run execute if block ~ ~-1 ~ minecraft:stone run say g
 - **それ自体が条件。** `if` の中ではレジスタを経由しない（`execute if data` と同じ判断。
   [§6.27](#627-string--確定m8)）。`!` は `unless` になる
 - 値として受けたいときは `execute store success score <dst> if block …` で 1 コマンド
-- **無いブロックは偽**（[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §4.4）。
-  ブロック状態（`minecraft:chest[facing=north]`）はまだ書けない
+- **無いブロックは偽**（[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §4.4）
+- **ブロック状態は述語で、部分一致**（M11）。`minecraft:chest[facing=north]` は
+  `facing` だけを問い、書かなかった状態は問わない。バニラがそうだから
+  — これは値ではなく述語で、「北を向いた chest」は「chest であって facing が north」
+  という意味しか持たない
+- 状態は字句の側で 1 トークンに収まる（§2.8）ので、**HIR より下は何も変わらない**。
+  `ExprKind::Resource` の文字列が長くなるだけ
 
 ---
 

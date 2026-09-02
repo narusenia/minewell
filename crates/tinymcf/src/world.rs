@@ -34,16 +34,61 @@ pub struct Entity {
     pub nbt: NbtValue,
 }
 
-/// A block, as much of one as anything needs: what it is, and its NBT.
+/// A block, as much of one as anything needs: what it is, what state it is in, and
+/// its NBT.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
     pub id: String,
+    /// `facing=north`, `waterlogged=false`. Whatever was written; nothing here knows
+    /// which states a block actually has.
+    pub states: BTreeMap<String, String>,
     pub nbt: NbtValue,
+}
+
+impl Block {
+    /// Whether this block answers to a predicate like `chest[facing=north]`.
+    ///
+    /// **Vanilla matches partially**: the states written have to agree, and the ones
+    /// left out are not asked about. It is a predicate, not a value.
+    pub fn matches(&self, predicate: &str) -> bool {
+        let (id, states) = split_block(predicate);
+        self.id == id
+            && states
+                .iter()
+                .all(|(key, want)| self.states.get(key) == Some(want))
+    }
+}
+
+/// `minecraft:chest[facing=north]` into its id and its states.
+///
+/// Nothing here validates the states: which ones a block has is registry data, and the
+/// interpreter has no registry (§1).
+pub fn split_block(spec: &str) -> (String, BTreeMap<String, String>) {
+    let (id, rest) = match spec.split_once('[') {
+        Some((id, rest)) => (id, rest.trim_end_matches(']')),
+        None => (spec, ""),
+    };
+    let states = rest
+        .split(',')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
+        .collect();
+    (block_id(id.trim()), states)
 }
 
 /// The block a position is inside. Vanilla floors, so `~-0.5` is the block below.
 pub fn block_pos(pos: [f64; 3]) -> [i64; 3] {
     pos.map(|n| n.floor() as i64)
+}
+
+/// `stone` and `minecraft:stone` are the same block.
+fn new_block(spec: &str) -> Block {
+    let (id, states) = split_block(spec);
+    Block {
+        id,
+        states,
+        nbt: NbtValue::Compound(Default::default()),
+    }
 }
 
 /// `stone` and `minecraft:stone` are the same block.
@@ -57,22 +102,13 @@ pub fn block_id(id: &str) -> String {
 impl World {
     /// Puts a block down. The harness uses this to lay out a world; `setblock` uses it
     /// too, so a pack can see what it built (`SPEC.md` section 4.6).
-    pub fn set_block(&mut self, pos: [i64; 3], id: &str) -> &mut Block {
-        self.blocks.entry(pos).or_insert(Block {
-            id: block_id(id),
-            nbt: NbtValue::Compound(Default::default()),
-        })
+    pub fn set_block(&mut self, pos: [i64; 3], spec: &str) -> &mut Block {
+        self.blocks.entry(pos).or_insert_with(|| new_block(spec))
     }
 
-    /// Replaces whatever was there.
-    pub fn place(&mut self, pos: [i64; 3], id: &str) {
-        self.blocks.insert(
-            pos,
-            Block {
-                id: block_id(id),
-                nbt: NbtValue::Compound(Default::default()),
-            },
-        );
+    /// Replaces whatever was there. `spec` may carry states: `chest[facing=north]`.
+    pub fn place(&mut self, pos: [i64; 3], spec: &str) {
+        self.blocks.insert(pos, new_block(spec));
     }
 
     pub fn block(&self, pos: [i64; 3]) -> Option<&Block> {
@@ -273,5 +309,35 @@ mod tests {
         let mut w = World::default();
         *w.storage_mut("a:mw") = NbtValue::compound([("x", NbtValue::Int(1))]);
         assert_eq!(w.storage("b:mw"), &NbtValue::Compound(Default::default()));
+    }
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+
+    #[test]
+    fn a_predicate_matches_partially() {
+        // Vanilla asks about the states written and nothing else: it is a predicate,
+        // not a value.
+        let mut world = World::default();
+        world.place([0, 0, 0], "chest[facing=north,waterlogged=false]");
+        let block = world.block([0, 0, 0]).expect("placed");
+        assert!(block.matches("minecraft:chest"));
+        assert!(block.matches("chest[facing=north]"));
+        assert!(!block.matches("minecraft:chest[facing=south]"));
+        assert!(!block.matches("minecraft:barrel"));
+    }
+
+    #[test]
+    fn asking_for_a_state_a_block_does_not_have_finds_nothing() {
+        let mut world = World::default();
+        world.place([0, 0, 0], "chest");
+        assert!(
+            !world
+                .block([0, 0, 0])
+                .expect("placed")
+                .matches("chest[facing=north]")
+        );
     }
 }

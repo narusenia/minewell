@@ -337,6 +337,12 @@ impl<'a> Lexer<'a> {
             self.at += 1;
             self.take_while(is_resource_path);
         }
+        // `minecraft:chest[facing=north]` is one token, the way a selector is
+        // (spec section 2.8). A resource location is never indexed, so a `[` here
+        // cannot be anything else.
+        if self.rest().starts_with('[') {
+            self.balanced();
+        }
     }
 
     fn selector(&mut self, start: usize) -> Option<TokenKind> {

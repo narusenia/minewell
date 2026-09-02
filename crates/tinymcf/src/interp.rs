@@ -612,7 +612,9 @@ impl Interpreter {
         let Ok(id) = args.word() else {
             return;
         };
-        if id.contains('[') || id.contains('{') {
+        // States are kept; NBT in the command is not, because nothing has asked for
+        // it and guessing at the shape would be worse than not knowing.
+        if id.contains('{') {
             return;
         }
         let pos = crate::world::block_pos(at.resolve(self.context.pos, self.context.rot));
@@ -632,12 +634,7 @@ impl Interpreter {
             // unset score does.
             Condition::Block { at, id } => {
                 let pos = crate::world::block_pos(at.resolve(self.context.pos, self.context.rot));
-                let wanted = crate::world::block_id(id);
-                Some(
-                    self.world
-                        .block(pos)
-                        .is_some_and(|block| block.id == wanted),
-                )
+                Some(self.world.block(pos).is_some_and(|block| block.matches(id)))
             }
             // An unset score makes the condition false rather than an error, so
             // `if score` never needs the holder to exist first.

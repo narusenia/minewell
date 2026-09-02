@@ -2883,3 +2883,78 @@ fn a_block_that_could_not_be_inlined_leaves_no_registers_behind() {
     mc.call("test:main");
     assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
 }
+
+/// Block states (spec section 6.39).
+mod block_states {
+    use super::harness::{NS, load};
+
+    fn ask(placed: &str, predicate: &str) -> bool {
+        let src = format!(
+            r#"#[load] fn main() {{
+                 positioned pos!(0 64 0) {{
+                   if block(pos!(~ ~ ~), {predicate}) {{ raw!("say yes"); }}
+                 }}
+               }}"#
+        );
+        let mut mc = load(&src);
+        mc.world.place([0, 64, 0], placed);
+        mc.call(&format!("{NS}:main"));
+        assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
+        !mc.effects.is_empty()
+    }
+
+    #[test]
+    fn a_state_that_is_asked_about_has_to_agree() {
+        assert!(ask("chest[facing=north]", "minecraft:chest[facing=north]"));
+        assert!(!ask("chest[facing=south]", "minecraft:chest[facing=north]"));
+    }
+
+    #[test]
+    fn a_state_that_is_not_asked_about_is_not_asked_about() {
+        // Vanilla matches partially: it is a predicate, not a value.
+        assert!(ask(
+            "chest[facing=north,waterlogged=false]",
+            "minecraft:chest"
+        ));
+        assert!(ask(
+            "chest[facing=north,waterlogged=false]",
+            "minecraft:chest[facing=north]"
+        ));
+    }
+
+    #[test]
+    fn asking_for_a_state_a_block_does_not_have_finds_nothing() {
+        assert!(!ask("chest", "minecraft:chest[facing=north]"));
+    }
+
+    #[test]
+    fn several_states_all_have_to_agree() {
+        assert!(ask(
+            "chest[facing=north,waterlogged=true]",
+            "minecraft:chest[facing=north,waterlogged=true]"
+        ));
+        assert!(!ask(
+            "chest[facing=north,waterlogged=false]",
+            "minecraft:chest[facing=north,waterlogged=true]"
+        ));
+    }
+
+    #[test]
+    fn a_pack_can_set_a_state_and_see_it() {
+        let mut mc = load(
+            r#"#[load] fn main() {
+                 positioned pos!(0 64 0) {
+                   raw!("setblock ~ ~ ~ minecraft:chest[facing=north]");
+                   if block(pos!(~ ~ ~), minecraft:chest[facing=north]) { raw!("say yes"); }
+                 }
+               }"#,
+        );
+        mc.call(&format!("{NS}:main"));
+        assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
+        assert!(
+            mc.effects.iter().any(|e| e.args == "yes"),
+            "{:?}",
+            mc.effects
+        );
+    }
+}
