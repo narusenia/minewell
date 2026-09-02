@@ -2677,3 +2677,53 @@ mod nbt_arguments {
         assert!(mwlc::driver::compile(src, "test", &options).is_err());
     }
 }
+
+/// `positioned` (spec section 6.38).
+mod positioned {
+    use super::harness::{NS, load};
+
+    #[test]
+    fn the_body_runs_where_the_coordinates_say() {
+        let mut mc = load(
+            r#"#[ctx(position)] fn mark() { raw!("say here"); }
+               #[load] fn main() { positioned pos!(3 64 5) { mark(); } }"#,
+        );
+        mc.call(&format!("{NS}:main"));
+        assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
+        assert_eq!(mc.effects.len(), 1);
+        assert_eq!(mc.effects[0].position, [3.0, 64.0, 5.0]);
+    }
+
+    #[test]
+    fn it_provides_a_position_and_nothing_else() {
+        // A position satisfies `#[ctx(position)]`; an executor is still missing.
+        let src = r#"#[ctx(entity)] fn hurt() {}
+                     #[load] fn main() { positioned pos!(~ ~1 ~) { hurt(); } }"#;
+        let options = mwlc::emit::Options::default();
+        assert!(mwlc::driver::compile(src, NS, &options).is_err());
+    }
+
+    #[test]
+    fn offsets_are_relative_to_where_it_already_is() {
+        let mut mc = load(
+            r#"#[load] fn main() { positioned pos!(1 2 3) { positioned pos!(~ ~1 ~) { raw!("say a"); } } }"#,
+        );
+        mc.call(&format!("{NS}:main"));
+        assert_eq!(mc.effects[0].position, [1.0, 3.0, 3.0]);
+    }
+
+    #[test]
+    fn a_single_command_needs_no_function_of_its_own() {
+        let mut mc = load(r#"#[load] fn main() { positioned pos!(~ ~1 ~) { raw!("say a"); } }"#);
+        mc.call(&format!("{NS}:main"));
+        // `execute positioned ~ ~1 ~ run say a` is two commands, not three.
+        assert_eq!(mc.commands_run, 2);
+    }
+
+    #[test]
+    fn coordinates_are_what_it_takes() {
+        let src = r#"#[load] fn main() { positioned @s { raw!("say a"); } }"#;
+        let options = mwlc::emit::Options::default();
+        assert!(mwlc::driver::compile(src, NS, &options).is_err());
+    }
+}

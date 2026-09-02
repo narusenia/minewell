@@ -203,9 +203,15 @@ module.exports = grammar({
         $.block,
       ),
 
-    // `as @s { .. }` and `at @s { .. }` (spec section 6.15).
+    // `as @s { .. }`, `at @s { .. }` and `positioned pos!(..) { .. }`
+    // (spec sections 6.15 and 6.38).
     context_statement: ($) =>
-      seq(repeat($.attribute), choice('as', 'at'), field('selector', $._expression), $.block),
+      seq(
+        repeat($.attribute),
+        choice('as', 'at', 'positioned'),
+        field('selector', $._expression),
+        $.block,
+      ),
 
     match_statement: ($) =>
       seq('match', field('value', $._expression), '{', repeat($.match_arm), '}'),

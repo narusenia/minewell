@@ -195,7 +195,10 @@ fn per_entity(inst: &Inst) -> bool {
 
 /// Whether a selector can find more than one entity.
 fn many(clause: &ExecuteAs) -> bool {
-    let (ExecuteAs::As(selector) | ExecuteAs::At(selector)) = clause;
+    // Coordinates are one place, so the body runs once.
+    let (ExecuteAs::As(selector) | ExecuteAs::At(selector)) = clause else {
+        return false;
+    };
     let head = selector.split('[').next().unwrap_or(selector);
     if matches!(head, "@s" | "@p" | "@r") {
         return false;

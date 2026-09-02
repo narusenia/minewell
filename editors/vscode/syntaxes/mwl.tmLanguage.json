@@ -66,7 +66,7 @@
         {
           "comment": "as and at are execution contexts here, not casts",
           "name": "keyword.other.context.mwl",
-          "match": "\\b(as|at)\\b"
+          "match": "\\b(as|at|positioned)\\b"
         },
         {
           "name": "storage.type.mwl",

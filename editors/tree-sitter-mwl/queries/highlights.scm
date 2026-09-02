@@ -26,7 +26,7 @@
 "return" @keyword.return
 
 ; Execution context, which is the language's own idea (spec section 6.15).
-[ "as" "at" ] @keyword.modifier
+[ "as" "at" "positioned" ] @keyword.modifier
 
 [ "Some" "None" ] @constant.builtin
 

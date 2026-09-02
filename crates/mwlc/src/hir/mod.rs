@@ -880,6 +880,8 @@ pub enum ContextKind {
     As,
     At,
     For,
+    /// `positioned <pos>`: the body runs once, somewhere else.
+    Positioned,
 }
 
 /// A selector, resolved at compile time. `@s` is what a `for` binding means.
@@ -2734,6 +2736,45 @@ impl FnLowering<'_> {
         }
     }
 
+    /// `positioned pos!(~ ~1 ~) { .. }` (spec section 6.38).
+    ///
+    /// It provides a position and nothing else: there is no entity behind a
+    /// coordinate, so `@s` inside means whatever it meant outside.
+    fn positioned_stmt(&mut self, stmt: &ast::ContextStmt) -> Option<Stmt> {
+        let value = self.expr(&stmt.selector)?;
+        let ExprKind::Pos(text) = value.kind else {
+            let found = self.ty(value.ty);
+            self.error(
+                value.span,
+                format!(
+                    "'positioned' takes coordinates, as in 'positioned pos!(~ ~1 ~)'; found {found}"
+                ),
+            );
+            return None;
+        };
+        let inline = self.inline_attr(&stmt.attrs)?;
+        self.provided.push(Ctx::Position);
+        self.scopes.push(HashMap::new());
+        let body = stmt
+            .body
+            .stmts
+            .iter()
+            .filter_map(|stmt| self.stmt(stmt))
+            .collect();
+        self.scopes.pop();
+        self.provided.pop();
+        Some(Stmt::Context {
+            kind: ContextKind::Positioned,
+            selector: Selector {
+                text,
+                span: value.span,
+            },
+            body,
+            inline,
+            span: stmt.span,
+        })
+    }
+
     fn context_stmt(&mut self, stmt: &ast::ContextStmt) -> Option<Stmt> {
         // `for` over a list is a different construct that happens to share a keyword.
         if stmt.kind == ast::ContextKind::For
@@ -2741,11 +2782,17 @@ impl FnLowering<'_> {
         {
             return self.for_vec(stmt, place);
         }
+        // `positioned` takes coordinates rather than a selector, and its body runs
+        // once rather than once per entity (spec section 6.38).
+        if stmt.kind == ast::ContextKind::Positioned {
+            return self.positioned_stmt(stmt);
+        }
         let selector = self.selector(&stmt.selector)?;
         let kind = match stmt.kind {
             ast::ContextKind::As => ContextKind::As,
             ast::ContextKind::At => ContextKind::At,
             ast::ContextKind::For => ContextKind::For,
+            ast::ContextKind::Positioned => unreachable!("handled above"),
         };
         // `@s` only means something when there is already an executor.
         if selector.text == "@s" {

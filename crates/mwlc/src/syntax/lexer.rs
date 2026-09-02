@@ -63,6 +63,8 @@ pub enum Keyword {
     Return,
     As,
     At,
+    /// `positioned pos!(~ ~1 ~) { .. }`: the execution position, without an entity.
+    Positioned,
     Struct,
     Enum,
     Impl,
@@ -93,6 +95,7 @@ impl Keyword {
             "continue" => Keyword::Continue,
             "return" => Keyword::Return,
             "as" => Keyword::As,
+            "positioned" => Keyword::Positioned,
             "at" => Keyword::At,
             "struct" => Keyword::Struct,
             "enum" => Keyword::Enum,

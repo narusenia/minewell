@@ -107,7 +107,8 @@ pub enum Stmt {
     If(IfStmt),
     /// `while c { .. }` and `loop { .. }`; the latter has no condition.
     Loop(LoopStmt),
-    /// `as <sel> { }`, `at <sel> { }` and `for e in <sel> { }`.
+    /// `as <sel> { }`, `at <sel> { }`, `positioned <pos> { }` and
+    /// `for e in <sel> { }`.
     Context(ContextStmt),
     Match(MatchStmt),
     Break(Span),
@@ -192,6 +193,8 @@ pub enum ContextKind {
     As,
     At,
     For,
+    /// `positioned <pos>`: a position with no entity behind it.
+    Positioned,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

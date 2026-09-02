@@ -64,10 +64,10 @@ objective 名・NBT キーに識別子が現れ、Minecraft 側の許容文字�
 
 ```
 fn let mut const  if else match  while loop for in break continue return
-as at  struct enum impl  mod use pub  true false
+as at positioned  struct enum impl  mod use pub  true false
 ```
 
-`as` と `at` は実行コンテキストのブロック構文（要件定義 §6.1）であり、
+`as`・`at`・`positioned` は実行コンテキストのブロック構文（要件定義 §6.1）であり、
 Rust の型キャストの `as` ではない。**minewell に型キャストの `as` は無い** —
 数値変換はすべて明示的な関数で行う（[§5](#5-型-未定) 参照）。
 
@@ -628,6 +628,22 @@ fn area_is_right() {
 - **release には出力されない。** function タグから辿れないので
   デッドコード除去が落とす（[§6.34](#634-デッドコード除去--確定m9)）。
   テストコードが配布物に入らないのは意図した結果
+
+### 3.24 `positioned` — 確定（M10）
+
+```
+stmt += "positioned" expr block
+```
+
+```rust
+positioned pos!(~ ~1 ~) { place(); }
+```
+
+- 引数は**座標**（`Pos`）で、セレクタではない。`positioned @s` はエラー
+- **位置だけを与える。** 座標の後ろにエンティティはいないので、`@s` は外側のまま
+- **本体は 1 回だけ走る。** `as` / `at` / `for` と違って反復ではないので、
+  `break` と `continue` は中で意味を持たない（外側のループのものになる）
+- 回転は動かない。`^` は外側の回転で測られる（[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §4.4）
 
 ### 3.5 未定
 
@@ -2176,3 +2192,22 @@ scoreboard players operation $main.b myns.v += $main.a myns.v
 **期待型は引数にも配る。** 引数は仮引数の型を期待として読まれるので、
 `f(nbt!({ .. }))` が書けるようになった（[§4.18](#418-nbt--確定m8)）。
 型引数（`Type::Param`）のままの仮引数では、まだ照合先が決まらないので拒否する。
+
+---
+
+### 6.38 `positioned` — 確定（M10）
+
+```rust
+#[load] fn main() { positioned pos!(~ ~1 ~) { place(); } }
+```
+
+```
+execute positioned ~ ~1 ~ run function myns:main/positioned_0
+```
+
+- **`if` のブロックと同じ形。** 1 回しか走らないので、`as` / `at` / `for` が持つ
+  「エンティティごと」の仕掛け（`break` の伝播、実行者ガード）は要らない
+- 本体が 1 コマンドなら関数を作らず `execute positioned … run <cmd>` に畳む
+  （[§6.8](#68-if--else) と同じ判断）
+- **コスト表では `+` が付かない**（[§6.36](#636-コマンド数の静的検査--確定m9)）。
+  座標は 1 か所で、複数一致しうるセレクタとは違う

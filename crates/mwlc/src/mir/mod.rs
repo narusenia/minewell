@@ -185,6 +185,8 @@ pub enum Inst {
 pub enum ExecuteAs {
     As(String),
     At(String),
+    /// `positioned <x> <y> <z>`: coordinates, with no entity behind them.
+    Positioned(String),
 }
 
 /// A test that can be written straight into an `execute`.
@@ -2424,6 +2426,7 @@ impl<'p> Lowering<'_, 'p> {
         let escaping = escapes(body);
         let clause = match kind {
             hir::ContextKind::At => ExecuteAs::At(selector.text.clone()),
+            hir::ContextKind::Positioned => ExecuteAs::Positioned(selector.text.clone()),
             _ => ExecuteAs::As(selector.text.clone()),
         };
 
@@ -2443,10 +2446,26 @@ impl<'p> Lowering<'_, 'p> {
             self.insts.truncate(before);
         }
 
+        // Coordinates find nothing and lose nothing: the body runs once, so it needs
+        // none of the per-entity machinery below. It is an `if`'s block with a
+        // different wrapper (spec section 6.38).
+        if kind == hir::ContextKind::Positioned {
+            let path = self.split("positioned", body);
+            self.insts.push(Inst::Context {
+                clause,
+                inst: Box::new(Inst::Call { path }),
+            });
+            if escaping.any() {
+                self.propagate();
+            }
+            return;
+        }
+
         let name = match kind {
             hir::ContextKind::As => "as",
             hir::ContextKind::At => "at",
             hir::ContextKind::For => "for",
+            hir::ContextKind::Positioned => unreachable!("handled above"),
         };
         let path = format!("{}/{name}_{}", self.prefix, self.counter);
         self.counter += 1;

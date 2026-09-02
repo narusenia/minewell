@@ -431,6 +431,7 @@ fn command(inst: &Inst, ns: &str, options: &Options) -> String {
             let clause = match clause {
                 ExecuteAs::As(selector) => format!("as {selector}"),
                 ExecuteAs::At(selector) => format!("at {selector}"),
+                ExecuteAs::Positioned(coords) => format!("positioned {coords}"),
             };
             format!("execute {clause} run {}", command(inst, ns, options))
         }

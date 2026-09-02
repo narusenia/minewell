@@ -431,9 +431,9 @@ impl Parser {
             Some(TokenKind::Keyword(Keyword::While | Keyword::Loop)) => {
                 self.loop_stmt(attrs).map(Stmt::Loop)
             }
-            Some(TokenKind::Keyword(Keyword::As | Keyword::At | Keyword::For)) => {
-                self.context_stmt(attrs).map(Stmt::Context)
-            }
+            Some(TokenKind::Keyword(
+                Keyword::As | Keyword::At | Keyword::For | Keyword::Positioned,
+            )) => self.context_stmt(attrs).map(Stmt::Context),
             Some(TokenKind::Keyword(Keyword::Match)) => {
                 if let Some(attr) = attrs.first() {
                     self.errors.push(SyntaxError::new(
@@ -644,6 +644,7 @@ impl Parser {
         let kind = match self.peek() {
             Some(TokenKind::Keyword(Keyword::As)) => ContextKind::As,
             Some(TokenKind::Keyword(Keyword::At)) => ContextKind::At,
+            Some(TokenKind::Keyword(Keyword::Positioned)) => ContextKind::Positioned,
             _ => ContextKind::For,
         };
         self.bump();
