@@ -102,6 +102,9 @@ fn asked(offset_of: &str, nudge: usize) -> Asked {
     let hover = serde_json::json!({
         "jsonrpc": "2.0", "id": 3, "method": "textDocument/hover", "params": &position,
     });
+    let definition = serde_json::json!({
+        "jsonrpc": "2.0", "id": 5, "method": "textDocument/definition", "params": &position,
+    });
     let hints = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 4,
@@ -118,6 +121,7 @@ fn asked(offset_of: &str, nudge: usize) -> Asked {
         &document.to_string(),
         &completion.to_string(),
         &hover.to_string(),
+        &definition.to_string(),
         &hints.to_string(),
         r#"{"jsonrpc":"2.0","method":"exit"}"#,
     ] {
@@ -130,11 +134,13 @@ fn asked(offset_of: &str, nudge: usize) -> Asked {
     read(&mut out); // the diagnostics for the document
     let completed = read(&mut out);
     let hovered = read(&mut out);
+    let defined = read(&mut out);
     let hinted = read(&mut out);
     server.wait().expect("the server exits");
     Asked {
         completed,
         hovered,
+        defined,
         hinted,
     }
 }
@@ -142,6 +148,7 @@ fn asked(offset_of: &str, nudge: usize) -> Asked {
 struct Asked {
     completed: String,
     hovered: String,
+    defined: String,
     hinted: String,
 }
 
@@ -196,6 +203,29 @@ fn hovering_a_function_gives_its_signature() {
         hovered.contains("fn area(r: fix<1000>) -> fix<1000>"),
         "{hovered}"
     );
+}
+
+#[test]
+fn a_name_jumps_to_where_it_is_declared() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/arena/src/lib.mwl"
+    ))
+    .expect("the example is there");
+    let declared = spot(&text, text.find("arena: Arena").expect("there"));
+    let defined = asked("arena.radius", 3).defined;
+    // The `let` that bound it, not the use the cursor was on.
+    assert!(
+        defined.contains(&format!(r#""start":{declared}"#).replace(' ', "")),
+        "{defined} wanted {declared}"
+    );
+}
+
+#[test]
+fn a_command_has_nowhere_to_jump_to() {
+    // It lives in the toolchain's table, not in the source.
+    let defined = asked("play_sound(minecraft:block", 4).defined;
+    assert!(defined.contains(r#""result":null"#), "{defined}");
 }
 
 #[test]

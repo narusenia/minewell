@@ -2,7 +2,7 @@
 
 //! A language server, as small as one can be and still be worth running.
 //!
-//! Diagnostics, plus completion, hover and inlay hints. `mwlc` already answers
+//! Diagnostics, plus completion, hover, definition jumps and inlay hints. `mwlc` already answers
 //! with problems and spans, so the diagnostics half is a loop: read a document, compile
 //! it, write the problems back. The other half is the toolchain's command table
 //! reformatted — which is the part nobody can hold in their head, and it costs the
@@ -55,6 +55,7 @@ pub fn serve() -> io::Result<()> {
                                 "completionProvider": {},
                                 "hoverProvider": true,
                                 "inlayHintProvider": true,
+                                "definitionProvider": true,
                             },
                             "serverInfo": { "name": "mwl", "version": env!("CARGO_PKG_VERSION") },
                         }),
@@ -87,6 +88,10 @@ pub fn serve() -> io::Result<()> {
             "textDocument/hover" => {
                 let hover = server.hover(&params);
                 write(&mut output, &reply(id, hover))?;
+            }
+            "textDocument/definition" => {
+                let target = server.definition(&params);
+                write(&mut output, &reply(id, target))?;
             }
             "textDocument/inlayHint" => {
                 let hints = server.hints(&params);
@@ -252,6 +257,35 @@ impl Server {
         json!({ "contents": { "kind": "markdown", "value": value }, "range": range })
     }
 
+    /// Where the name under the cursor was declared.
+    ///
+    /// Same file, always: there is one source file per pack (`mod` and `use` are not in
+    /// v1). A command has nowhere to go — it is in the toolchain's table, not the
+    /// source — and saying so is the honest answer.
+    fn definition(&mut self, params: &Value) -> Value {
+        let Some((path, text, at)) = self.spot(params) else {
+            return Value::Null;
+        };
+        let (start, end) = word(&text, at);
+        if start == end {
+            return Value::Null;
+        }
+        let (namespace, schema) = self.project(path.as_deref());
+        let word = &text[start..end];
+        let Some(symbol) =
+            visible(&text, &namespace, schema.as_ref(), at).find(|symbol| symbol.name == word)
+        else {
+            return Value::Null;
+        };
+        json!({
+            "uri": params["textDocument"]["uri"],
+            "range": {
+                "start": position(&text, symbol.span.start),
+                "end": position(&text, symbol.span.end),
+            },
+        })
+    }
+
     /// The types the source does not write, shown where they would go.
     ///
     /// Only the inferred bindings: repeating a type the reader already wrote is noise,
@@ -365,7 +399,11 @@ fn visible<'a>(
     // Innermost first: a shadowing `let` is the one that answers for the name.
     found.sort_by_key(|symbol| std::cmp::Reverse(symbol.scope.start));
     found.into_iter().filter(move |symbol| {
-        symbol.scope.start <= at && at <= symbol.scope.end && symbol.span.start <= at
+        // A binding is only a name once it has been written; a function is one
+        // anywhere in the file, including above where it is defined — calling one
+        // further down is deliberately not an error.
+        let declared = symbol.kind == SymbolKind::Function || symbol.span.start <= at;
+        symbol.scope.start <= at && at <= symbol.scope.end && declared
     })
 }
 
@@ -544,6 +582,18 @@ mod tests {
             described.contains("playsound_master(sound: ResourceLocation, targets: selector)"),
             "{described}"
         );
+    }
+
+    #[test]
+    fn a_function_is_visible_above_where_it_is_written() {
+        // Calling a function defined further down is not an error (there is a pass for
+        // exactly that), so it cannot be missing from the list either.
+        let src = "fn main() { let a = helper(); }\nfn helper() -> i32 { return 1; }";
+        let at = src.find("helper").expect("there");
+        let names: Vec<String> = visible(src, "myns", None, at)
+            .map(|symbol| symbol.name)
+            .collect();
+        assert!(names.contains(&"helper".to_owned()), "{names:?}");
     }
 
     #[test]
