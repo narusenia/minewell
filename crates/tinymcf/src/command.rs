@@ -82,6 +82,11 @@ pub enum Condition {
     },
     /// `entity <selector>`: does the selector find anything?
     Entity(String),
+    /// `block <x> <y> <z> <id>`: is that block there?
+    Block {
+        at: Coords,
+        id: String,
+    },
     /// Parsed but not implemented; see `SPEC.md` §4.4.
     Deferred(String),
 }
@@ -139,11 +144,11 @@ pub enum Return {
 }
 
 /// Where NBT lives. Only [`Target::Storage`] executes; see `SPEC.md` §4.2.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Target {
     Storage(String),
     Entity(String),
-    Block(String),
+    Block(Coords),
 }
 
 impl Target {
@@ -152,10 +157,7 @@ impl Target {
         Ok(match kind {
             "storage" => Target::Storage(args.word()?.to_owned()),
             "entity" => Target::Entity(args.word()?.to_owned()),
-            "block" => {
-                let (x, y, z) = (args.word()?, args.word()?, args.word()?);
-                Target::Block(format!("{x} {y} {z}"))
-            }
+            "block" => Target::Block(coords(args)?),
             other => return Err(unexpected(other)),
         })
     }
@@ -449,7 +451,14 @@ fn condition(args: &mut Args) -> Result<Condition, ParseError> {
             Ok(Condition::Data { target, path })
         }
         "entity" => Ok(Condition::Entity(args.word()?.to_owned())),
-        "block" | "predicate" | "biome" | "blocks" | "dimension" | "loaded" => {
+        "block" => {
+            let at = coords(args)?;
+            Ok(Condition::Block {
+                at,
+                id: args.word()?.to_owned(),
+            })
+        }
+        "predicate" | "biome" | "blocks" | "dimension" | "loaded" => {
             // Consumed whole, so the deferral is reported when it runs rather than as
             // a syntax error the caller cannot act on.
             args.rest();
@@ -734,6 +743,12 @@ impl Coords {
         };
         [one(x, pos[0]), one(y, pos[1]), one(z, pos[2])]
     }
+}
+
+/// Reads a coordinate triple. Public so the interpreter can read the ones inside a
+/// command it otherwise only records.
+pub fn coords_of(args: &mut Args) -> Result<Coords, ParseError> {
+    coords(args)
 }
 
 fn coords(args: &mut Args) -> Result<Coords, ParseError> {

@@ -15,6 +15,9 @@ pub struct World {
     pub scoreboard: Scoreboard,
     storage: BTreeMap<String, NbtValue>,
     entities: BTreeMap<String, Entity>,
+    /// What stands at each block position. Only the places something put a block, or
+    /// the harness declared one; everywhere else is air.
+    blocks: BTreeMap<[i64; 3], Block>,
     /// What each selector text finds. There is no world to search, so the harness
     /// says. An unbound selector finds nothing, which is honest: nothing is there.
     selectors: BTreeMap<String, Vec<String>>,
@@ -31,7 +34,55 @@ pub struct Entity {
     pub nbt: NbtValue,
 }
 
+/// A block, as much of one as anything needs: what it is, and its NBT.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Block {
+    pub id: String,
+    pub nbt: NbtValue,
+}
+
+/// The block a position is inside. Vanilla floors, so `~-0.5` is the block below.
+pub fn block_pos(pos: [f64; 3]) -> [i64; 3] {
+    pos.map(|n| n.floor() as i64)
+}
+
+/// `stone` and `minecraft:stone` are the same block.
+pub fn block_id(id: &str) -> String {
+    match id.contains(':') {
+        true => id.to_owned(),
+        false => format!("minecraft:{id}"),
+    }
+}
+
 impl World {
+    /// Puts a block down. The harness uses this to lay out a world; `setblock` uses it
+    /// too, so a pack can see what it built (`SPEC.md` section 4.6).
+    pub fn set_block(&mut self, pos: [i64; 3], id: &str) -> &mut Block {
+        self.blocks.entry(pos).or_insert(Block {
+            id: block_id(id),
+            nbt: NbtValue::Compound(Default::default()),
+        })
+    }
+
+    /// Replaces whatever was there.
+    pub fn place(&mut self, pos: [i64; 3], id: &str) {
+        self.blocks.insert(
+            pos,
+            Block {
+                id: block_id(id),
+                nbt: NbtValue::Compound(Default::default()),
+            },
+        );
+    }
+
+    pub fn block(&self, pos: [i64; 3]) -> Option<&Block> {
+        self.blocks.get(&pos)
+    }
+
+    pub fn block_mut(&mut self, pos: [i64; 3]) -> Option<&mut Block> {
+        self.blocks.get_mut(&pos)
+    }
+
     /// The root compound of a storage namespace. Absent namespaces read as empty,
     /// which is what vanilla does.
     pub fn storage(&self, namespace: &str) -> &NbtValue {

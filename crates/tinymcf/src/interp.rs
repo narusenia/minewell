@@ -58,13 +58,6 @@ fn deferred(what: &str) -> String {
     format!("'{what}' is not implemented yet; see SPEC.md section 4.4 (M0-8b)")
 }
 
-fn unmodelled(target: &Target) -> String {
-    format!(
-        "{} targets are not modelled by tinymcf; see SPEC.md section 1",
-        target.describe()
-    )
-}
-
 /// Why a read produced nothing.
 ///
 /// `None` is an ordinary absence, and carries no diagnostic: a path that is not there
@@ -435,6 +428,12 @@ impl Interpreter {
             Command::Return(kind) => self.ret(kind),
             Command::Execute(cmd) => self.execute(cmd),
             Command::Unknown { name, args } => {
+                // `setblock` is the one unmodelled command that also *does* something
+                // here: without it `if block` could only ever see what the harness laid
+                // out, and a pack could not test what it built (`SPEC.md` section 4.6).
+                if name == "setblock" {
+                    self.place_block(args);
+                }
                 self.effects.push(Effect {
                     name: name.clone(),
                     args: args.clone(),
@@ -601,6 +600,25 @@ impl Interpreter {
         )
     }
 
+    /// Applies a `setblock` whose arguments read as `<x> <y> <z> <block>`.
+    ///
+    /// Anything more elaborate — block states, `destroy`/`keep` — is recorded and not
+    /// applied. Guessing at a shape nothing asked for would be worse than not knowing.
+    fn place_block(&mut self, args: &str) {
+        let mut args = crate::args::Args::new(args);
+        let Ok(at) = crate::command::coords_of(&mut args) else {
+            return;
+        };
+        let Ok(id) = args.word() else {
+            return;
+        };
+        if id.contains('[') || id.contains('{') {
+            return;
+        }
+        let pos = crate::world::block_pos(at.resolve(self.context.pos, self.context.rot));
+        self.world.place(pos, id);
+    }
+
     /// `None` when the condition is one of the deferred kinds.
     fn condition(&mut self, cond: &Condition) -> Option<bool> {
         match cond {
@@ -608,6 +626,18 @@ impl Interpreter {
                 let message = deferred(name);
                 self.fail(message);
                 None
+            }
+            // Nothing there is air, and air is not stone: a block that was never put
+            // down makes the condition false rather than an error, the same way an
+            // unset score does.
+            Condition::Block { at, id } => {
+                let pos = crate::world::block_pos(at.resolve(self.context.pos, self.context.rot));
+                let wanted = crate::world::block_id(id);
+                Some(
+                    self.world
+                        .block(pos)
+                        .is_some_and(|block| block.id == wanted),
+                )
             }
             // An unset score makes the condition false rather than an error, so
             // `if score` never needs the holder to exist first.
@@ -793,7 +823,15 @@ impl Interpreter {
                     .nbt
                     .clone())
             }
-            other => Err(Some(unmodelled(other))),
+            // Reading a block that is not there is an ordinary miss, like an entity
+            // the selector did not find.
+            Target::Block(at) => {
+                let pos = crate::world::block_pos(at.resolve(self.context.pos, self.context.rot));
+                self.world
+                    .block(pos)
+                    .map(|block| block.nbt.clone())
+                    .ok_or(None)
+            }
         }
     }
 
@@ -830,9 +868,16 @@ impl Interpreter {
                     f(&mut entity.nbt)
                 }
             },
-            other => {
-                let message = unmodelled(other);
-                self.fail(message)
+            Target::Block(at) => {
+                let pos = crate::world::block_pos(at.resolve(self.context.pos, self.context.rot));
+                match self.world.block_mut(pos) {
+                    Some(block) => f(&mut block.nbt),
+                    // Vanilla refuses to write NBT into air, and says so.
+                    None => {
+                        let [x, y, z] = pos;
+                        self.fail(format!("there is no block at {x} {y} {z} to write to"))
+                    }
+                }
             }
         }
     }
@@ -1388,10 +1433,11 @@ mod data_tests {
     }
 
     #[test]
-    fn block_targets_parse_but_say_they_are_not_modelled() {
+    fn a_target_that_is_not_there_is_an_answer_rather_than_an_error() {
+        // Air has no NBT, and asking is not a mistake.
         let (it, out) = run(&["data get block 0 0 0 Items"]);
         assert_eq!(out, Outcome::FAILED);
-        assert!(it.diagnostics[0].contains("not modelled"));
+        assert!(it.diagnostics.is_empty(), "{:?}", it.diagnostics);
 
         // An entity target with no executor finds nobody, which is an answer.
         let (it, out) = run(&["data get entity @s Health"]);
@@ -1689,8 +1735,8 @@ mod execute_tests {
         for line in [
             "execute in minecraft:overworld run say hi",
             "execute anchored eyes run say hi",
-            "execute if block 0 0 0 stone run say hi",
             "execute if predicate ns:p run say hi",
+            "execute if biome 0 0 0 minecraft:plains run say hi",
         ] {
             it.diagnostics.clear();
             assert_eq!(it.run_line(line), Outcome::FAILED, "{line}");
@@ -2047,13 +2093,88 @@ mod context_tests {
     }
 
     #[test]
+    fn a_block_the_harness_laid_out_is_found() {
+        let mut it = zombies();
+        it.world.place([0, 64, 5], "stone");
+        assert_eq!(
+            it.run_line("execute positioned 0 64 5 if block ~ ~ ~ minecraft:stone run say hit"),
+            Outcome::ok(1)
+        );
+        // Air is not stone, and asking is not an error.
+        assert_eq!(
+            it.run_line("execute positioned 0 64 6 if block ~ ~ ~ minecraft:stone run say hit"),
+            Outcome::FAILED
+        );
+        assert!(it.diagnostics.is_empty(), "{:?}", it.diagnostics);
+    }
+
+    #[test]
+    fn the_namespace_is_optional_on_both_sides() {
+        let mut it = zombies();
+        it.world.place([1, 1, 1], "minecraft:chest");
+        assert_eq!(
+            it.run_line("execute if block 1 1 1 chest run say hit"),
+            Outcome::ok(1)
+        );
+    }
+
+    #[test]
+    fn a_pack_can_see_the_block_it_set() {
+        let mut it = zombies();
+        it.run_line("setblock 2 3 4 minecraft:stone");
+        assert_eq!(
+            it.run_line("execute if block 2 3 4 stone run say hit"),
+            Outcome::ok(1)
+        );
+        // Recorded as well as applied: the effect log is what most tests read.
+        assert_eq!(it.effects[0].name, "setblock");
+    }
+
+    #[test]
+    fn a_position_falls_into_the_block_it_is_inside() {
+        let mut it = zombies();
+        it.world.place([0, 64, 0], "stone");
+        assert_eq!(
+            it.run_line("execute positioned 0.5 64.9 0.5 if block ~ ~ ~ stone run say hit"),
+            Outcome::ok(1)
+        );
+    }
+
+    #[test]
+    fn block_nbt_reads_and_writes() {
+        let mut it = zombies();
+        it.world.place([0, 64, 0], "chest");
+        it.run_line(r#"data modify block 0 64 0 Lock set value "key""#);
+        assert_eq!(
+            it.run_line("data get block 0 64 0 Lock"),
+            Outcome::ok(3),
+            "{:?}",
+            it.diagnostics
+        );
+    }
+
+    #[test]
+    fn writing_nbt_into_air_says_so() {
+        let mut it = zombies();
+        assert_eq!(
+            it.run_line("data modify block 9 9 9 Lock set value 1"),
+            Outcome::FAILED
+        );
+        assert!(
+            it.diagnostics.iter().any(|d| d.contains("no block at")),
+            "{:?}",
+            it.diagnostics
+        );
+    }
+
+    #[test]
     fn the_still_deferred_clauses_name_themselves() {
         let mut it = zombies();
         for line in [
             "execute in minecraft:overworld run say hi",
             "execute anchored eyes run say hi",
-            "execute if block 0 0 0 stone run say hi",
             "execute if predicate ns:p run say hi",
+            "execute if biome 0 0 0 minecraft:plains run say hi",
         ] {
             it.diagnostics.clear();
             assert_eq!(it.run_line(line), Outcome::FAILED, "{line}");

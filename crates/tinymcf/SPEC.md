@@ -354,11 +354,35 @@ The basis is the usual one: with yaw 0 and pitch 0 an entity faces `+Z`, its up 
     up      = (-sin y · sin p,   cos p,   cos y · sin p)
     left    = ( cos y,           0,       sin y)
 
+#### Blocks — **done** (M10-2)
+
+```
+cond += block <x> <y> <z> <id>
+```
+
+The world holds a block wherever something put one; everywhere else is air. A block
+that is not there makes the condition **false rather than an error**, the same way an
+unset score does. `stone` and `minecraft:stone` are the same block.
+
+The harness lays a world out, and `setblock` puts blocks down too (§4.6):
+
+```rust
+world.place([0, 64, 5], "stone");
+```
+
+A position falls into the block it is inside — vanilla floors, so `0.5 64.9 0.5` is the
+block at `0 64 0`.
+
+`data … block <x> <y> <z> <path>` reads and writes a block's NBT. Reading air is a miss
+like an entity a selector did not find; **writing to air fails and says so**, which is
+what vanilla does.
+
 #### Still deferred
 
-`in`, `anchored`, `align`, `facing`, `on`, `positioned as` and `rotated as` parse and
-fail with a diagnostic naming themselves. `in` wants a dimension model and the rest
-want more of the world than anything has asked for.
+`in`, `anchored`, `align`, `facing`, `on`, `positioned as`, `rotated as`,
+`if predicate`, `if biome`, `if blocks`, `if dimension` and `if loaded` parse and fail
+with a diagnostic naming themselves. `in` wants a dimension model and the rest want
+more of the world than anything has asked for.
 
 ### 4.5 Macro functions — **done**
 
@@ -387,9 +411,16 @@ else inserts its SNBT.
 
 ### 4.6 Side-effecting commands — **done**
 
+**`setblock` is the exception: it is applied as well as recorded** (M10-2). Without it
+`if block` could only ever see what the harness laid out, and a pack could not test
+what it built. Only the plain `<x> <y> <z> <block>` shape is applied; block states and
+the `destroy`/`keep` modes are recorded and not applied, because guessing at a shape
+nothing has asked for is worse than not knowing.
+
 `say`, `tellraw`, `setblock`, `summon`, `kill` and the like are **not** simulated. Each
 is appended to an ordered log as `(name, arguments)`, with the arguments exactly as
-written, and reports success.
+written, and reports success. The log also records where and as whom each one ran,
+since the arguments keep the coordinates as written (`~ ~1 ~`).
 
 Only commands that actually run are logged, so the log doubles as a trace: a command
 skipped by a false `execute if` leaves nothing behind.
