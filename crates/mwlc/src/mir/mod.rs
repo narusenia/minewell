@@ -213,6 +213,12 @@ pub enum Cond {
         filter: String,
         negated: bool,
     },
+    /// `if|unless block <x> <y> <z> <id>` (spec section 6.39).
+    Block {
+        at: String,
+        id: String,
+        negated: bool,
+    },
 }
 
 impl Cond {
@@ -247,6 +253,11 @@ impl Cond {
             } => Cond::Data {
                 path,
                 filter,
+                negated: !negated,
+            },
+            Cond::Block { at, id, negated } => Cond::Block {
+                at,
+                id,
                 negated: !negated,
             },
         }
@@ -2850,6 +2861,13 @@ impl<'p> Lowering<'_, 'p> {
     fn cond(&mut self, expr: &hir::Expr) -> Cond {
         match &expr.kind {
             hir::ExprKind::Unary(UnaryOp::Not, inner) => self.cond(inner).negate(),
+            // `execute if block` is a condition already: asking it into a register and
+            // then asking about the register would be a command wasted.
+            hir::ExprKind::Block { at, id } => Cond::Block {
+                at: at.clone(),
+                id: id.clone(),
+                negated: false,
+            },
             // `execute if data` is a condition already: asking it into a register and
             // then asking about the register would be a command wasted.
             hir::ExprKind::Binary(op, lhs, rhs) if lhs.ty == Type::Str => {
@@ -2926,6 +2944,20 @@ impl<'p> Lowering<'_, 'p> {
         match &expr.kind {
             // A component is JSON inside a command's text; it never reaches a register.
             hir::ExprKind::Component(_) => unreachable!("a component is part of a command"),
+            // `execute store success score <dst> if block …` names its own
+            // destination, so asking for the answer costs one command.
+            hir::ExprKind::Block { at, id } => {
+                let dst = self.temps_next();
+                self.insts.push(Inst::StoreCond {
+                    dst: dst.clone(),
+                    cond: Cond::Block {
+                        at: at.clone(),
+                        id: id.clone(),
+                        negated: false,
+                    },
+                });
+                Value::Reg(dst)
+            }
             hir::ExprKind::Int(n) => Value::Const(*n),
             hir::ExprKind::Bool(b) => Value::Const(i32::from(*b)),
             hir::ExprKind::Local(local) => Value::Reg(self.local(*local)),

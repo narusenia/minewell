@@ -1038,6 +1038,12 @@ pub enum ExprKind {
     },
     /// A compile-time selector. Never evaluated into a register.
     Selector(String),
+    /// `block(pos!(..), minecraft:stone)`: is that block there (spec section 6.39)?
+    /// A condition in its own right, so it costs nothing to ask inside an `if`.
+    Block {
+        at: String,
+        id: String,
+    },
     /// A chat component, fully built (spec section 3.22). Compile-time only: it ends
     /// up as JSON inside a command's text and costs nothing to run.
     Component(Component),
@@ -4104,11 +4110,50 @@ impl FnLowering<'_> {
         Some(result)
     }
 
+    /// `block(pos!(~ ~-1 ~), minecraft:stone)` (spec section 6.39).
+    ///
+    /// Both arguments have to be known while compiling, which they are: a coordinate
+    /// and a resource location are compile-time types (spec section 4.7). So the test
+    /// is one `execute if block` and costs nothing to build.
+    fn block_test(&mut self, call: &ast::CallExpr) -> Option<Expr> {
+        let [at, id] = call.args.as_slice() else {
+            self.error(
+                call.span,
+                "'block' takes a position and a block id, as in \
+                 'block(pos!(~ ~-1 ~), minecraft:stone)'",
+            );
+            return None;
+        };
+        let at = self.expr(at)?;
+        let id = self.expr(id)?;
+        let (ExprKind::Pos(at_text), ExprKind::Resource(id_text)) = (&at.kind, &id.kind) else {
+            self.error(
+                call.span,
+                "'block' takes a position and a block id, as in \
+                 'block(pos!(~ ~-1 ~), minecraft:stone)'",
+            );
+            return None;
+        };
+        Some(Expr {
+            kind: ExprKind::Block {
+                at: at_text.clone(),
+                id: id_text.clone(),
+            },
+            ty: Type::Bool,
+            span: call.span,
+        })
+    }
+
     /// A command call, if the name is one. User functions win: defining `fn setblock`
     /// shadows the command, which is the only way to wrap one.
     fn command(&mut self, call: &ast::CallExpr) -> Option<Expr> {
         if self.signatures.contains_key(&call.callee.name) {
             return None;
+        }
+        // `block` is asked of the world rather than run at it, so it is built in
+        // rather than read off the command table (spec section 6.39).
+        if call.callee.name == "block" {
+            return self.block_test(call);
         }
         let Some(schema) = self.toolchain else {
             self.error(

@@ -451,6 +451,10 @@ fn target(reference: &DataRef, ns: &str) -> String {
 /// `if score $a obj matches 1..`, ready to follow an `execute`.
 fn condition(cond: &Cond, ns: &str) -> String {
     match cond {
+        Cond::Block { at, id, negated } => {
+            let keyword = if *negated { "unless" } else { "if" };
+            format!("{keyword} block {at} {id}")
+        }
         Cond::Score {
             lhs,
             cmp,

@@ -2211,3 +2211,27 @@ execute positioned ~ ~1 ~ run function myns:main/positioned_0
   （[§6.8](#68-if--else) と同じ判断）
 - **コスト表では `+` が付かない**（[§6.36](#636-コマンド数の静的検査--確定m9)）。
   座標は 1 か所で、複数一致しうるセレクタとは違う
+
+---
+
+### 6.39 `block(..)` — 確定（M10）
+
+```rust
+positioned pos!(0 64 0) {
+    if block(pos!(~ ~-1 ~), minecraft:stone) { raw!("say ground"); }
+}
+```
+
+```
+execute positioned 0 64 0 run execute if block ~ ~-1 ~ minecraft:stone run say ground
+```
+
+- **組み込み関数**であってコマンドではない。世界に**尋ねる**もので、世界に対して
+  実行するものではないので、コマンド表からは引かない
+- 引数は座標とリソースロケーションで、**どちらもコンパイル時の型**（[§4.7](#47-コマンド)）。
+  だから `execute if block` 1 つに落ち、組み立てにコストがかからない
+- **それ自体が条件。** `if` の中ではレジスタを経由しない（`execute if data` と同じ判断。
+  [§6.27](#627-string--確定m8)）。`!` は `unless` になる
+- 値として受けたいときは `execute store success score <dst> if block …` で 1 コマンド
+- **無いブロックは偽**（[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §4.4）。
+  ブロック状態（`minecraft:chest[facing=north]`）はまだ書けない

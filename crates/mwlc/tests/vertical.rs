@@ -2727,3 +2727,83 @@ mod positioned {
         assert!(mwlc::driver::compile(src, NS, &options).is_err());
     }
 }
+
+/// `block(..)` (spec section 6.39).
+mod blocks {
+    use super::harness::{NS, load, local};
+
+    fn with_stone(src: &str) -> tinymcf::Interpreter {
+        let mut mc = load(src);
+        mc.world.place([0, 63, 0], "stone");
+        mc.call(&format!("{NS}:main"));
+        assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
+        mc
+    }
+
+    #[test]
+    fn a_block_test_is_one_command_inside_an_if() {
+        let mc = with_stone(
+            r#"#[load] fn main() {
+                 positioned pos!(0 64 0) {
+                   if block(pos!(~ ~-1 ~), minecraft:stone) { raw!("say ground"); }
+                 }
+               }"#,
+        );
+        assert_eq!(
+            mc.effects
+                .iter()
+                .map(|e| e.args.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ground"]
+        );
+        // Both blocks hold one command, so both fold into the `execute`:
+        // `execute positioned 0 64 0 run execute if block ~ ~-1 ~ … run say ground`
+        // is three commands, and none of them is a function call.
+        assert_eq!(mc.commands_run, 3);
+    }
+
+    #[test]
+    fn nothing_there_is_simply_false() {
+        let mc = with_stone(
+            r#"#[load] fn main() {
+                 positioned pos!(0 70 0) {
+                   if block(pos!(~ ~-1 ~), minecraft:stone) { raw!("say ground"); }
+                 }
+               }"#,
+        );
+        assert!(mc.effects.is_empty(), "{:?}", mc.effects);
+    }
+
+    #[test]
+    fn the_answer_can_be_kept() {
+        let mc = with_stone(
+            r#"#[load] fn main() {
+                 positioned pos!(0 64 0) { let solid = block(pos!(~ ~-1 ~), minecraft:stone); }
+               }"#,
+        );
+        assert_eq!(local(&mc, "main", "solid"), Some(1));
+    }
+
+    #[test]
+    fn negation_becomes_unless() {
+        let mc = with_stone(
+            r#"#[load] fn main() {
+                 positioned pos!(0 70 0) {
+                   if !block(pos!(~ ~-1 ~), minecraft:stone) { raw!("say air"); }
+                 }
+               }"#,
+        );
+        assert_eq!(mc.effects.len(), 1);
+    }
+
+    #[test]
+    fn it_takes_a_position_and_a_block_id() {
+        let options = mwlc::emit::Options::default();
+        for src in [
+            r#"#[load] fn main() { if block(pos!(~ ~ ~)) { raw!("say a"); } }"#,
+            r#"#[load] fn main() { if block(1, minecraft:stone) { raw!("say a"); } }"#,
+        ] {
+            assert!(mwlc::driver::compile(src, NS, &options).is_err(), "{src}");
+        }
+    }
+}
