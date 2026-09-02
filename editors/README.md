@@ -9,7 +9,7 @@
 | `tree-sitter-mwl/` | `.mwl` の tree-sitter grammar とハイライトクエリ。nvim と zed が指す |
 | `vscode/` | VS Code 拡張。TextMate grammar（同じ字句規則から起こした 2 本目）と LSP クライアント |
 | `zed/` | Zed 拡張。grammar は `tree-sitter-mwl/` を指し、クエリはシンボリックリンク。LSP は WASM 拡張 |
-| `nvim/` | nvim-treesitter と `vim.lsp` の設定断片 |
+| `nvim/` | → **別リポジトリ**（[minewell-nvim](https://github.com/narusenia/minewell-nvim)） |
 
 **ハイライトの側はコンパイラに依存しない。** 依存させた瞬間に版の同期が発生する。
 LSP はもちろん依存する（それが仕事）ので、別物として扱う。
@@ -22,7 +22,7 @@ LSP はもちろん依存する（それが仕事）ので、別物として扱�
 
 | エディタ | 何をするか | 要るもの |
 |---|---|---|
-| nvim | `vim.lsp.config` に 5 行（[`nvim/README.md`](nvim/README.md)） | 無し |
+| nvim | [minewell-nvim](https://github.com/narusenia/minewell-nvim) を入れるだけ | 無し |
 | VS Code | 拡張が `vscode-languageclient` で起動する | `npm install` |
 | Zed | WASM 拡張が起動コマンドを答える（`zed/src/lib.rs`） | `wasm32-wasip1` |
 

@@ -287,9 +287,15 @@ compound どうしの `==`、タプル型バリアント（`V(i32)`）、
 
 - tree-sitter grammar 1 本（nvim と zed が指す）、VS Code 用に TextMate grammar 1 本、
   ハイライトクエリ 1 本（zed からはシンボリックリンク）
-- **3 つとも `mwl lsp` を起動する**（X-7）。nvim は設定 5 行、VS Code は
-  `vscode-languageclient`、Zed は WASM 拡張（それ以外に道が無い）。
-  **どれも `mwl` を名前で探すだけ**なので版の同期は起きない
+- **3 つとも `mwl lsp` を起動する**（X-7）。**どれも `mwl` を名前で探すだけ**なので
+  版の同期は起きない。VS Code は `vscode-languageclient`、Zed は WASM 拡張
+  （それ以外に道が無い）
+- **nvim だけ別リポジトリ**（[minewell-nvim](https://github.com/narusenia/minewell-nvim)）。
+  nvim のプラグインはリポジトリのルートが runtimepath に載る前提で、
+  マネージャの多くはサブディレクトリを指せない。生成した `parser.c` を向こうに
+  持ち込んであり（コミットしないと利用者に tree-sitter CLI を要求することになる）、
+  **parser は初回に非同期でビルドする** — `vim.system():wait()` を autocmd の中で
+  呼ぶとエディタが固まる
 - **どれもコンパイラに依存しない。** 依存させた瞬間に版の同期が発生する
 - 生成物はコミットしない。`mise run grammar` が作り、そのまま `examples/` を
   全部パースする grammar のテストになっている（`ci` に入っている）

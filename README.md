@@ -70,10 +70,18 @@ The full reasoning is in [the requirements](docs/01-requirements.md).
 | Path | What |
 |---|---|
 | [`crates/tinymcf`](crates/tinymcf) | mcfunction interpreter. Depends on nothing else here; independently publishable |
-| `crates/mwlc` | the compiler *(not started)* |
-| `crates/mwl` | the CLI *(not started)* |
+| [`crates/mwlc`](crates/mwlc) | the compiler: `syntax` → `hir` → `mir` → `emit` |
+| [`crates/mwl`](crates/mwl) | the CLI, and the language server |
+| [`editors/`](editors) | tree-sitter grammar, and the VS Code and Zed extensions |
+| [`examples/`](examples) | worked examples, all of them built and run by the tests |
 | [`docs/01-requirements.md`](docs/01-requirements.md) | every design decision and why |
+| [`docs/02-spec.md`](docs/02-spec.md) | grammar, typing rules, lowering |
 | [`docs/03-plan.md`](docs/03-plan.md) | task list and progress |
+| [`docs/04-handover.md`](docs/04-handover.md) | where the work stands, and what was deliberately left out |
+
+Neovim support lives in its own repository,
+[minewell-nvim](https://github.com/narusenia/minewell-nvim), because a Neovim plugin
+has to be the root of what the runtimepath sees.
 
 ### tinymcf
 

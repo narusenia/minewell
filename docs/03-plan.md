@@ -976,6 +976,16 @@ v0.1.0 を公開したあとの 3 つ。**順に独立**なので、どれから
     Zed の拡張が `wasm32-wasip1` にビルドできること。
     **エディタに読み込んだ状態までは自動で確かめていない**（そこは手で開くしかない）
   - Zed の拡張は自分の workspace（ターゲットが違うので）
+  - **nvim だけ別リポジトリに切り出した**（[minewell-nvim](https://github.com/narusenia/minewell-nvim)）。
+    nvim のプラグインは**リポジトリのルートが runtimepath に載る**前提で、
+    `plugin/` `queries/` `parser/` をそこに置く必要がある。マネージャの多くは
+    サブディレクトリを指せない。**コンパイラのルートにそれを置くのは筋が悪い**
+  - minewell-nvim は**生成した `parser.c` を持ち込む**。コミットしないと利用者に
+    tree-sitter CLI を要求することになり、「一発で入る」にならない。
+    grammar はこちらが正典で、向こうの `scripts/vendor.sh` が取り直す
+  - **parser のビルドは初回の `.mwl` を開いたときに、非同期で行う。**
+    マネージャごとにビルドフックの書き方が違い、初回チェックアウトで走らないものもある。
+    `vim.system():wait()` を autocmd の中で使うと**エディタが固まる**（1 度踏んだ）
 - [x] **X-5** README
   - README は M0 の途中で先行して用意
   - `examples/` に 4 本（hello / burn-the-undead / countdown / recursion）。
