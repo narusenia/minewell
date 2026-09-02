@@ -2807,3 +2807,59 @@ mod blocks {
         }
     }
 }
+
+/// Block NBT views (spec section 6.40).
+mod block_views {
+    use super::harness::{NS, load, local};
+
+    const CHEST: &str = r#"#[block]
+        struct Chest { #[nbt(byte, rename = "Locked")] locked: Option<i32> }
+    "#;
+
+    fn with_chest(src: &str) -> tinymcf::Interpreter {
+        let mut mc = load(&format!("{CHEST}{src}"));
+        mc.world.place([0, 64, 0], "chest");
+        mc.call(&format!("{NS}:main"));
+        assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
+        mc
+    }
+
+    #[test]
+    fn a_field_writes_into_the_block() {
+        let mc = with_chest(
+            r#"#[load] fn main() { let mut c = Chest::of(pos!(0 64 0)); c.locked = Some(1); }"#,
+        );
+        let nbt = mc.world.block([0, 64, 0]).expect("placed").nbt.to_string();
+        assert!(nbt.contains("Locked:1b"), "{nbt}");
+    }
+
+    #[test]
+    fn a_missing_field_reads_as_none() {
+        let mc = with_chest(
+            r#"#[load] fn main() { let c = Chest::of(pos!(0 64 0)); let mut x = 0;
+                                   if let Some(v) = c.locked { x = v; } }"#,
+        );
+        assert_eq!(local(&mc, "main", "x"), Some(0));
+    }
+
+    #[test]
+    fn making_one_costs_nothing() {
+        let mc = with_chest(r#"#[load] fn main() { let c = Chest::of(pos!(0 64 0)); }"#);
+        assert_eq!(mc.commands_run, 0);
+    }
+
+    #[test]
+    fn a_relative_position_needs_one_to_be_relative_to() {
+        // `~ ~-1 ~` is read where the command runs, so there has to be a position.
+        let src = format!("{CHEST}#[load] fn main() {{ let c = Chest::of(pos!(~ ~-1 ~)); }}");
+        let options = mwlc::emit::Options::default();
+        assert!(mwlc::driver::compile(&src, NS, &options).is_err());
+    }
+
+    #[test]
+    fn a_block_view_is_not_looked_at_by_selector() {
+        let src = format!("{CHEST}#[load] fn main() {{ let c = Chest::of(@s); }}");
+        let options = mwlc::emit::Options::default();
+        assert!(mwlc::driver::compile(&src, NS, &options).is_err());
+    }
+}

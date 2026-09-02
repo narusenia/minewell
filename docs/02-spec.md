@@ -645,6 +645,33 @@ positioned pos!(~ ~1 ~) { place(); }
   `break` と `continue` は中で意味を持たない（外側のループのものになる）
 - 回転は動かない。`^` は外側の回転で測られる（[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §4.4）
 
+### 3.25 ブロック NBT のビュー — 確定（M10）
+
+```
+item += "#" "[" "block" "]" struct_item
+primary += IDENT "::" "of" "(" expr ")"
+```
+
+```rust
+#[block]
+struct Chest { #[nbt(byte, rename = "Locked")] locked: Option<i32> }
+
+positioned pos!(~ ~-1 ~) {
+    let mut c = Chest::of(pos!(~ ~ ~));
+    c.locked = Some(1);
+}
+```
+
+- **エンティティのビュー（§3.19）と同じもの**で、見る先が座標になるだけ。
+  束縛は場所の別名で、作るのに 1 コマンドもかからない
+- **`of` は 1 つ。** `#[entity]` ならセレクタを、`#[block]` なら座標を取る。
+  取り違えは診断が言う。`at` を使わなかったのは `at` がキーワードだから
+- **`~` と `^` を書いたら `#[ctx(position)]` を要求する。** 相対座標はコマンドが走る
+  場所で読まれるので、位置が無ければ意味が決まらない
+- 無いブロックのフィールドは `None`。**air への書き込みは実行時に失敗する**
+  （[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §4.4）— バニラと同じで、
+  ここは静的には分からない
+
 ### 3.5 未定
 
 以降のタスクが、実装の直前に確定させる。
@@ -2235,3 +2262,18 @@ execute positioned 0 64 0 run execute if block ~ ~-1 ~ minecraft:stone run say g
 - 値として受けたいときは `execute store success score <dst> if block …` で 1 コマンド
 - **無いブロックは偽**（[`../crates/tinymcf/SPEC.md`](../crates/tinymcf/SPEC.md) §4.4）。
   ブロック状態（`minecraft:chest[facing=north]`）はまだ書けない
+
+---
+
+### 6.40 ブロック NBT のビュー — 確定（M10）
+
+```
+data modify block 0 64 0 Locked set value 1b
+execute store result score $main.x myns.v run data get block ~ ~-1 ~ Locked
+```
+
+- **`DataRef` の対象が 1 つ増えるだけ。** M9-11 が `storage` と `entity` の違いを
+  そこに閉じ込めておいたので、ブロックはその 3 つ目として入った
+- 座標はコンパイル時のテキストなので、パスはそのままコマンドに書かれる
+- `#[entity]` と `#[block]` はどちらも `Type::View`。どちらの見方かは
+  `StructDef::view` が持つ

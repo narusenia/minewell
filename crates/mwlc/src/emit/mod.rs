@@ -445,6 +445,7 @@ fn target(reference: &DataRef, ns: &str) -> String {
     match &reference.target {
         DataTarget::Storage => format!("storage {} {path}", crate::names::storage(ns)),
         DataTarget::Entity(selector) => format!("entity {selector} {path}"),
+        DataTarget::Block(at) => format!("block {at} {path}"),
     }
 }
 

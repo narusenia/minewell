@@ -289,6 +289,7 @@ impl Types {
             fields,
             span: template.span,
             from: Some(key),
+            view: None,
         });
         Some(Type::Struct(id))
     }
@@ -491,6 +492,9 @@ pub enum Root {
     /// An entity's NBT, reached through a view (spec section 6.29). The selector is
     /// compile-time text, so the whole path is written into the command.
     Entity { selector: String },
+    /// The NBT of the block at a position (spec section 6.40). Same idea, and the
+    /// coordinates are compile-time text too.
+    Block { at: String },
     /// A binding of the caller, lent by reference (spec section 6.24). Borrowing is a
     /// name for someone else's place, so the name of that place is what is carried.
     Lent {
@@ -526,6 +530,7 @@ impl Place {
         let root = match &self.root {
             Root::Local(id) => format!("l{}", id.0),
             Root::Entity { selector } => format!("e{selector}"),
+            Root::Block { at } => format!("b{at}"),
             Root::Lent {
                 owner,
                 local,
@@ -554,6 +559,18 @@ pub struct StructDef {
     pub span: Span,
     /// Which template and type arguments this came from, for a generic struct.
     pub from: Option<(usize, Vec<Type>)>,
+    /// What this is a view of, if it is one. Decides what `T::of(..)` takes
+    /// (spec section 3.25).
+    pub view: Option<ViewKind>,
+}
+
+/// The two things a view can look at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewKind {
+    /// `#[entity]`: the NBT of whatever a selector finds.
+    Entity,
+    /// `#[block]`: the NBT of the block at a position.
+    Block,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1681,9 +1698,9 @@ fn collect_types(file: &SourceFile, errors: &mut Vec<SyntaxError>) -> Types {
                 let id = StructId(structs.len() as u32);
                 // `#[entity]` makes the struct a view: its fields are places on an
                 // entity rather than a compound of its own (spec section 4.20).
-                let ty = match has_attr(item, "entity") {
-                    true => Type::View(id),
-                    false => Type::Struct(id),
+                let ty = match view_kind(item) {
+                    Some(_) => Type::View(id),
+                    None => Type::Struct(id),
                 };
                 structs.push((item, declared));
                 (&declared.name, ty)
@@ -1707,7 +1724,8 @@ fn collect_types(file: &SourceFile, errors: &mut Vec<SyntaxError>) -> Types {
     }
 
     for (item, declared) in structs {
-        if !has_attr(item, "entity") {
+        let view = view_kind(item);
+        if view.is_none() {
             reject_item_attrs(item, "a struct", errors);
         }
         let fields = collect_fields(&declared.fields, &types, &[], errors);
@@ -1718,6 +1736,7 @@ fn collect_types(file: &SourceFile, errors: &mut Vec<SyntaxError>) -> Types {
             fields,
             span: declared.name.span,
             from: None,
+            view,
         });
     }
     // Templates last: their fields may name a plain struct, and their own parameters
@@ -1810,6 +1829,14 @@ fn collect_types(file: &SourceFile, errors: &mut Vec<SyntaxError>) -> Types {
 }
 
 /// Whether an item carries a bare `#[name]`.
+/// `#[entity]` or `#[block]`, if the struct carries one.
+fn view_kind(item: &ast::Item) -> Option<ViewKind> {
+    if has_attr(item, "entity") {
+        return Some(ViewKind::Entity);
+    }
+    has_attr(item, "block").then_some(ViewKind::Block)
+}
+
 fn has_attr(item: &ast::Item, name: &str) -> bool {
     item.attrs.iter().any(|attr| {
         matches!(attr.tokens.first().map(|t| &t.kind),
@@ -2914,10 +2941,15 @@ impl FnLowering<'_> {
             let name = &view.ty.name;
             self.error(
                 view.ty.span,
-                format!("'{name}' is not a view; declare it with #[entity]"),
+                format!("'{name}' is not a view; declare it with #[entity] or #[block]"),
             );
             return None;
         };
+        // A block view is looked at by position rather than by selector; everything
+        // after that is the same (spec section 6.40).
+        if self.types.struct_def(id).view == Some(ViewKind::Block) {
+            return self.block_view(view, id, span);
+        }
         let selector = self.selector(&view.selector)?;
         // Vanilla's `data` commands take one entity and fail silently on several.
         // Which entities a selector finds is not knowable here, but how many it may
@@ -2944,6 +2976,40 @@ impl FnLowering<'_> {
                 ty: Type::View(id),
                 tag: None,
                 // Settled by the binding it goes into.
+                mutable: false,
+                via: view.ty.name.clone(),
+            }),
+            ty: Type::View(id),
+            span,
+        })
+    }
+
+    /// `Chest::of(pos!(0 64 0))` (spec section 6.40).
+    fn block_view(&mut self, view: &ast::ViewOfExpr, id: StructId, span: Span) -> Option<Expr> {
+        let value = self.expr(&view.selector)?;
+        let ExprKind::Pos(at) = value.kind else {
+            let name = &view.ty.name;
+            let found = self.ty(value.ty);
+            self.error(
+                value.span,
+                format!(
+                    "'{name}' is a #[block] view, so it is looked at by position: \
+                     '{name}::of(pos!(~ ~-1 ~))'; found {found}"
+                ),
+            );
+            return None;
+        };
+        // Coordinates written with `~` or `^` are read where the command runs, so the
+        // view needs the position the enclosing context provides.
+        if at.contains('~') || at.contains('^') {
+            self.require(Ctx::Position, value.span, "a relative position");
+        }
+        Some(Expr {
+            kind: ExprKind::View(Place {
+                root: Root::Block { at },
+                steps: Vec::new(),
+                ty: Type::View(id),
+                tag: None,
                 mutable: false,
                 via: view.ty.name.clone(),
             }),

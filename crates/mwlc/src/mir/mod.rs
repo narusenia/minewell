@@ -409,6 +409,8 @@ pub struct DataRef {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataTarget {
+    /// `block <x> <y> <z> <path>` (spec section 6.40).
+    Block(String),
     Storage,
     /// `entity <selector>`. The selector is compile-time text.
     Entity(String),
@@ -955,6 +957,8 @@ fn place_path(function: &hir::Function, place: &hir::Place) -> DataRef {
         }
         // A view names an entity, and the path is written on the command itself.
         hir::Root::Entity { selector } => (DataTarget::Entity(selector.clone()), String::new()),
+        // A block's path starts at its root compound too, so the same rule applies.
+        hir::Root::Block { at } => (DataTarget::Block(at.clone()), String::new()),
     };
     for step in &place.steps {
         match step {
@@ -979,7 +983,7 @@ fn place_reg(function: &hir::Function, place: &hir::Place) -> Reg {
     match &place.root {
         Root::Local(local) => local_reg(function, *local),
         // A view's fields are in the entity's NBT; none of them is a register.
-        Root::Entity { .. } => unreachable!("a view has no register"),
+        Root::Entity { .. } | Root::Block { .. } => unreachable!("a view has no register"),
         Root::Lent { owner, local, .. } => Reg {
             holder: crate::names::fake_player(owner, local),
             kind: RegKind::Var,
@@ -1977,7 +1981,7 @@ impl<'p> Lowering<'_, 'p> {
             Root::Local(_) | Root::Lent { .. } => {
                 place_reg(self.function, place).holder != dst.holder
             }
-            Root::Entity { .. } => true,
+            Root::Entity { .. } | Root::Block { .. } => true,
         }
     }
 
