@@ -2250,6 +2250,7 @@ impl<'p> Lowering<'_, 'p> {
             && !escaping.any()
             && inline != hir::Inline::Never;
         if inlinable {
+            let mark = self.program.mark();
             let before = self.insts.len();
             self.scoped_stmt(&then[0]);
             if self.insts.len() == before + 1 {
@@ -2261,7 +2262,11 @@ impl<'p> Lowering<'_, 'p> {
                 return;
             }
             // The statement needed more than one command after all; undo and split.
+            // The temporaries go back too: an attempt that was thrown away wrote
+            // nothing, and leaving them on the save list makes a later recursive call
+            // save a register nothing ever set.
             self.insts.truncate(before);
+            self.program.reset_to(mark);
         }
 
         let then_path = self.split("if", then);
@@ -2448,6 +2453,7 @@ impl<'p> Lowering<'_, 'p> {
         // A single command that cannot transfer control needs no function.
         let inlinable = body.len() == 1 && !escaping.any() && inline != hir::Inline::Never;
         if inlinable {
+            let mark = self.program.mark();
             let before = self.insts.len();
             self.scoped_stmt(&body[0]);
             if self.insts.len() == before + 1 {
@@ -2458,7 +2464,9 @@ impl<'p> Lowering<'_, 'p> {
                 });
                 return;
             }
+            // As above: an abandoned attempt leaves no temporaries behind.
             self.insts.truncate(before);
+            self.program.reset_to(mark);
         }
 
         // Coordinates find nothing and lose nothing: the body runs once, so it needs

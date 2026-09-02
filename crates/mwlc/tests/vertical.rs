@@ -2863,3 +2863,23 @@ mod block_views {
         assert!(mwlc::driver::compile(&src, NS, &options).is_err());
     }
 }
+
+/// An abandoned inlining attempt must not leave its temporaries behind.
+///
+/// A block holding one statement is tried inline first. When that statement turns out
+/// to need more than one command the attempt is thrown away — and so are the registers
+/// it took, or a later recursive call saves one that nothing ever wrote and the
+/// `scoreboard players get` fails on every call.
+#[test]
+fn a_block_that_could_not_be_inlined_leaves_no_registers_behind() {
+    let mut mc = harness::load(
+        r#"#[ctx(position)]
+           fn step(left: i32) {
+               if left <= 0 { return; }
+               positioned pos!(~ ~1 ~) { step(left - 1); }
+           }
+           #[load] fn main() { positioned pos!(0 64 0) { step(3); } }"#,
+    );
+    mc.call("test:main");
+    assert!(mc.diagnostics.is_empty(), "{:?}", mc.diagnostics);
+}
