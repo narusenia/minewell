@@ -32,7 +32,15 @@ ln -s ~/src/minewell/editors/tree-sitter-mwl/queries/highlights.scm \
 
 ## 診断（LSP）
 
-`mwl` が PATH にあれば、これだけ。nvim 0.11 以降:
+**まず filetype を登録する。** `.mwl` を知っているランタイムはどこにも無いので、
+これが無いと `filetypes = { "mwl" }` が一致せず、**クライアントが起動しないまま黙る**。
+ハイライトの節と同じ 1 行だが、LSP だけ設定するときも要る:
+
+```lua
+vim.filetype.add({ extension = { mwl = "mwl" } })
+```
+
+そのうえで、`mwl` が PATH にあればこれだけ。nvim 0.11 以降:
 
 ```lua
 vim.lsp.config.mwl = {
@@ -59,4 +67,11 @@ vim.api.nvim_create_autocmd("FileType", {
 ```
 
 **`mwl` は名前で起動するだけ**なので、プラグインはコンパイラのどの版とも結びつかない。
-```
+
+### 動かないとき
+
+| 症状 | 見るところ |
+|---|---|
+| 何も起きない | `:echo &filetype` が `mwl` か。空なら `vim.filetype.add` が無い |
+| filetype は合っているのに attach しない | `:checkhealth vim.lsp`、`:lua =vim.lsp.get_clients()` |
+| attach しているのに診断が出ない | `mwl lsp` が起動できているか（`:LspLog`）、`mwl` が PATH にあるか |
