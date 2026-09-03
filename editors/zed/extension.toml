@@ -12,7 +12,12 @@ repository = "https://github.com/NaruseNia/minewell"
 name = "minewell"
 language = "minewell"
 
+# Zed fetches this revision from the remote and compiles `src/parser.c` out of it --
+# it never runs `tree-sitter generate`, and never looks at the working tree. So the
+# revision has to be a 40-digit SHA that is pushed and carries a generated `src/`;
+# a branch name or `HEAD` leaves the shallow fetch with no local ref to check out.
+# Bump this whenever `grammar.js` changes (`editors/README.md`).
 [grammars.mwl]
 repository = "https://github.com/NaruseNia/minewell"
-commit = "HEAD"
+commit = "021bfd01ae3e79459f496be9640b60fe94184d11"
 path = "editors/tree-sitter-mwl"

@@ -1044,8 +1044,15 @@ M12-2 と M12-3 は HIR に span を足す必要があり、そこで初めて�
   - 先に書くテスト: grammar が `examples/` の全 `.mwl` をエラーなく解析すること。
     `mise run grammar` がそれで、**`ci` に入れた**
   - 置き場所は `editors/{tree-sitter-mwl,vscode,zed,nvim}`
-  - **生成物（`src/parser.c`）はコミットしない。** 580KB の生成 C を、出力の読みやすさを
-    掲げるリポジトリに置きたくない。作るのは `mise run grammar` の 1 コマンド
+  - **生成物（`src/parser.c`）はコミットする。** 580KB の生成 C を、出力の読みやすさを
+    掲げるリポジトリに置きたくなかったので最初は外していたが、**Zed は
+    `tree-sitter generate` を走らせない。** clone した `src/parser.c` を直接
+    コンパイルするだけなので、コミットしないと grammar が組めない。
+    X-7 で minewell-nvim に持ち込んだのと同じ理由が、Zed にもそのまま効いた
+  - **Zed の `extension.toml` の `commit` は 40 桁の SHA でなければならない。**
+    remote から取るのでローカルの変更は見えないし、`HEAD` やブランチ名だと
+    shallow fetch がローカルに ref を作らず `checkout` が
+    `pathspec ... did not match` で落ちる（1 度踏んだ）
   - ハイライトクエリは 1 本だけ持ち、**zed からはシンボリックリンクで指す**。
     2 本置くと必ずずれる
   - 罠は仕様どおり 3 つとも踏んだ: リソースロケーション（1 トークン、`.` と `-` 込み）、

@@ -8,4 +8,8 @@ target/
 
 # build output
 /dist
-editors/tree-sitter-mwl/src/
+
+# Zed builds in place, next to the manifest it was told to load: the WASM component
+# and a git checkout per grammar.
+editors/zed/extension.wasm
+editors/zed/grammars/
