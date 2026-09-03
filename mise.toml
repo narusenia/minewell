@@ -5,8 +5,8 @@
 # and clippy are absent unless named here.
 rust = { version = "stable", components = "rustfmt,clippy" }
 "cargo-insta" = "latest"
-# For the editor grammar (`editors/`). The generated parser is not committed, so the
-# CLI is needed to build and test it.
+# For the editor grammar (`editors/`). The generated parser is committed, but the CLI
+# is what regenerates it, and what parses every example as the grammar's test.
 "tree-sitter" = "0.26"
 # The VS Code extension is JavaScript, and `mise run editors` checks it parses.
 node = "22"
